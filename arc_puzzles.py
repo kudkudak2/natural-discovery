@@ -1,0 +1,1234 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Optional, Sequence
+
+import numpy as np
+
+
+@dataclass(frozen=True)
+class OODSpec:
+    """Controls in-distribution vs out-of-distribution input complexity."""
+
+    # NOTE: When we increase the number of "instances" (e.g. scattered pixels) in OOD,
+    # we cap it to at most 2x the IID maximum (see Puzzle._num_pixels).
+    #
+    # Defaults are conservative for 5x5 grids.
+    min_pixels_id: int = 1
+    max_pixels_id: int = 2
+    min_pixels_ood: int = 2
+    max_pixels_ood: int = 4
+
+
+class Puzzle:
+    """
+    Base ARC-style puzzle.
+
+    Contract:
+    - Input grid uses colors in {0..4} where 0 is background.
+    - Some puzzles use a hidden `rule_color` that must be inferred from demos.
+    """
+
+    skill_id: int
+    name: str
+    uses_rule_color: bool
+
+    def __init__(
+        self,
+        *,
+        size: int = 5,
+        colors: Sequence[int] = (1, 2, 3, 4),
+        ood_spec: OODSpec = OODSpec(),
+        rng: Optional[np.random.Generator] = None,
+    ) -> None:
+        self.size = int(size)
+        if self.size < 3:
+            # Many skills rely on having an interior (e.g. "1 cell away from wall", rectangles with interior, etc.)
+            raise ValueError(f"Grid size must be >= 3, got size={self.size}")
+        self.colors = tuple(int(c) for c in colors)
+        self.ood_spec = ood_spec
+        self.rng = rng if rng is not None else np.random.default_rng()
+
+    def blank(self) -> np.ndarray:
+        return np.zeros((self.size, self.size), dtype=np.int64)
+
+    def _num_pixels(self, *, ood: bool) -> int:
+        """
+        Draw a number of pixels/instances.
+
+        Rule: OOD is allowed to be harder, but we cap the OOD maximum to at most
+        2x the IID maximum to prevent extreme distribution shifts.
+        """
+        lo_id = int(self.ood_spec.min_pixels_id)
+        hi_id = int(self.ood_spec.max_pixels_id)
+        if hi_id < lo_id:
+            hi_id = lo_id
+
+        if not ood:
+            return int(self.rng.integers(lo_id, hi_id + 1))
+
+        cap_hi = int(2 * hi_id)
+        lo_ood = int(self.ood_spec.min_pixels_ood)
+        hi_ood = int(self.ood_spec.max_pixels_ood)
+        if hi_ood < lo_ood:
+            hi_ood = lo_ood
+
+        # Enforce the 2x cap (also clamps the min if it's above the cap).
+        lo = min(max(lo_ood, lo_id), cap_hi)
+        hi = min(hi_ood, cap_hi)
+        if hi < lo:
+            hi = lo
+        return int(self.rng.integers(lo, hi + 1))
+
+    def apply(self, grid: np.ndarray, rule_color: Optional[int]) -> np.ndarray:
+        raise NotImplementedError
+
+    def make_input(self, *, ood: bool) -> np.ndarray:
+        raise NotImplementedError
+
+    def generate_single_example(self, *, rule_color: Optional[int], ood: bool) -> tuple[np.ndarray, np.ndarray]:
+        inp = self.make_input(ood=ood)
+        out = self.apply(inp, rule_color)
+        return inp, out
+
+    def generate_prompt(
+        self,
+        *,
+        num_demos: int = 3,
+        ood_test: bool = False,
+    ) -> tuple[list[tuple[np.ndarray, np.ndarray]], tuple[np.ndarray, np.ndarray], Optional[int]]:
+        rule_color: Optional[int] = None
+        if self.uses_rule_color:
+            rule_color = int(self.rng.choice(self.colors))
+
+        demos: list[tuple[np.ndarray, np.ndarray]] = [
+            self.generate_single_example(rule_color=rule_color, ood=False) for _ in range(num_demos)
+        ]
+        test_pair = self.generate_single_example(rule_color=rule_color, ood=ood_test)
+        return demos, test_pair, rule_color
+
+
+def apply_gravity(grid: np.ndarray) -> np.ndarray:
+    """Drops non-zero cells in each column to the bottom (stable)."""
+    size = grid.shape[0]
+    new_grid = np.zeros_like(grid)
+    for col in range(size):
+        pixels = grid[:, col][grid[:, col] != 0]
+        if pixels.size == 0:
+            continue
+        new_grid[size - pixels.size : size, col] = pixels
+    return new_grid
+
+
+def apply_bottom_color_change(grid: np.ndarray, target_color: int) -> np.ndarray:
+    """Changes the bottom-row non-zero cells to `target_color`."""
+    new_grid = grid.copy()
+    bottom = new_grid[-1, :]
+    bottom[bottom != 0] = int(target_color)
+    new_grid[-1, :] = bottom
+    return new_grid
+
+
+def apply_right_gravity(grid: np.ndarray) -> np.ndarray:
+    """Slides non-zero cells in each row to the right (stable)."""
+    size = grid.shape[1]
+    new_grid = np.zeros_like(grid)
+    for row in range(grid.shape[0]):
+        pixels = grid[row, :][grid[row, :] != 0]
+        if pixels.size == 0:
+            continue
+        new_grid[row, size - pixels.size : size] = pixels
+    return new_grid
+
+
+class Skill1Gravity(Puzzle):
+    skill_id = 1
+    name = "gravity"
+    uses_rule_color = False
+
+    def make_input(self, *, ood: bool) -> np.ndarray:
+        grid = self.blank()
+        n = self._num_pixels(ood=ood)
+        # Avoid bottom row so the effect is visible.
+        for _ in range(n * 3):
+            if n == 0:
+                break
+            r = int(self.rng.integers(0, self.size - 1))
+            c = int(self.rng.integers(0, self.size))
+            if grid[r, c] == 0:
+                grid[r, c] = 1
+                n -= 1
+            if n == 0:
+                break
+        return grid
+
+    def apply(self, grid: np.ndarray, rule_color: Optional[int]) -> np.ndarray:
+        _ = rule_color
+        return apply_gravity(grid)
+
+
+class Skill2BottomRecolor(Puzzle):
+    skill_id = 2
+    name = "bottom_recolor"
+    uses_rule_color = True
+
+    def make_input(self, *, ood: bool) -> np.ndarray:
+        grid = self.blank()
+        # Skill 2 should show squares across multiple rows, but the *rule* only recolors
+        # the bottom row. We therefore add non-bottom "distractor" pixels that remain unchanged.
+
+        # Ensure at least one bottom-row pixel so the recoloring is observable.
+        bottom_k = int(self.rng.integers(1, self.size + 1))
+        bottom_cols = self.rng.choice(np.arange(self.size), size=bottom_k, replace=False)
+        grid[-1, bottom_cols] = 1
+
+        # Add a few pixels above the bottom row; OOD means "more clutter", not a different rule.
+        #
+        # Cap OOD clutter count to at most 2x the IID maximum (IID max is size-1, because bottom row is excluded).
+        if not ood:
+            top_n = int(self.rng.integers(1, self.size))
+        else:
+            iid_max = max(1, int(self.size) - 1)
+            ood_max = min(int(2 * iid_max), int(self.size) * int(self.size))
+            ood_min = min(int(self.size), ood_max)
+            top_n = int(self.rng.integers(ood_min, ood_max + 1))
+        placed = 0
+        attempts = 0
+        while placed < top_n and attempts < top_n * 10:
+            attempts += 1
+            r = int(self.rng.integers(0, self.size - 1))  # exclude bottom row
+            c = int(self.rng.integers(0, self.size))
+            if grid[r, c] == 0:
+                grid[r, c] = 1
+                placed += 1
+        return grid
+
+    def apply(self, grid: np.ndarray, rule_color: Optional[int]) -> np.ndarray:
+        assert rule_color is not None
+        return apply_bottom_color_change(grid, rule_color)
+
+
+class Skill3GravityThenRecolor(Puzzle):
+    skill_id = 3
+    name = "gravity_then_recolor"
+    uses_rule_color = True
+
+    def make_input(self, *, ood: bool) -> np.ndarray:
+        # Same generator as skill1: scattered pixels.
+        grid = self.blank()
+        n = self._num_pixels(ood=ood)
+        for _ in range(n * 3):
+            if n == 0:
+                break
+            r = int(self.rng.integers(0, self.size - 1))
+            c = int(self.rng.integers(0, self.size))
+            if grid[r, c] == 0:
+                grid[r, c] = 1
+                n -= 1
+            if n == 0:
+                break
+        return grid
+
+    def apply(self, grid: np.ndarray, rule_color: Optional[int]) -> np.ndarray:
+        assert rule_color is not None
+        return apply_bottom_color_change(apply_gravity(grid), rule_color)
+
+
+class Skill4PlaceCenterDot(Puzzle):
+    skill_id = 4
+    name = "place_center_dot"
+    uses_rule_color = True
+
+    def make_input(self, *, ood: bool) -> np.ndarray:
+        """
+        Create a single solid rectangle (color=1). This makes the "center" unambiguous.
+
+        ID: smaller rectangles, OOD: larger rectangles.
+        """
+        grid = self.blank()
+
+        if ood:
+            h = int(self.rng.integers(max(2, self.size - 1), self.size + 1))  # 4-5 when size=5
+            w = int(self.rng.integers(max(2, self.size - 1), self.size + 1))
+        else:
+            h = int(self.rng.integers(2, min(4, self.size) + 1))  # 2-4
+            w = int(self.rng.integers(2, min(4, self.size) + 1))
+
+        r0 = int(self.rng.integers(0, self.size - h + 1))
+        c0 = int(self.rng.integers(0, self.size - w + 1))
+        grid[r0 : r0 + h, c0 : c0 + w] = 1
+        return grid
+
+    def apply(self, grid: np.ndarray, rule_color: Optional[int]) -> np.ndarray:
+        assert rule_color is not None
+        """
+        Recolor the center cell(s) of the object's bounding box with `rule_color`.
+
+        - If bbox height/width is odd -> single center cell.
+        - If even -> 2 center rows and/or 2 center cols, yielding a 2x2 / 2x1 / 1x2 center region.
+        """
+        out = grid.copy()
+        rs, cs = np.nonzero(grid)
+        if rs.size == 0:
+            return out
+
+        r0, r1 = int(rs.min()), int(rs.max())
+        c0, c1 = int(cs.min()), int(cs.max())
+        h = r1 - r0 + 1
+        w = c1 - c0 + 1
+
+        if h % 2 == 1:
+            center_rows = [r0 + h // 2]
+        else:
+            center_rows = [r0 + (h // 2) - 1, r0 + (h // 2)]
+
+        if w % 2 == 1:
+            center_cols = [c0 + w // 2]
+        else:
+            center_cols = [c0 + (w // 2) - 1, c0 + (w // 2)]
+
+        for r in center_rows:
+            for c in center_cols:
+                out[r, c] = int(rule_color)
+        return out
+
+
+class Skill5FillRectangleInterior(Puzzle):
+    skill_id = 5
+    name = "fill_rectangle_interior"
+    uses_rule_color = True
+
+    def make_input(self, *, ood: bool) -> np.ndarray:
+        _ = ood
+        grid = self.blank()
+        # Create a rectangular frame (color 1), min size 3x3 so there's an interior.
+        h = int(self.rng.integers(3, self.size + 1))
+        w = int(self.rng.integers(3, self.size + 1))
+        r0 = int(self.rng.integers(0, self.size - h + 1))
+        c0 = int(self.rng.integers(0, self.size - w + 1))
+        r1 = r0 + h - 1
+        c1 = c0 + w - 1
+
+        grid[r0, c0 : c1 + 1] = 1
+        grid[r1, c0 : c1 + 1] = 1
+        grid[r0 : r1 + 1, c0] = 1
+        grid[r0 : r1 + 1, c1] = 1
+        return grid
+
+    def apply(self, grid: np.ndarray, rule_color: Optional[int]) -> np.ndarray:
+        assert rule_color is not None
+        out = grid.copy()
+        rs, cs = np.nonzero(grid)
+        if rs.size == 0:
+            return out
+        r0, r1 = int(rs.min()), int(rs.max())
+        c0, c1 = int(cs.min()), int(cs.max())
+        if (r1 - r0) < 2 or (c1 - c0) < 2:
+            return out
+        out[r0 + 1 : r1, c0 + 1 : c1] = int(rule_color)
+        return out
+
+
+class Skill6RightGravity(Puzzle):
+    skill_id = 6
+    name = "right_gravity"
+    uses_rule_color = False
+
+    def make_input(self, *, ood: bool) -> np.ndarray:
+        grid = self.blank()
+        n = self._num_pixels(ood=ood)
+        # Avoid rightmost col so the effect is visible.
+        for _ in range(n * 3):
+            if n == 0:
+                break
+            r = int(self.rng.integers(0, self.size))
+            c = int(self.rng.integers(0, self.size - 1))
+            if grid[r, c] == 0:
+                grid[r, c] = 1
+                n -= 1
+            if n == 0:
+                break
+        return grid
+
+    def apply(self, grid: np.ndarray, rule_color: Optional[int]) -> np.ndarray:
+        _ = rule_color
+        return apply_right_gravity(grid)
+
+
+class Skill7DownThenRight(Puzzle):
+    skill_id = 7
+    name = "down_then_right"
+    uses_rule_color = False
+
+    def make_input(self, *, ood: bool) -> np.ndarray:
+        # Same style as Skill 1/6: scattered pixels.
+        grid = self.blank()
+        n = self._num_pixels(ood=ood)
+        for _ in range(n * 3):
+            if n == 0:
+                break
+            r = int(self.rng.integers(0, self.size - 1))
+            c = int(self.rng.integers(0, self.size - 1))
+            if grid[r, c] == 0:
+                grid[r, c] = 1
+                n -= 1
+            if n == 0:
+                break
+        return grid
+
+    def apply(self, grid: np.ndarray, rule_color: Optional[int]) -> np.ndarray:
+        _ = rule_color
+        return apply_right_gravity(apply_gravity(grid))
+
+
+def _ray_color_from_source(src_color: int) -> int:
+    """
+    Deterministic "different color" mapping without a hidden rule:
+      1 -> 2 -> 3 -> 4 -> 1
+    """
+    c = int(src_color)
+    if c not in (1, 2, 3, 4):
+        return 2
+    return 1 + (c % 4)
+
+
+def _shoot_left_ray(grid: np.ndarray, *, row: int, from_col: int, ray_color: int) -> None:
+    """
+    Draw a horizontal ray to the left wall on the given row, excluding the cell at `from_col`.
+    Only fills background cells (0) to keep objects intact.
+    """
+    if from_col <= 0:
+        return
+    for c in range(0, from_col):
+        if grid[row, c] == 0:
+            grid[row, c] = int(ray_color)
+
+
+def _bbox(mask: np.ndarray) -> tuple[int, int, int, int]:
+    """Return (r0, r1, c0, c1) bbox for a boolean mask; assumes mask has at least one True."""
+    rs, cs = np.nonzero(mask)
+    r0, r1 = int(rs.min()), int(rs.max())
+    c0, c1 = int(cs.min()), int(cs.max())
+    return r0, r1, c0, c1
+
+
+def _rects_overlap(a: tuple[int, int, int, int], b: tuple[int, int, int, int]) -> bool:
+    """Axis-aligned rectangle overlap check for (r0,r1,c0,c1) inclusive coords."""
+    ar0, ar1, ac0, ac1 = a
+    br0, br1, bc0, bc1 = b
+    if ar1 < br0 or br1 < ar0:
+        return False
+    if ac1 < bc0 or bc1 < ac0:
+        return False
+    return True
+
+
+def _try_place_solid_rect(
+    grid: np.ndarray,
+    *,
+    color: int,
+    h: int,
+    w: int,
+    rng: np.random.Generator,
+    max_tries: int = 200,
+) -> Optional[tuple[int, int, int, int]]:
+    """
+    Try to place a solid h×w rectangle of `color` into background-only cells (0).
+    Returns (r0, r1, c0, c1) inclusive coords if placed, else None.
+    """
+    size_r, size_c = int(grid.shape[0]), int(grid.shape[1])
+    h = int(h)
+    w = int(w)
+    if h <= 0 or w <= 0:
+        return None
+    if h > size_r or w > size_c:
+        return None
+
+    for _ in range(int(max_tries)):
+        r0 = int(rng.integers(0, size_r - h + 1))
+        c0 = int(rng.integers(0, size_c - w + 1))
+        r1 = r0 + h - 1
+        c1 = c0 + w - 1
+        if np.any(grid[r0 : r1 + 1, c0 : c1 + 1] != 0):
+            continue
+        grid[r0 : r1 + 1, c0 : c1 + 1] = int(color)
+        return (r0, r1, c0, c1)
+    return None
+
+
+def _count_components_4(mask: np.ndarray) -> int:
+    """Count 4-connected components in a boolean mask."""
+    h, w = int(mask.shape[0]), int(mask.shape[1])
+    visited = np.zeros_like(mask, dtype=bool)
+    count = 0
+    for r in range(h):
+        for c in range(w):
+            if not bool(mask[r, c]) or bool(visited[r, c]):
+                continue
+            count += 1
+            stack = [(r, c)]
+            visited[r, c] = True
+            while stack:
+                cr, cc = stack.pop()
+                nr = cr - 1
+                if nr >= 0 and bool(mask[nr, cc]) and not bool(visited[nr, cc]):
+                    visited[nr, cc] = True
+                    stack.append((nr, cc))
+                nr = cr + 1
+                if nr < h and bool(mask[nr, cc]) and not bool(visited[nr, cc]):
+                    visited[nr, cc] = True
+                    stack.append((nr, cc))
+                nc = cc - 1
+                if nc >= 0 and bool(mask[cr, nc]) and not bool(visited[cr, nc]):
+                    visited[cr, nc] = True
+                    stack.append((cr, nc))
+                nc = cc + 1
+                if nc < w and bool(mask[cr, nc]) and not bool(visited[cr, nc]):
+                    visited[cr, nc] = True
+                    stack.append((cr, nc))
+    return int(count)
+
+
+def _component_counts_by_color(grid: np.ndarray) -> dict[int, int]:
+    """Return {color: n_components} for each non-zero color in the grid (4-connected)."""
+    colors_present = sorted({int(c) for c in grid.flatten().tolist() if int(c) != 0})
+    out: dict[int, int] = {}
+    for c in colors_present:
+        out[int(c)] = int(_count_components_4(grid == int(c)))
+    return out
+
+
+def _make_unique_rects_grid(
+    *,
+    size: int,
+    colors: Sequence[int],
+    rng: np.random.Generator,
+    ood: bool,
+) -> tuple[np.ndarray, int]:
+    """
+    Create a grid containing solid non-overlapping rectangles with:
+    - exactly one "unique" color that appears in exactly one component
+    - distractor colors that appear in >=2 disconnected components each
+
+    Allowed rectangle sizes: 1x1, 1x2, 2x1, 2x2.
+    Returns (grid, unique_color).
+    """
+    size = int(size)
+    rect_sizes = [(1, 1), (1, 2), (2, 1), (2, 2)]
+
+    for _ in range(200):
+        grid = np.zeros((size, size), dtype=np.int64)
+        unique_color = int(rng.choice(np.asarray(colors)))
+
+        # Place unique rectangle.
+        uh, uw = rect_sizes[int(rng.integers(0, len(rect_sizes)))]
+        if _try_place_solid_rect(grid, color=unique_color, h=uh, w=uw, rng=rng, max_tries=200) is None:
+            continue
+
+        available_distractors = [int(c) for c in colors if int(c) != unique_color]
+        if not available_distractors:
+            continue
+
+        # ID: fewer distractor colors and components; OOD: more.
+        max_colors = min(len(available_distractors), 3 if not ood else 4)
+        n_distractor_colors = int(rng.integers(1, max_colors + 1))
+        distractor_colors = rng.choice(np.asarray(available_distractors), size=n_distractor_colors, replace=False).tolist()
+
+        ok = True
+        for d_color in distractor_colors:
+            n_objs = int(rng.integers(2, 4)) if not ood else int(rng.integers(2, 6))
+            placed = 0
+            for _obj in range(n_objs):
+                h, w = rect_sizes[int(rng.integers(0, len(rect_sizes)))]
+                if _try_place_solid_rect(grid, color=int(d_color), h=h, w=w, rng=rng, max_tries=200) is None:
+                    ok = False
+                    break
+                placed += 1
+            if not ok:
+                break
+            if placed < 2:
+                ok = False
+                break
+
+        if not ok:
+            continue
+
+        # Validate the uniqueness property by connected components.
+        counts = _component_counts_by_color(grid)
+        if int(counts.get(unique_color, 0)) != 1:
+            continue
+        distractor_ok = True
+        for d_color in distractor_colors:
+            if int(counts.get(int(d_color), 0)) < 2:
+                distractor_ok = False
+                break
+        if not distractor_ok:
+            continue
+
+        # Also ensure *only one* color has exactly one component (for unambiguous rule).
+        singles = [c for c, k in counts.items() if int(k) == 1]
+        if len(singles) != 1:
+            continue
+
+        return grid, unique_color
+
+    # Fallback: simple minimal valid construction.
+    grid = np.zeros((size, size), dtype=np.int64)
+    unique_color = int(colors[0]) if len(colors) > 0 else 1
+    _try_place_solid_rect(grid, color=unique_color, h=1, w=1, rng=rng, max_tries=10_000)
+    distractor_color = int(colors[1]) if len(colors) > 1 else 2
+    _try_place_solid_rect(grid, color=distractor_color, h=1, w=1, rng=rng, max_tries=10_000)
+    _try_place_solid_rect(grid, color=distractor_color, h=1, w=1, rng=rng, max_tries=10_000)
+    return grid, unique_color
+
+
+class Skill8DropThenShootRay(Puzzle):
+    """
+    Input contains one or more colored 1x1 pixels (colors in 1..4).
+    Output:
+      1) Apply down-gravity
+      2) Each fallen pixel shoots a left ray of a different color (deterministic mapping) to the left wall.
+
+    OOD: more pixels.
+    """
+
+    skill_id = 8
+    name = "drop_then_shoot_ray"
+    uses_rule_color = False
+
+    def make_input(self, *, ood: bool) -> np.ndarray:
+        grid = self.blank()
+        # ID: 1 pixel. OOD: more pixels, but capped to at most 2x the IID max (=> 2).
+        if not ood:
+            n = 1
+        else:
+            n_max = min(2, int(self.size) * int(self.size))
+            n_min = min(2, n_max)
+            n = int(self.rng.integers(n_min, n_max + 1))
+        placed = 0
+        attempts = 0
+        while placed < n and attempts < n * 20:
+            attempts += 1
+            # Avoid left wall so the ray is visible; avoid bottom row so gravity does something.
+            r = int(self.rng.integers(0, max(1, self.size - 1)))
+            c = int(self.rng.integers(1, self.size))
+            if grid[r, c] == 0:
+                grid[r, c] = int(self.rng.choice(self.colors))
+                placed += 1
+        return grid
+
+    def apply(self, grid: np.ndarray, rule_color: Optional[int]) -> np.ndarray:
+        _ = rule_color
+        fallen = apply_gravity(grid)
+        out = fallen.copy()
+        rs, cs = np.nonzero(fallen)
+        for r, c in zip(rs.tolist(), cs.tolist()):
+            src_color = int(fallen[r, c])
+            ray_color = _ray_color_from_source(src_color)
+            _shoot_left_ray(out, row=int(r), from_col=int(c), ray_color=ray_color)
+        return out
+
+
+class Skill9ShootRay(Puzzle):
+    """
+    Input contains one or more colored 1x1 pixels (colors in 1..4).
+    Output: each pixel shoots a left ray of a different color (deterministic mapping) to the left wall.
+
+    OOD: more pixels.
+    """
+
+    skill_id = 9
+    name = "shoot_ray"
+    uses_rule_color = False
+
+    def make_input(self, *, ood: bool) -> np.ndarray:
+        grid = self.blank()
+        # ID: 1 pixel. OOD: more pixels, but capped to at most 2x the IID max (=> 2).
+        if not ood:
+            n = 1
+        else:
+            n_max = min(2, int(self.size) * int(self.size))
+            n_min = min(2, n_max)
+            n = int(self.rng.integers(n_min, n_max + 1))
+        placed = 0
+        attempts = 0
+        while placed < n and attempts < n * 20:
+            attempts += 1
+            r = int(self.rng.integers(0, self.size))
+            c = int(self.rng.integers(1, self.size))  # avoid left wall so ray is visible
+            if grid[r, c] == 0:
+                grid[r, c] = int(self.rng.choice(self.colors))
+                placed += 1
+        return grid
+
+    def apply(self, grid: np.ndarray, rule_color: Optional[int]) -> np.ndarray:
+        _ = rule_color
+        out = grid.copy()
+        rs, cs = np.nonzero(grid)
+        for r, c in zip(rs.tolist(), cs.tolist()):
+            src_color = int(grid[r, c])
+            ray_color = _ray_color_from_source(src_color)
+            _shoot_left_ray(out, row=int(r), from_col=int(c), ray_color=ray_color)
+        return out
+
+
+class Skill10BoxesToNearestWall(Puzzle):
+    """
+    Input contains multiple solid rectangles ("boxes"), each with a distinct color.
+
+    Output: move each box horizontally so that it is exactly 1 cell away from its nearest wall
+    (left or right), without changing its shape or vertical position.
+
+    "Exclude middle column" (for odd grid sizes): we generate boxes that do NOT occupy the middle
+    column so that the nearest-wall choice is unambiguous.
+    """
+
+    skill_id = 10
+    name = "boxes_to_nearest_wall"
+    uses_rule_color = False
+
+    def make_input(self, *, ood: bool) -> np.ndarray:
+        grid = self.blank()
+
+        # IID: 2 boxes. OOD: 3-4 boxes (capped to 2x IID => 4).
+        n_boxes = 2 if not ood else int(self.rng.integers(3, 5))
+        n_boxes = int(min(n_boxes, len(self.colors)))
+
+        size = int(self.size)
+        if size < 4:
+            # Need at least: wall + 1-cell margin + box width>=2
+            raise ValueError(f"Skill10 requires grid size >= 4, got size={size}")
+
+        # "Exclude middle column": always exclude a single column index.
+        # For odd sizes this is the true middle; for even sizes this picks the right-middle column.
+        mid_col = size // 2
+
+        # Box dimensions scale with grid size (no 5x5 assumptions):
+        # - width at least 2 so it's a "box", and at most size-2 so it can be 1 cell away from a wall.
+        # - height at least 1; keep small to allow multiple boxes without overlap.
+        w_min = 2
+        w_max_global = min(4, size - 2)
+
+        used_row_ranges: list[tuple[int, int]] = []
+        placed_rects: list[tuple[int, int, int, int]] = []
+
+        box_colors = list(self.rng.choice(np.asarray(self.colors), size=n_boxes, replace=False).tolist())
+        for color in box_colors:
+            placed = False
+            for _ in range(200):
+                h = int(self.rng.integers(1, min(3, size) + 1))  # 1..3 (or smaller if size<3, but we guard)
+                r0 = int(self.rng.integers(0, size - h + 1))
+                r1 = r0 + h - 1
+
+                # Keep boxes vertically disjoint (with a 1-row gap) so horizontal shifts cannot overlap them.
+                ok_rows = True
+                for ur0, ur1 in used_row_ranges:
+                    if not (r1 < ur0 - 1 or ur1 < r0 - 1):
+                        ok_rows = False
+                        break
+                if not ok_rows:
+                    continue
+
+                # Place a box fully on either side of the excluded middle column.
+                # left side columns: [0 .. mid_col-1] has width mid_col
+                # right side columns: [mid_col+1 .. size-1] has width (size-mid_col-1)
+                left_width = int(mid_col)
+                right_width = int(size - mid_col - 1)
+
+                side = "left" if bool(self.rng.integers(0, 2)) == 0 else "right"
+                # If the chosen side can't fit width>=2, flip sides.
+                if side == "left" and left_width < w_min:
+                    side = "right"
+                if side == "right" and right_width < w_min:
+                    side = "left"
+
+                side_width = left_width if side == "left" else right_width
+                w_max = min(w_max_global, side_width)
+                if w_max < w_min:
+                    continue
+                w = int(self.rng.integers(w_min, w_max + 1))
+
+                if side == "left":
+                    max_c0 = (mid_col - 1) - (w - 1)
+                    if max_c0 < 0:
+                        continue
+                    c0 = int(self.rng.integers(0, max_c0 + 1))
+                else:
+                    min_c0 = mid_col + 1
+                    max_c0 = (size - 1) - (w - 1)
+                    if max_c0 < min_c0:
+                        continue
+                    c0 = int(self.rng.integers(min_c0, max_c0 + 1))
+
+                c1 = c0 + w - 1
+                if c0 <= mid_col <= c1:
+                    continue
+
+                rect = (r0, r1, c0, c1)
+                if any(_rects_overlap(rect, r) for r in placed_rects):
+                    continue
+
+                grid[r0 : r1 + 1, c0 : c1 + 1] = int(color)
+                placed_rects.append(rect)
+                used_row_ranges.append((r0, r1))
+                placed = True
+                break
+
+            if not placed:
+                break
+
+        return grid
+
+    def apply(self, grid: np.ndarray, rule_color: Optional[int]) -> np.ndarray:
+        _ = rule_color
+        size = int(grid.shape[1])
+        out = np.zeros_like(grid)
+
+        # Each box is monochrome; track boxes by color.
+        colors_present = sorted({int(c) for c in grid.flatten().tolist() if int(c) != 0})
+        for color in colors_present:
+            mask = grid == int(color)
+            if not np.any(mask):
+                continue
+            _, _, c0, c1 = _bbox(mask)
+
+            dist_left = int(c0)
+            dist_right = int((size - 1) - c1)
+            if dist_left <= dist_right:
+                dx = int(1 - c0)  # 1 cell away from left wall
+            else:
+                dx = int((size - 2) - c1)  # 1 cell away from right wall
+
+            rs, cs = np.nonzero(mask)
+            out[rs, (cs + dx).astype(np.int64)] = int(color)
+
+        return out
+
+class Skill11FilterUnique(Puzzle):
+    """
+    Dependent Skill 1: Uniqueness Detection.
+    Input: A grid with noise (distractors) and exactly one pixel of a 'unique' color.
+    Output: Only the unique pixel remains; all distractors are removed (black).
+    """
+    skill_id = 11
+    name = "filter_unique"
+    uses_rule_color = False
+
+    def make_input(self, *, ood: bool) -> np.ndarray:
+        grid = self.blank()
+        
+        # 1. Pick a color to be the unique one
+        unique_color = int(self.rng.choice(self.colors))
+        
+        # 2. Pick distractor colors (at least 1, max all others)
+        available_distractors = [c for c in self.colors if c != unique_color]
+        if not available_distractors:
+            # Fallback for edge case with few colors
+            available_distractors = [c for c in range(1, 5) if c != unique_color]
+            
+        # 3. Place the Unique Pixel
+        # OOD: Place it anywhere. ID: Avoid edges to make it "easier" to see? 
+        # Actually, let's keep placement uniform, but vary the amount of clutter.
+        r = int(self.rng.integers(0, self.size))
+        c = int(self.rng.integers(0, self.size))
+        grid[r, c] = unique_color
+        
+        # 4. Place Distractors
+        # Constraint: Distractors must appear at least 2 times each to be "not unique"
+        # ID: Low density. OOD: High density.
+        num_distractor_colors = int(self.rng.integers(1, len(available_distractors) + 1))
+        chosen_distractors = self.rng.choice(available_distractors, size=num_distractor_colors, replace=False)
+        
+        for d_color in chosen_distractors:
+            # Min 2 pixels for distractors
+            if ood:
+                count = int(self.rng.integers(3, 7)) # Higher clutter
+            else:
+                count = int(self.rng.integers(2, 4)) # Lower clutter
+                
+            for _ in range(count):
+                # Try to place distractor
+                for _try in range(20):
+                    dr = int(self.rng.integers(0, self.size))
+                    dc = int(self.rng.integers(0, self.size))
+                    if grid[dr, dc] == 0:
+                        grid[dr, dc] = d_color
+                        break
+        return grid
+
+    def apply(self, grid: np.ndarray, rule_color: Optional[int]) -> np.ndarray:
+        _ = rule_color
+        # Count color frequencies
+        vals, counts = np.unique(grid, return_counts=True)
+        unique_c = -1
+        
+        # Find the color that appears exactly once (excluding background 0)
+        for v, count in zip(vals, counts):
+            if v != 0 and count == 1:
+                unique_c = int(v)
+                break
+        
+        out = np.zeros_like(grid)
+        if unique_c != -1:
+            # Mask acts as a filter
+            mask = (grid == unique_c)
+            out[mask] = unique_c
+            
+        return out
+
+
+class Skill12PixelExplosion(Puzzle):
+    """
+    Dependent Skill 2: Spatial Expansion.
+    Input: Scattered single pixels.
+    Output: Each pixel becomes a 3x3 square of that color centered on the original.
+    Overlap handling: Later writes overwrite earlier ones (or simple max).
+    """
+    skill_id = 12
+    name = "pixel_explosion"
+    uses_rule_color = False
+
+    def make_input(self, *, ood: bool) -> np.ndarray:
+        grid = self.blank()
+        
+        # ID: 1 or 2 pixels, well separated.
+        # OOD: 3 to 5 pixels, potentially closer.
+        if ood:
+            n_pixels = int(self.rng.integers(3, 6))
+        else:
+            n_pixels = int(self.rng.integers(1, 3))
+            
+        placed_locs = []
+        
+        for _ in range(n_pixels):
+            color = int(self.rng.choice(self.colors))
+            
+            for _try in range(50):
+                r = int(self.rng.integers(1, self.size - 1)) # Keep 1px border so 3x3 fits comfortably? 
+                # Actually, let's allow border and handle clipping in apply()
+                r = int(self.rng.integers(0, self.size))
+                c = int(self.rng.integers(0, self.size))
+                
+                if grid[r, c] == 0:
+                    # Enforce some distance for visual clarity in ID
+                    if not ood and any(abs(r-pr) < 3 and abs(c-pc) < 3 for pr, pc in placed_locs):
+                         continue
+                         
+                    grid[r, c] = color
+                    placed_locs.append((r,c))
+                    break
+        return grid
+
+    def apply(self, grid: np.ndarray, rule_color: Optional[int]) -> np.ndarray:
+        _ = rule_color
+        out = np.zeros_like(grid)
+        size = grid.shape[0]
+        
+        rs, cs = np.nonzero(grid)
+        for r, c in zip(rs, cs):
+            color = grid[r, c]
+            
+            # Define 3x3 bounds
+            r_min = max(0, r - 1)
+            r_max = min(size, r + 2) # Slice exclusive
+            c_min = max(0, c - 1)
+            c_max = min(size, c + 2)
+            
+            out[r_min:r_max, c_min:c_max] = color
+            
+        return out
+
+
+class Skill13ExplodeUnique(Puzzle):
+    """
+    Target Skill: Composition of S11 and S12.
+    Input: Cluttered grid with one unique color pixel.
+    Output: Find the unique pixel, remove everything else, and expand the unique one to 3x3.
+    """
+    skill_id = 13
+    name = "explode_unique"
+    uses_rule_color = False
+
+    def make_input(self, *, ood: bool) -> np.ndarray:
+        # Use the logic from Skill 11 to generate the input
+        # We can instantiate S11 purely for generation if we want, or copy logic.
+        # Copying logic to avoid instantiation overhead/context issues.
+        
+        grid = self.blank()
+        unique_color = int(self.rng.choice(self.colors))
+        
+        available_distractors = [c for c in self.colors if c != unique_color]
+        if not available_distractors:
+             available_distractors = [c for c in range(1, 5) if c != unique_color]
+
+        # Place Unique
+        r = int(self.rng.integers(0, self.size))
+        c = int(self.rng.integers(0, self.size))
+        grid[r, c] = unique_color
+        
+        # Place Distractors
+        # ID: Low clutter. OOD: High clutter.
+        num_distractor_colors = int(self.rng.integers(1, len(available_distractors) + 1))
+        chosen_distractors = self.rng.choice(available_distractors, size=num_distractor_colors, replace=False)
+        
+        for d_color in chosen_distractors:
+            if ood:
+                count = int(self.rng.integers(3, 7))
+            else:
+                count = int(self.rng.integers(2, 4))
+                
+            for _ in range(count):
+                for _try in range(20):
+                    dr = int(self.rng.integers(0, self.size))
+                    dc = int(self.rng.integers(0, self.size))
+                    if grid[dr, dc] == 0:
+                        grid[dr, dc] = d_color
+                        break
+        return grid
+
+    def apply(self, grid: np.ndarray, rule_color: Optional[int]) -> np.ndarray:
+        _ = rule_color
+        
+        # Step 1: Filter Unique (Logic from S11)
+        vals, counts = np.unique(grid, return_counts=True)
+        unique_c = -1
+        unique_pos = None
+        
+        for v, count in zip(vals, counts):
+            if v != 0 and count == 1:
+                unique_c = int(v)
+                break
+        
+        if unique_c == -1:
+            return np.zeros_like(grid) # Should not happen based on generator
+            
+        # Find position of unique color
+        rs, cs = np.where(grid == unique_c)
+        if len(rs) == 0:
+             return np.zeros_like(grid)
+             
+        r, c = rs[0], cs[0]
+        
+        # Step 2: Explode (Logic from S12)
+        out = np.zeros_like(grid)
+        size = grid.shape[0]
+        
+        r_min = max(0, r - 1)
+        r_max = min(size, r + 2)
+        c_min = max(0, c - 1)
+        c_max = min(size, c + 2)
+        
+        out[r_min:r_max, c_min:c_max] = unique_c
+        
+        return out
+
+
+def _explosion_offsets(mode: str) -> list[tuple[int, int]]:
+    """
+    Return relative offsets (dr, dc) for a single-pixel "explosion" kernel.
+    Modes are designed to increase combinatorial variety while remaining easy to infer from demos.
+    """
+    if mode == "square3":
+        return [(dr, dc) for dr in (-1, 0, 1) for dc in (-1, 0, 1)]
+    if mode == "line3_h":
+        return [(0, -1), (0, 0), (0, 1)]
+    if mode == "line3_v":
+        return [(-1, 0), (0, 0), (1, 0)]
+    if mode == "ray3_right":
+        return [(0, 0), (0, 1), (0, 2)]
+    if mode == "ray3_left":
+        return [(0, 0), (0, -1), (0, -2)]
+    if mode == "ray3_down":
+        return [(0, 0), (1, 0), (2, 0)]
+    if mode == "ray3_up":
+        return [(0, 0), (-1, 0), (-2, 0)]
+    raise ValueError(f"Unknown explosion mode: {mode}")
+
+
+def _apply_explosion(
+    *,
+    out: np.ndarray,
+    row: int,
+    col: int,
+    color: int,
+    offsets: Sequence[tuple[int, int]],
+) -> None:
+    """Write an explosion at (row,col) onto out, clipping to bounds."""
+    h, w = int(out.shape[0]), int(out.shape[1])
+    for dr, dc in offsets:
+        rr = int(row) + int(dr)
+        cc = int(col) + int(dc)
+        if 0 <= rr < h and 0 <= cc < w:
+            out[rr, cc] = int(color)
+
+
+class Skill14FilterUniqueVariants(Puzzle):
+    """
+    Variant of Skill11 (filter_unique), but objects are solid rectangles, not just single pixels.
+
+    Input: non-overlapping solid rectangles of sizes in {1x1,1x2,2x1,2x2}.
+           Exactly one color appears in exactly one connected component; all other colors appear
+           in >=2 disconnected components.
+    Output: keep the entire unique-color object; remove everything else.
+    """
+
+    skill_id = 14
+    name = "filter_unique_variants"
+    uses_rule_color = False
+
+    def make_input(self, *, ood: bool) -> np.ndarray:
+        grid, _unique_color = _make_unique_rects_grid(size=self.size, colors=self.colors, rng=self.rng, ood=ood)
+        return grid
+
+    def apply(self, grid: np.ndarray, rule_color: Optional[int]) -> np.ndarray:
+        _ = rule_color
+        counts = _component_counts_by_color(grid)
+        unique_colors = [c for c, k in counts.items() if int(k) == 1]
+        if not unique_colors:
+            return np.zeros_like(grid)
+        unique_c = int(sorted(unique_colors)[0])
+        out = np.zeros_like(grid)
+        out[grid == unique_c] = unique_c
+        return out
+
+
+class Skill15PixelExplosionVariants(Puzzle):
+    """
+    Variant of Skill12 (pixel_explosion) with a per-task explosion kernel:
+    - 3x3 square
+    - 3-long horizontal / vertical line centered
+    - 3-long directional "ray" from the pixel (up/down/left/right)
+    """
+
+    skill_id = 15
+    name = "pixel_explosion_variants"
+    uses_rule_color = False
+
+    def __init__(
+        self,
+        *,
+        size: int = 5,
+        colors: Sequence[int] = (1, 2, 3, 4),
+        ood_spec: OODSpec = OODSpec(),
+        rng: Optional[np.random.Generator] = None,
+    ) -> None:
+        super().__init__(size=size, colors=colors, ood_spec=ood_spec, rng=rng)
+        modes = ["square3", "line3_h", "line3_v", "ray3_right", "ray3_left", "ray3_down", "ray3_up"]
+        self._explosion_mode = str(self.rng.choice(np.asarray(modes)))
+        self._offsets = _explosion_offsets(self._explosion_mode)
+
+    def make_input(self, *, ood: bool) -> np.ndarray:
+        grid = self.blank()
+        # ID: 1-2 pixels. OOD: 3-6 pixels (clipped by grid area).
+        if ood:
+            n_pixels = int(self.rng.integers(3, min(7, int(self.size) * int(self.size)) + 1))
+        else:
+            n_pixels = int(self.rng.integers(1, 3))
+
+        placed = 0
+        attempts = 0
+        while placed < n_pixels and attempts < n_pixels * 50:
+            attempts += 1
+            r = int(self.rng.integers(0, self.size))
+            c = int(self.rng.integers(0, self.size))
+            if grid[r, c] != 0:
+                continue
+            grid[r, c] = int(self.rng.choice(self.colors))
+            placed += 1
+        return grid
+
+    def apply(self, grid: np.ndarray, rule_color: Optional[int]) -> np.ndarray:
+        _ = rule_color
+        out = np.zeros_like(grid)
+        rs, cs = np.nonzero(grid)
+        for r, c in zip(rs.tolist(), cs.tolist()):
+            color = int(grid[int(r), int(c)])
+            _apply_explosion(out=out, row=int(r), col=int(c), color=color, offsets=self._offsets)
+        return out
+
+
+class Skill16ExplodeUniqueVariants(Puzzle):
+    """
+    Variant of Skill13 (explode_unique) that composes:
+    - Skill14-style uniqueness detection on rectangle objects
+    - Skill15-style explosion kernel
+
+    Input: same as Skill14.
+    Output: explode every pixel of the unique-color object using the per-task kernel.
+    """
+
+    skill_id = 16
+    name = "explode_unique_variants"
+    uses_rule_color = False
+
+    def __init__(
+        self,
+        *,
+        size: int = 5,
+        colors: Sequence[int] = (1, 2, 3, 4),
+        ood_spec: OODSpec = OODSpec(),
+        rng: Optional[np.random.Generator] = None,
+    ) -> None:
+        super().__init__(size=size, colors=colors, ood_spec=ood_spec, rng=rng)
+        modes = ["square3", "line3_h", "line3_v", "ray3_right", "ray3_left", "ray3_down", "ray3_up"]
+        self._explosion_mode = str(self.rng.choice(np.asarray(modes)))
+        self._offsets = _explosion_offsets(self._explosion_mode)
+
+    def make_input(self, *, ood: bool) -> np.ndarray:
+        grid, _unique_color = _make_unique_rects_grid(size=self.size, colors=self.colors, rng=self.rng, ood=ood)
+        return grid
+
+    def apply(self, grid: np.ndarray, rule_color: Optional[int]) -> np.ndarray:
+        _ = rule_color
+        counts = _component_counts_by_color(grid)
+        unique_colors = [c for c, k in counts.items() if int(k) == 1]
+        if not unique_colors:
+            return np.zeros_like(grid)
+        unique_c = int(sorted(unique_colors)[0])
+        mask = grid == unique_c
+
+        out = np.zeros_like(grid)
+        rs, cs = np.nonzero(mask)
+        for r, c in zip(rs.tolist(), cs.tolist()):
+            _apply_explosion(out=out, row=int(r), col=int(c), color=unique_c, offsets=self._offsets)
+        return out
+
+# --- Update the Factory ---
+
+def build_puzzle(skill_id: int, *, size: int, rng: Optional[np.random.Generator] = None) -> Puzzle:
+    if skill_id == 1:
+        return Skill1Gravity(size=size, rng=rng)
+    if skill_id == 2:
+        return Skill2BottomRecolor(size=size, rng=rng)
+    if skill_id == 3:
+        return Skill3GravityThenRecolor(size=size, rng=rng)
+    if skill_id == 4:
+        return Skill4PlaceCenterDot(size=size, rng=rng)
+    if skill_id == 5:
+        return Skill5FillRectangleInterior(size=size, rng=rng)
+    if skill_id == 6:
+        return Skill6RightGravity(size=size, rng=rng)
+    if skill_id == 7:
+        return Skill7DownThenRight(size=size, rng=rng)
+    if skill_id == 8:
+        return Skill8DropThenShootRay(size=size, rng=rng)
+    if skill_id == 9:
+        return Skill9ShootRay(size=size, rng=rng)
+    if skill_id == 10:
+        return Skill10BoxesToNearestWall(size=size, rng=rng)
+    # New Skills
+    if skill_id == 11:
+        return Skill11FilterUnique(size=size, rng=rng)
+    if skill_id == 12:
+        return Skill12PixelExplosion(size=size, rng=rng)
+    if skill_id == 13:
+        return Skill13ExplodeUnique(size=size, rng=rng)
+    if skill_id == 14:
+        return Skill14FilterUniqueVariants(size=size, rng=rng)
+    if skill_id == 15:
+        return Skill15PixelExplosionVariants(size=size, rng=rng)
+    if skill_id == 16:
+        return Skill16ExplodeUniqueVariants(size=size, rng=rng)
+        
+    raise ValueError(f"Unknown skill_id={skill_id}")
+
