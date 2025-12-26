@@ -60,7 +60,7 @@ CUDA_VISIBLE_DEVICES=0 python arc_train_transformer.py \
   --steps=100000
 ```
 
-#### “Wait” run (delay introducing skill 16 until step 60k)
+#### “Wait” run (delay introducing skills until specific steps)
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 python arc_train_transformer.py \
@@ -68,8 +68,20 @@ CUDA_VISIBLE_DEVICES=0 python arc_train_transformer.py \
   --data_dir=6x6_400 \
   --grid_size=6 \
   --steps=100000 \
-  --delay_train_skill=16 \
-  --delay_train_until_step=60000
+  --delay_train_skills 16 \
+  --delay_train_until_steps 60000
+```
+
+You can delay multiple skills with different cutoff steps:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python arc_train_transformer.py \
+  --out_dir=2025_12_25_6x6_400_wait_multi_wd \
+  --data_dir=6x6_400 \
+  --grid_size=6 \
+  --steps=100000 \
+  --delay_train_skills 13 14 \
+  --delay_train_until_steps 1000 5000
 ```
 
 ---

@@ -178,7 +178,7 @@ def main() -> None:
     p.add_argument("--grid_size", type=int, default=6, help="Grid size (NxN)")
     p.add_argument("--skills", type=int, nargs="*", default=range(11,17), help="Skills to generate (e.g. 1 2 3)")
     p.add_argument("--seed", type=int, default=0, help="Base RNG seed")
-    p.add_argument("--png_per_skill", type=int, default=4, help="How many tasks to render as PNG per skill per split")
+    p.add_argument("--png_per_skill", type=int, default=8, help="How many tasks to render as PNG per skill per split")
     p.add_argument(
         "--no_progress",
         action="store_true",

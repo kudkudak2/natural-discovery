@@ -890,33 +890,24 @@ class Skill12PixelExplosion(Puzzle):
 
     def make_input(self, *, ood: bool) -> np.ndarray:
         grid = self.blank()
-        
-        # ID: 1 or 2 pixels, well separated.
-        # OOD: 3 to 5 pixels, potentially closer.
-        if ood:
-            n_pixels = int(self.rng.integers(3, 6))
-        else:
-            n_pixels = int(self.rng.integers(1, 3))
-            
-        placed_locs = []
-        
+
+        # Standard 3x3 kernel offsets.
+        offsets = [(dr, dc) for dr in (-1, 0, 1) for dc in (-1, 0, 1)]
+
+        # ID: 1-2 well-separated pixels. OOD: 3-4 pixels.
+        n_pixels = int(self.rng.integers(3, 5)) if ood else int(self.rng.integers(1, 3))
+
+        placed_locs: list[tuple[int, int]] = []
         for _ in range(n_pixels):
-            color = int(self.rng.choice(self.colors))
-            
-            for _try in range(50):
-                r = int(self.rng.integers(1, self.size - 1)) # Keep 1px border so 3x3 fits comfortably? 
-                # Actually, let's allow border and handle clipping in apply()
-                r = int(self.rng.integers(0, self.size))
-                c = int(self.rng.integers(0, self.size))
-                
-                if grid[r, c] == 0:
-                    # Enforce some distance for visual clarity in ID
-                    if not ood and any(abs(r-pr) < 3 and abs(c-pc) < 3 for pr, pc in placed_locs):
-                         continue
-                         
-                    grid[r, c] = color
-                    placed_locs.append((r,c))
-                    break
+            mask = _get_safe_placement_mask(self.size, offsets, placed_locs, separation_buffer=1)
+            mask[grid != 0] = False
+            valid = np.argwhere(mask)
+            if valid.size == 0:
+                break
+            idx = int(self.rng.choice(len(valid)))
+            r, c = valid[idx]
+            grid[int(r), int(c)] = int(self.rng.choice(self.colors))
+            placed_locs.append((int(r), int(c)))
         return grid
 
     def apply(self, grid: np.ndarray, rule_color: Optional[int]) -> np.ndarray:
@@ -1045,6 +1036,124 @@ def _explosion_offsets(mode: str) -> list[tuple[int, int]]:
     raise ValueError(f"Unknown explosion mode: {mode}")
 
 
+def _explosion_offsets_extended(mode: str) -> list[tuple[int, int]]:
+    """
+    Extended explosion kernels used by some variant skills.
+
+    Includes the base modes from `_explosion_offsets` plus:
+    - diag3_main: main diagonal centered on the pixel
+    - diag3_anti: anti-diagonal centered on the pixel
+    - cross3: center + 4-neighbors (up/down/left/right)
+    """
+    if mode == "diag3_main":
+        return [(-1, -1), (0, 0), (1, 1)]
+    if mode == "diag3_anti":
+        return [(-1, 1), (0, 0), (1, -1)]
+    if mode == "cross3":
+        return [(-1, 0), (0, -1), (0, 0), (0, 1), (1, 0)]
+    return _explosion_offsets(mode)
+
+
+def _shift_bool_grid(a: np.ndarray, dr: int, dc: int) -> np.ndarray:
+    """
+    Shift a boolean grid by (dr, dc). Out-of-bounds cells are filled with False.
+
+    dr > 0 shifts content down; dc > 0 shifts content right.
+    """
+    h, w = int(a.shape[0]), int(a.shape[1])
+    out = np.zeros((h, w), dtype=bool)
+
+    if dr >= 0:
+        src_r0, dst_r0 = 0, dr
+        src_r1, dst_r1 = h - dr, h
+    else:
+        src_r0, dst_r0 = -dr, 0
+        src_r1, dst_r1 = h, h + dr
+
+    if dc >= 0:
+        src_c0, dst_c0 = 0, dc
+        src_c1, dst_c1 = w - dc, w
+    else:
+        src_c0, dst_c0 = -dc, 0
+        src_c1, dst_c1 = w, w + dc
+
+    if src_r0 >= src_r1 or src_c0 >= src_c1:
+        return out
+
+    out[dst_r0:dst_r1, dst_c0:dst_c1] = a[src_r0:src_r1, src_c0:src_c1]
+    return out
+
+
+def _get_safe_placement_mask(
+    size: int,
+    offsets: Sequence[tuple[int, int]],
+    existing_pixels: list[tuple[int, int]],
+    separation_buffer: int = 1,
+) -> np.ndarray:
+    """
+    Returns a boolean mask of valid (r, c) locations where a pixel can be placed such that:
+    1) Margin check: its explosion (defined by offsets) does not clip outside the grid.
+    2) Separation check: its explosion footprint does not overlap or touch existing explosions.
+
+    Separation is enforced at the *explosion footprint* level (not just center distance), and
+    uses 4-neighbor adjacency expanded by `separation_buffer` in Chebyshev distance.
+    """
+    size = int(size)
+    mask = np.ones((size, size), dtype=bool)
+    if size <= 0:
+        return mask
+
+    # 1) Margin check: eliminate edges where the kernel would clip.
+    rows = [int(dr) for dr, _dc in offsets]
+    cols = [int(dc) for _dr, dc in offsets]
+    min_dr, max_dr = int(min(rows)), int(max(rows))
+    min_dc, max_dc = int(min(cols)), int(max(cols))
+
+    if min_dr < 0:
+        mask[0 : -min_dr, :] = False
+    if max_dr > 0:
+        mask[size - max_dr : size, :] = False
+    if min_dc < 0:
+        mask[:, 0 : -min_dc] = False
+    if max_dc > 0:
+        mask[:, size - max_dc : size] = False
+
+    # 2) Separation check: new explosion must not overlap/touch old explosions.
+    if existing_pixels:
+        existing_footprint = np.zeros((size, size), dtype=bool)
+        for r0, c0 in existing_pixels:
+            rr0, cc0 = int(r0), int(c0)
+            for dr, dc in offsets:
+                rr = rr0 + int(dr)
+                cc = cc0 + int(dc)
+                if 0 <= rr < size and 0 <= cc < size:
+                    existing_footprint[rr, cc] = True
+
+        # Expand footprint by separation_buffer in Chebyshev distance.
+        forbidden = existing_footprint.copy()
+        b = int(separation_buffer)
+        if b > 0:
+            for dr in range(-b, b + 1):
+                for dc in range(-b, b + 1):
+                    if dr == 0 and dc == 0:
+                        continue
+                    forbidden |= _shift_bool_grid(existing_footprint, dr, dc)
+
+        # Block any center whose explosion footprint would land on a forbidden cell.
+        blocked_centers = np.zeros((size, size), dtype=bool)
+        for dr, dc in offsets:
+            blocked_centers |= _shift_bool_grid(forbidden, -int(dr), -int(dc))
+        mask[blocked_centers] = False
+
+        # Also disallow re-using an existing center location.
+        for rr, cc in existing_pixels:
+            r1, c1 = int(rr), int(cc)
+            if 0 <= r1 < size and 0 <= c1 < size:
+                mask[r1, c1] = False
+
+    return mask
+
+
 def _apply_explosion(
     *,
     out: np.ndarray,
@@ -1098,6 +1207,8 @@ class Skill15PixelExplosionVariants(Puzzle):
     - 3x3 square
     - 3-long horizontal / vertical line centered
     - 3-long directional "ray" from the pixel (up/down/left/right)
+    - 3-long diagonals
+    - 5-cell cross (center + 4-neighbors)
     """
 
     skill_id = 15
@@ -1113,28 +1224,38 @@ class Skill15PixelExplosionVariants(Puzzle):
         rng: Optional[np.random.Generator] = None,
     ) -> None:
         super().__init__(size=size, colors=colors, ood_spec=ood_spec, rng=rng)
-        modes = ["square3", "line3_h", "line3_v", "ray3_right", "ray3_left", "ray3_down", "ray3_up"]
+        modes = [
+            "square3",
+            "line3_h",
+            "line3_v",
+            "ray3_right",
+            "ray3_left",
+            "ray3_down",
+            "ray3_up",
+            "diag3_main",
+            "diag3_anti",
+            "cross3",
+        ]
         self._explosion_mode = str(self.rng.choice(np.asarray(modes)))
-        self._offsets = _explosion_offsets(self._explosion_mode)
+        self._offsets = _explosion_offsets_extended(self._explosion_mode)
 
     def make_input(self, *, ood: bool) -> np.ndarray:
         grid = self.blank()
-        # ID: 1-2 pixels. OOD: 3-6 pixels (clipped by grid area).
-        if ood:
-            n_pixels = int(self.rng.integers(3, min(7, int(self.size) * int(self.size)) + 1))
-        else:
-            n_pixels = int(self.rng.integers(1, 3))
 
-        placed = 0
-        attempts = 0
-        while placed < n_pixels and attempts < n_pixels * 50:
-            attempts += 1
-            r = int(self.rng.integers(0, self.size))
-            c = int(self.rng.integers(0, self.size))
-            if grid[r, c] != 0:
-                continue
-            grid[r, c] = int(self.rng.choice(self.colors))
-            placed += 1
+        # ID: 1-2 pixels. OOD: 2-4 pixels.
+        n_pixels = int(self.rng.integers(2, 5)) if ood else int(self.rng.integers(1, 3))
+
+        placed_locs: list[tuple[int, int]] = []
+        for _ in range(n_pixels):
+            mask = _get_safe_placement_mask(self.size, self._offsets, placed_locs, separation_buffer=1)
+            mask[grid != 0] = False
+            valid = np.argwhere(mask)
+            if valid.size == 0:
+                break
+            idx = int(self.rng.choice(len(valid)))
+            r, c = valid[idx]
+            grid[int(r), int(c)] = int(self.rng.choice(self.colors))
+            placed_locs.append((int(r), int(c)))
         return grid
 
     def apply(self, grid: np.ndarray, rule_color: Optional[int]) -> np.ndarray:
@@ -1150,11 +1271,12 @@ class Skill15PixelExplosionVariants(Puzzle):
 class Skill16ExplodeUniqueVariants(Puzzle):
     """
     Variant of Skill13 (explode_unique) that composes:
-    - Skill14-style uniqueness detection on rectangle objects
+    - Skill14-style uniqueness detection (by connected components)
     - Skill15-style explosion kernel
 
-    Input: same as Skill14.
-    Output: explode every pixel of the unique-color object using the per-task kernel.
+    Input: scattered pixels where exactly one color forms exactly one 4-connected component,
+           and all other present colors form >=2 disconnected components each.
+    Output: explode every pixel of the unique-color component using the per-task kernel.
     """
 
     skill_id = 16
@@ -1170,12 +1292,128 @@ class Skill16ExplodeUniqueVariants(Puzzle):
         rng: Optional[np.random.Generator] = None,
     ) -> None:
         super().__init__(size=size, colors=colors, ood_spec=ood_spec, rng=rng)
-        modes = ["square3", "line3_h", "line3_v", "ray3_right", "ray3_left", "ray3_down", "ray3_up"]
+        modes = [
+            "square3",
+            "line3_h",
+            "line3_v",
+            "ray3_right",
+            "ray3_left",
+            "ray3_down",
+            "ray3_up",
+            "diag3_main",
+            "diag3_anti",
+            "cross3",
+        ]
         self._explosion_mode = str(self.rng.choice(np.asarray(modes)))
-        self._offsets = _explosion_offsets(self._explosion_mode)
+        self._offsets = _explosion_offsets_extended(self._explosion_mode)
 
     def make_input(self, *, ood: bool) -> np.ndarray:
-        grid, _unique_color = _make_unique_rects_grid(size=self.size, colors=self.colors, rng=self.rng, ood=ood)
+        size = int(self.size)
+
+        for _attempt in range(200):
+            grid = self.blank()
+
+            # 1) Pick the unique color and distractor colors.
+            unique_color = int(self.rng.choice(self.colors))
+            distractors = [int(c) for c in self.colors if int(c) != unique_color]
+            if not distractors:
+                distractors = [c for c in range(1, 5) if int(c) != unique_color]
+            if not distractors:
+                continue
+
+            max_d = min(len(distractors), 3 if not ood else 4)
+            n_distractor_colors = int(self.rng.integers(1, max_d + 1))
+            distractor_colors = (
+                self.rng.choice(np.asarray(distractors), size=n_distractor_colors, replace=False).tolist()
+            )
+
+            # 2) Place UNIQUE object (strictly 1x1) in a safe spot for the explosion.
+            mask = _get_safe_placement_mask(size, self._offsets, [], separation_buffer=1)
+            valid = np.argwhere(mask)
+            if valid.size == 0:
+                continue
+            idx = int(self.rng.choice(len(valid)))
+            ur, uc = valid[idx]
+            ur_i, uc_i = int(ur), int(uc)
+            grid[ur_i, uc_i] = unique_color
+
+            # 3) Place DISTRACTORS such that each distractor color has >=2 disconnected components.
+            # We do this by placing isolated (4-disconnected) pixels for each distractor color.
+            for d_color in distractor_colors:
+                if ood:
+                    n_pix = int(self.rng.integers(3, 7))
+                else:
+                    n_pix = int(self.rng.integers(2, 5))
+
+                placed = 0
+                tries = 0
+                while placed < n_pix and tries < 400:
+                    tries += 1
+                    r = int(self.rng.integers(0, size))
+                    c = int(self.rng.integers(0, size))
+                    if grid[r, c] != 0:
+                        continue
+                    # Ensure this pixel is not 4-adjacent to an existing pixel of the same color,
+                    # so components stay separated.
+                    if r > 0 and int(grid[r - 1, c]) == int(d_color):
+                        continue
+                    if r + 1 < size and int(grid[r + 1, c]) == int(d_color):
+                        continue
+                    if c > 0 and int(grid[r, c - 1]) == int(d_color):
+                        continue
+                    if c + 1 < size and int(grid[r, c + 1]) == int(d_color):
+                        continue
+                    grid[r, c] = int(d_color)
+                    placed += 1
+
+                if placed < 2:
+                    break
+
+            # Validate uniqueness-by-components (same contract as Skill14/16 expect).
+            counts = _component_counts_by_color(grid)
+            if int(counts.get(unique_color, 0)) != 1:
+                continue
+            if any(int(counts.get(int(dc), 0)) < 2 for dc in distractor_colors):
+                continue
+            singles = [c for c, k in counts.items() if int(k) == 1]
+            if len(singles) != 1:
+                continue
+
+            return grid
+
+        # Fallback: minimal, valid construction (still enforces unique 1x1).
+        grid = self.blank()
+        unique_color = int(self.colors[0]) if len(self.colors) > 0 else 1
+        mask = _get_safe_placement_mask(size, self._offsets, [], separation_buffer=1)
+        valid = np.argwhere(mask)
+        if valid.size == 0:
+            ur_i, uc_i = size // 2, size // 2
+        else:
+            r, c = valid[int(self.rng.choice(len(valid)))]
+            ur_i, uc_i = int(r), int(c)
+        grid[ur_i, uc_i] = unique_color
+
+        distractor_color = int(self.colors[1]) if len(self.colors) > 1 else 2
+        # Place two isolated pixels of the distractor color.
+        placed = 0
+        for r in range(size):
+            for c in range(size):
+                if placed >= 2:
+                    break
+                if grid[r, c] != 0:
+                    continue
+                if r > 0 and int(grid[r - 1, c]) == distractor_color:
+                    continue
+                if r + 1 < size and int(grid[r + 1, c]) == distractor_color:
+                    continue
+                if c > 0 and int(grid[r, c - 1]) == distractor_color:
+                    continue
+                if c + 1 < size and int(grid[r, c + 1]) == distractor_color:
+                    continue
+                grid[r, c] = distractor_color
+                placed += 1
+            if placed >= 2:
+                break
         return grid
 
     def apply(self, grid: np.ndarray, rule_color: Optional[int]) -> np.ndarray:

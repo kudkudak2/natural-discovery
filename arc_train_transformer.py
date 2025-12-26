@@ -74,6 +74,8 @@ def main(
     train_skills: Optional[list[int]] = None,
     delay_train_skill: Optional[int] = None,
     delay_train_until_step: int = 0,
+    delay_train_skills: Optional[list[int]] = None,
+    delay_train_until_steps: Optional[list[int]] = None,
     probe_skill: int = 8,
     cap_train_skill3: Optional[int] = None,
     cap_train_skill: Optional[int] = None,
@@ -121,12 +123,38 @@ def main(
         if sid < 1:
             raise ValueError(f"Invalid skill id: {sid}")
 
-    if delay_train_until_step < 0:
-        raise ValueError(f"delay_train_until_step must be >= 0, got {delay_train_until_step}")
-    if delay_train_skill is not None:
-        delay_train_skill = int(delay_train_skill)
-        if delay_train_skill not in train_skills:
-            raise ValueError(f"delay_train_skill={delay_train_skill} must be included in train_skills")
+    # Delayed introduction schedule: skill -> step at which it becomes available (included when step >= until_step).
+    # Back-compat: allow the old single-skill flags, but prefer the multi-skill form.
+    delay_until_by_skill: dict[int, int] = {}
+    if (delay_train_skills is not None) or (delay_train_until_steps is not None):
+        if (delay_train_skill is not None) or (int(delay_train_until_step) != 0):
+            raise ValueError(
+                "Use either (--delay_train_skill, --delay_train_until_step) OR "
+                "(--delay_train_skills, --delay_train_until_steps), not both."
+            )
+        skills_list = [] if delay_train_skills is None else [int(s) for s in delay_train_skills]
+        until_list = [] if delay_train_until_steps is None else [int(s) for s in delay_train_until_steps]
+        if len(skills_list) != len(until_list):
+            raise ValueError(
+                f"--delay_train_skills and --delay_train_until_steps must have the same length, "
+                f"got {len(skills_list)} vs {len(until_list)}"
+            )
+        for sid, until in zip(skills_list, until_list):
+            if until < 0:
+                raise ValueError(f"delay step must be >= 0, got {until} for skill {sid}")
+            if sid not in train_skills:
+                raise ValueError(f"Delayed skill {sid} must be included in train_skills")
+            if until > 0:
+                delay_until_by_skill[sid] = int(until)
+    else:
+        if delay_train_until_step < 0:
+            raise ValueError(f"delay_train_until_step must be >= 0, got {delay_train_until_step}")
+        if delay_train_skill is not None:
+            delay_train_skill = int(delay_train_skill)
+            if delay_train_skill not in train_skills:
+                raise ValueError(f"delay_train_skill={delay_train_skill} must be included in train_skills")
+            if int(delay_train_until_step) > 0:
+                delay_until_by_skill[int(delay_train_skill)] = int(delay_train_until_step)
 
     probe_skill = int(probe_skill)
     if probe_skill < 1:
@@ -206,31 +234,46 @@ def main(
         if ds.grid_size != grid_size:
             raise ValueError(f"Dataset grid_size={ds.grid_size} != --grid_size={grid_size}")
 
-    # Build mixed training pools. Optionally delay one skill until a given step.
+    # Build mixed training pools. Optionally delay multiple skills until specified steps.
     train_src_all = torch.cat([train_sets[sid].src for sid in train_skills], dim=0)
     train_tgt_all = torch.cat([train_sets[sid].tgt for sid in train_skills], dim=0)
     train_pool_all = TensorizedDataset(
         skill_id=-1, split="train_mix", grid_size=grid_size, src=train_src_all, tgt=train_tgt_all
     )
 
-    train_pool_pre = train_pool_all
-    if delay_train_skill is not None and int(delay_train_until_step) > 0:
-        pre_skills = [sid for sid in train_skills if sid != int(delay_train_skill)]
-        if len(pre_skills) == 0:
-            raise ValueError("Delaying the only training skill would leave an empty training pool.")
-        train_src_pre = torch.cat([train_sets[sid].src for sid in pre_skills], dim=0)
-        train_tgt_pre = torch.cat([train_sets[sid].tgt for sid in pre_skills], dim=0)
-        train_pool_pre = TensorizedDataset(
-            skill_id=-1,
-            split=f"train_mix_no_s{int(delay_train_skill)}_until_{int(delay_train_until_step)}",
-            grid_size=grid_size,
-            src=train_src_pre,
-            tgt=train_tgt_pre,
-        )
+    def build_pool(active_skills: list[int], *, split: str) -> TensorizedDataset:
+        train_src = torch.cat([train_sets[sid].src for sid in active_skills], dim=0)
+        train_tgt = torch.cat([train_sets[sid].tgt for sid in active_skills], dim=0)
+        return TensorizedDataset(skill_id=-1, split=split, grid_size=grid_size, src=train_src, tgt=train_tgt)
 
-    # Ensure training pools won't bottleneck on CPU.
-    train_pool_all = maybe_move_train_pool(train_pool_all, device=device, dataset_device=str(dataset_device))
-    train_pool_pre = maybe_move_train_pool(train_pool_pre, device=device, dataset_device=str(dataset_device))
+    # Precompute phase pools keyed by the step at which that pool becomes active.
+    phase_starts = [0]
+    if len(delay_until_by_skill) > 0:
+        phase_starts += sorted(set(int(v) for v in delay_until_by_skill.values() if int(v) > 0))
+
+    train_pool_phases: list[tuple[int, TensorizedDataset]] = []
+    for start in phase_starts:
+        active_skills = [sid for sid in train_skills if int(delay_until_by_skill.get(sid, 0)) <= int(start)]
+        if len(active_skills) == 0:
+            raise ValueError("Delaying all training skills at step 0 would leave an empty training pool.")
+        if len(active_skills) == len(train_skills):
+            pool = train_pool_all
+        else:
+            excluded = [sid for sid in train_skills if sid not in active_skills]
+            excluded_s = "_".join(f"s{sid}" for sid in excluded)
+            pool = build_pool(active_skills, split=f"train_mix_excl_{excluded_s}_from_{int(start)}")
+        train_pool_phases.append((int(start), pool))
+
+    # Ensure training pools won't bottleneck on CPU (avoid moving duplicate references twice).
+    moved_cache: dict[int, TensorizedDataset] = {}
+
+    def move_pool(pool: TensorizedDataset) -> TensorizedDataset:
+        k = id(pool)
+        if k not in moved_cache:
+            moved_cache[k] = maybe_move_train_pool(pool, device=device, dataset_device=str(dataset_device))
+        return moved_cache[k]
+
+    train_pool_phases = [(start, move_pool(pool)) for start, pool in train_pool_phases]
 
     model = ARCTransformer(
         vocab_size=VOCAB_SIZE,
@@ -278,8 +321,11 @@ def main(
     )
     gen_cpu = torch.Generator().manual_seed(int(seed))
     steps_iter = progress_iter(range(int(steps)), total=int(steps), desc="train", enabled=bool(progress))
+    phase_idx = 0
     for step in steps_iter:
-        active_pool = train_pool_pre if (delay_train_skill is not None and step < int(delay_train_until_step)) else train_pool_all
+        while (phase_idx + 1) < len(train_pool_phases) and int(step) >= int(train_pool_phases[phase_idx + 1][0]):
+            phase_idx += 1
+        active_pool = train_pool_phases[phase_idx][1]
         batch = prepare_batch(
             batch_size=int(batch_size),
             train_pool=active_pool,
@@ -384,11 +430,16 @@ def main(
             write_learning_curves_csv(curves=curves, skills=sorted(eval_ids), out_path=metrics_csv)
 
             if plots_enabled:
+                delay_s = (
+                    "none"
+                    if len(delay_until_by_skill) == 0
+                    else " ".join(f"s{sid}@{until}" for sid, until in sorted(delay_until_by_skill.items()))
+                )
                 title = (
                     "ARC skill learning curves (exact-match acc)\n"
                     f"train_skills={train_skills} | ood_in_train={sorted(train_with_ood)} | "
                     f"probe_skill={probe_skill} | cap_skill={cap_skill}:{cap_n} | "
-                    f"delay_skill={delay_train_skill}@{int(delay_train_until_step)} | eval_tasks={int(eval_tasks)}"
+                    f"delay_skills={delay_s} | eval_tasks={int(eval_tasks)}"
                 )
                 latest = out_dir / "plots" / "learning_curves_latest.png"
                 plot_learning_curves(curves=curves, skills=sorted(eval_ids), out_path=latest, title=title)
@@ -416,15 +467,28 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--train_skills", type=int, nargs="*", default=list(DEFAULT_TRAIN_SKILLS))
     p.add_argument(
         "--delay_train_skill",
+        "--delay_train_skills",
+        dest="delay_train_skills",
         type=int,
+        nargs="*",
         default=None,
-        help="Exclude this skill from the mixed training pool until --delay_train_until_step (hard switch).",
+        help=(
+            "Exclude these skills from the mixed training pool initially (hard switch). "
+            "Must be paired 1:1 with --delay_train_until_step/--delay_train_until_steps. "
+            "Example: --delay_train_skills 13 14 --delay_train_until_steps 1000 5000"
+        ),
     )
     p.add_argument(
         "--delay_train_until_step",
+        "--delay_train_until_steps",
+        dest="delay_train_until_steps",
         type=int,
-        default=0,
-        help="Step at which --delay_train_skill is introduced into training.",
+        nargs="*",
+        default=None,
+        help=(
+            "For each skill in --delay_train_skill/--delay_train_skills, the step at which that skill is introduced. "
+            "Example: --delay_train_skills 13 14 --delay_train_until_steps 1000 5000"
+        ),
     )
     p.add_argument(
         "--probe_skill",
@@ -521,8 +585,8 @@ def cli_main(argv: Optional[list[str]] = None) -> None:
         data_dir=Path(args.data_dir),
         grid_size=int(args.grid_size),
         train_skills=[int(s) for s in args.train_skills] if args.train_skills is not None else None,
-        delay_train_skill=int(args.delay_train_skill) if args.delay_train_skill is not None else None,
-        delay_train_until_step=int(args.delay_train_until_step),
+        delay_train_skills=[int(s) for s in args.delay_train_skills] if args.delay_train_skills is not None else None,
+        delay_train_until_steps=[int(s) for s in args.delay_train_until_steps] if args.delay_train_until_steps is not None else None,
         probe_skill=int(args.probe_skill),
         cap_train_skill3=int(args.cap_train_skill3) if args.cap_train_skill3 is not None else None,
         cap_train_skill=int(args.cap_train_skill) if args.cap_train_skill is not None else None,
