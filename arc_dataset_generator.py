@@ -5,6 +5,7 @@ import hashlib
 import importlib.util
 import json
 import shutil
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 from typing import Iterable, Optional
 
@@ -16,7 +17,7 @@ from arc_dataset_models import (
     ARCTask,
     ARCTestCase,
 )
-from arc_puzzles import build_puzzle
+from arc_puzzles import ShrinkPerturbSpec, build_puzzle
 
 
 def _stable_id(*parts: str) -> str:
@@ -29,6 +30,49 @@ def _stable_id(*parts: str) -> str:
 
 def _grid_to_list(grid: np.ndarray) -> list[list[int]]:
     return [[int(x) for x in row] for row in grid.tolist()]
+
+
+def _task_from_seed(
+    *,
+    skill_id: int,
+    grid_size: int,
+    dataset_id: str,
+    split: str,
+    ood: bool,
+    task_index: int,
+    task_seed: int,
+    shrink_perturb: Optional[ShrinkPerturbSpec],
+) -> ARCTask:
+    rng = np.random.default_rng(seed=int(task_seed))
+    puzzle = build_puzzle(int(skill_id), size=int(grid_size), rng=rng, shrink_perturb=shrink_perturb)
+    demos, (t_in, t_out), rule_color = puzzle.generate_prompt(num_demos=3, ood_test=bool(ood))
+
+    task_id = _stable_id(dataset_id, str(int(task_index)))
+    return ARCTask(
+        task_id=task_id,
+        skill_id=int(skill_id),
+        skill_name=puzzle.name,
+        puzzle_variant=puzzle.variant_id,
+        puzzle_params=puzzle.variant_params(),
+        grid_size=int(grid_size),
+        rule_color=rule_color,
+        demos=[ARCExamplePair(x=_grid_to_list(x), y=_grid_to_list(y)) for (x, y) in demos],
+        test=ARCTestCase(x=_grid_to_list(t_in), y=_grid_to_list(t_out)),
+    )
+
+
+def _task_from_seed_packed(args: tuple[int, int, str, str, bool, int, int, Optional[ShrinkPerturbSpec]]) -> ARCTask:
+    skill_id, grid_size, dataset_id, split, ood, task_index, task_seed, shrink_perturb = args
+    return _task_from_seed(
+        skill_id=skill_id,
+        grid_size=grid_size,
+        dataset_id=dataset_id,
+        split=split,
+        ood=ood,
+        task_index=task_index,
+        task_seed=task_seed,
+        shrink_perturb=shrink_perturb,
+    )
 
 
 def _has_tqdm() -> bool:
@@ -55,6 +99,8 @@ def generate_dataset(
     split: str,
     ood: bool,
     seed: int,
+    shrink_perturb: Optional[ShrinkPerturbSpec] = None,
+    n_jobs: int = 1,
     show_progress: bool = True,
 ) -> ARCDataset:
     rng = np.random.default_rng(seed=seed)
@@ -62,29 +108,57 @@ def generate_dataset(
     dataset_id = _stable_id("arc_synth", f"skill={skill_id}", f"split={split}", f"ood={ood}", f"seed={seed}")
     tasks: list[ARCTask] = []
 
-    task_iter = range(int(n_tasks))
-    if show_progress:
-        task_iter = _progress(task_iter, total=int(n_tasks), desc=f"skill {skill_id} {split}: tasks")
+    n_jobs = int(n_jobs)
+    if n_jobs <= 1:
+        task_iter = range(int(n_tasks))
+        if show_progress:
+            task_iter = _progress(task_iter, total=int(n_tasks), desc=f"skill {skill_id} {split}: tasks")
 
-    for i in task_iter:
-        # Important: instantiate a fresh puzzle per task so any per-task latent parameters
-        # (e.g., explosion kernel variants) are resampled across tasks while remaining
-        # reproducible under the single top-level RNG seed.
-        puzzle = build_puzzle(skill_id, size=grid_size, rng=rng)
-        demos, (t_in, t_out), rule_color = puzzle.generate_prompt(num_demos=3, ood_test=ood)
+        for i in task_iter:
+            # Important: instantiate a fresh puzzle per task so any per-task latent parameters
+            # (e.g., explosion kernel variants) are resampled across tasks while remaining
+            # reproducible under the single top-level RNG seed.
+            puzzle = build_puzzle(skill_id, size=grid_size, rng=rng, shrink_perturb=shrink_perturb)
+            demos, (t_in, t_out), rule_color = puzzle.generate_prompt(num_demos=3, ood_test=ood)
 
-        task_id = _stable_id(dataset_id, str(i))
-        tasks.append(
-            ARCTask(
-                task_id=task_id,
-                skill_id=int(skill_id),
-                skill_name=puzzle.name,
-                grid_size=int(grid_size),
-                rule_color=rule_color,
-                demos=[ARCExamplePair(x=_grid_to_list(x), y=_grid_to_list(y)) for (x, y) in demos],
-                test=ARCTestCase(x=_grid_to_list(t_in), y=_grid_to_list(t_out)),
+            task_id = _stable_id(dataset_id, str(i))
+            tasks.append(
+                ARCTask(
+                    task_id=task_id,
+                    skill_id=int(skill_id),
+                    skill_name=puzzle.name,
+                    puzzle_variant=puzzle.variant_id,
+                    puzzle_params=puzzle.variant_params(),
+                    grid_size=int(grid_size),
+                    rule_color=rule_color,
+                    demos=[ARCExamplePair(x=_grid_to_list(x), y=_grid_to_list(y)) for (x, y) in demos],
+                    test=ARCTestCase(x=_grid_to_list(t_in), y=_grid_to_list(t_out)),
+                )
             )
+    else:
+        # Pre-sample per-task seeds deterministically from the base RNG.
+        # Note: this makes multi-process generation deterministic, but results will differ
+        # from the n_jobs=1 path because the RNG consumption pattern is different.
+        task_seeds = rng.integers(0, 2**32 - 1, size=int(n_tasks), dtype=np.uint32).tolist()
+        items = (
+            (
+                int(skill_id),
+                int(grid_size),
+                str(dataset_id),
+                str(split),
+                bool(ood),
+                int(i),
+                int(task_seed),
+                shrink_perturb,
+            )
+            for i, task_seed in enumerate(task_seeds)
         )
+        chunksize = max(1, int(n_tasks) // (n_jobs * 4))
+        with ProcessPoolExecutor(max_workers=n_jobs) as ex:
+            it = ex.map(_task_from_seed_packed, items, chunksize=chunksize)
+            if show_progress:
+                it = _progress(it, total=int(n_tasks), desc=f"skill {skill_id} {split}: tasks")
+            tasks = list(it)
 
     return ARCDataset(
         dataset_id=dataset_id,
@@ -155,6 +229,7 @@ def save_task_png(path: Path, task: ARCTask) -> None:
 
     fig.suptitle(
         f"Skill {task.skill_id} ({task.skill_name})"
+        + (f" | variant={task.puzzle_variant}" if task.puzzle_variant else "")
         + (f" | rule_color={task.rule_color}" if task.rule_color is not None else ""),
         fontsize=12,
     )
@@ -180,6 +255,12 @@ def main() -> None:
     p.add_argument("--seed", type=int, default=0, help="Base RNG seed")
     p.add_argument("--png_per_skill", type=int, default=8, help="How many tasks to render as PNG per skill per split")
     p.add_argument(
+        "--n_jobs",
+        type=int,
+        default=1,
+        help="Number of worker processes for dataset generation. Use 1 to disable multiprocessing.",
+    )
+    p.add_argument(
         "--no_progress",
         action="store_true",
         help="Disable progress output (tqdm if installed, otherwise periodic prints are minimal anyway).",
@@ -189,6 +270,15 @@ def main() -> None:
         action="store_true",
         help="Disable creating a zip archive of the generated dataset folder.",
     )
+    p.add_argument(
+        "--shrink_perturb",
+        action="store_true",
+        help="Enable an extra input-space augmentation step: shrink non-zero content and slightly translate it, then recompute outputs.",
+    )
+    p.add_argument("--sp_prob", type=float, default=1.0, help="Probability of applying shrink+perturb per example (only used when --shrink_perturb is set).")
+    p.add_argument("--sp_shrink_min", type=float, default=0.6, help="Minimum shrink factor in (0,1] (only used when --shrink_perturb is set).")
+    p.add_argument("--sp_shrink_max", type=float, default=0.9, help="Maximum shrink factor in (0,1] (only used when --shrink_perturb is set).")
+    p.add_argument("--sp_shift_max", type=int, default=1, help="Max translation (pixels) applied to the content bbox (only used when --shrink_perturb is set).")
 
     args = p.parse_args()
 
@@ -196,6 +286,16 @@ def main() -> None:
     skills = _iter_skills(args.skills)
     grid_size = int(args.grid_size)
     show_progress = not bool(args.no_progress)
+
+    shrink_perturb: Optional[ShrinkPerturbSpec] = None
+    if bool(args.shrink_perturb):
+        shrink_perturb = ShrinkPerturbSpec(
+            enabled=True,
+            prob=float(args.sp_prob),
+            shrink_min=float(args.sp_shrink_min),
+            shrink_max=float(args.sp_shrink_max),
+            shift_max=int(args.sp_shift_max),
+        )
 
     for skill_id in skills:
         # Two splits: train-style (easy test) and ood test
@@ -207,6 +307,8 @@ def main() -> None:
                 split=split,
                 ood=ood,
                 seed=int(args.seed) + 10_000 * skill_id + (1 if ood else 0),
+                shrink_perturb=shrink_perturb,
+                n_jobs=int(args.n_jobs),
                 show_progress=show_progress,
             )
 

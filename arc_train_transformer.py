@@ -40,6 +40,8 @@ class ARCTransformer(nn.Module):
         self,
         *,
         vocab_size: int = VOCAB_SIZE,
+        grid_size: int = 5,
+        pos_encoding: str = "2d",
         embed_dim: int = 128,
         num_heads: int = 4,
         num_layers: int = 4,
@@ -48,8 +50,26 @@ class ARCTransformer(nn.Module):
         dropout: float = 0.0,
     ) -> None:
         super().__init__()
+        self.grid_size = int(grid_size)
+        if self.grid_size <= 0:
+            raise ValueError(f"grid_size must be >= 1, got {self.grid_size}")
+        self.grid_tokens = self.grid_size * self.grid_size
+
+        self.pos_encoding = str(pos_encoding).lower()
+        if self.pos_encoding not in {"2d", "1d"}:
+            raise ValueError(f"pos_encoding must be one of {{'2d','1d'}}, got {pos_encoding!r}")
+
         self.embed = nn.Embedding(vocab_size, embed_dim)
-        self.pos_enc = nn.Parameter(torch.randn(1, max_len, embed_dim) * 0.02)
+        # Always include a *global* 1D positional encoding so the model can distinguish
+        # "demo1 input" vs "demo1 output" vs "test input" even when (row, col) repeats.
+        self.global_pos_enc = nn.Parameter(torch.randn(1, int(max_len), embed_dim) * 0.02)
+
+        # Optional *local* 2D positional encoding (row + col) to restore spatial inductive bias.
+        # Note: SEP tokens (between grids) will receive a 0 2D positional embedding.
+        if self.pos_encoding == "2d":
+            self.row_embed = nn.Embedding(self.grid_size, embed_dim)
+            self.col_embed = nn.Embedding(self.grid_size, embed_dim)
+
         layer = nn.TransformerEncoderLayer(
             d_model=embed_dim,
             nhead=num_heads,
@@ -62,8 +82,31 @@ class ARCTransformer(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: (B, T)
-        b, t = x.shape
-        emb = self.embed(x) + self.pos_enc[:, :t, :]
+        _b, t = x.shape
+        if t > int(self.global_pos_enc.shape[1]):
+            raise ValueError(
+                f"Sequence too long: t={t} > max_len={int(self.global_pos_enc.shape[1])}. "
+                "Increase max_len."
+            )
+
+        emb = self.embed(x) + self.global_pos_enc[:, :t, :]
+
+        if self.pos_encoding == "2d":
+            # NOTE: if we move to non-square grids, we need to adjust the positional embeddings.
+            # Prompt layout is a repetition of: [grid_tokens] + [SEP]
+            # So we can compute 2D positions by position-in-block and automatically reset per grid.
+            block = self.grid_tokens + 1
+            pos = torch.arange(t, device=x.device)
+            within = pos % block  # [0..grid_tokens] where grid_tokens is the SEP position
+            is_sep = within == self.grid_tokens
+            cell = torch.clamp(within, max=self.grid_tokens - 1)
+
+            row = (cell // self.grid_size).to(torch.long)
+            col = (cell % self.grid_size).to(torch.long)
+            pos_emb_2d = self.row_embed(row) + self.col_embed(col)  # (T, D)
+            pos_emb_2d = pos_emb_2d.masked_fill(is_sep.unsqueeze(-1), 0.0)
+            emb = emb + pos_emb_2d.unsqueeze(0)  # (B, T, D)
+
         h = self.transformer(emb)
         return self.fc_out(h)  # (B, T, vocab)
 
@@ -71,6 +114,7 @@ class ARCTransformer(nn.Module):
 def main(
     data_dir: Path = Path("tmp"),
     grid_size: int = 5,
+    pos_encoding: str = "2d",
     train_skills: Optional[list[int]] = None,
     delay_train_skill: Optional[int] = None,
     delay_train_until_step: int = 0,
@@ -277,6 +321,8 @@ def main(
 
     model = ARCTransformer(
         vocab_size=VOCAB_SIZE,
+        grid_size=grid_size,
+        pos_encoding=str(pos_encoding),
         embed_dim=int(embed_dim),
         num_heads=int(num_heads),
         num_layers=int(num_layers),
@@ -550,15 +596,22 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--steps", type=int, default=3000)
     p.add_argument("--batch_size", type=int, default=32)
     p.add_argument("--lr", type=float, default=5e-4)
-    p.add_argument("--weight_decay", type=float, default=0.1, help="AdamW weight decay (L2).")
+    p.add_argument("--weight_decay", type=float, default=0.01, help="AdamW weight decay (L2).")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--embed_dim", type=int, default=128)
     p.add_argument("--num_heads", type=int, default=4)
-    p.add_argument("--num_layers", type=int, default=4)
+    p.add_argument("--num_layers", type=int, default=6)
     p.add_argument("--ff_dim", type=int, default=256)
     p.add_argument("--dropout", type=float, default=0.0)
-    p.add_argument("--eval_every", type=int, default=500)
+    p.add_argument(
+        "--pos_encoding",
+        type=str,
+        default="2d",
+        choices=["2d", "1d"],
+        help="Positional encoding scheme. '2d' (default) uses row+col embeddings per grid; '1d' uses the old absolute learned positions.",
+    )
+    p.add_argument("--eval_every", type=int, default=1000)
     p.add_argument("--eval_tasks", type=int, default=128)
     p.add_argument(
         "--eval_batch_size",
@@ -584,6 +637,7 @@ def cli_main(argv: Optional[list[str]] = None) -> None:
     main(
         data_dir=Path(args.data_dir),
         grid_size=int(args.grid_size),
+        pos_encoding=str(args.pos_encoding),
         train_skills=[int(s) for s in args.train_skills] if args.train_skills is not None else None,
         delay_train_skills=[int(s) for s in args.delay_train_skills] if args.delay_train_skills is not None else None,
         delay_train_until_steps=[int(s) for s in args.delay_train_until_steps] if args.delay_train_until_steps is not None else None,

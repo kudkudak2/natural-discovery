@@ -20,6 +20,22 @@ class OODSpec:
     max_pixels_ood: int = 4
 
 
+@dataclass(frozen=True)
+class ShrinkPerturbSpec:
+    """
+    Optional input-space augmentation applied *before* computing outputs.
+
+    Rationale: applying shrink/translation to the input grid and then recomputing the
+    puzzle output preserves correctness (y = apply(x, rule_color)).
+    """
+
+    enabled: bool = False
+    prob: float = 1.0
+    shrink_min: float = 0.6
+    shrink_max: float = 0.9
+    shift_max: int = 1
+
+
 class Puzzle:
     """
     Base ARC-style puzzle.
@@ -39,6 +55,7 @@ class Puzzle:
         size: int = 5,
         colors: Sequence[int] = (1, 2, 3, 4),
         ood_spec: OODSpec = OODSpec(),
+        shrink_perturb: Optional[ShrinkPerturbSpec] = None,
         rng: Optional[np.random.Generator] = None,
     ) -> None:
         self.size = int(size)
@@ -48,9 +65,28 @@ class Puzzle:
         self.colors = tuple(int(c) for c in colors)
         self.ood_spec = ood_spec
         self.rng = rng if rng is not None else np.random.default_rng()
+        self.shrink_perturb = shrink_perturb
 
     def blank(self) -> np.ndarray:
         return np.zeros((self.size, self.size), dtype=np.int64)
+
+    @property
+    def variant_id(self) -> Optional[str]:
+        """
+        Optional per-task latent variant identifier.
+
+        Example: Skills with a per-task explosion kernel return the chosen kernel mode.
+        Default: None (no variant).
+        """
+        return None
+
+    def variant_params(self) -> dict[str, object]:
+        """
+        Optional per-task latent parameters (JSON-serializable) for analysis/repro.
+
+        Default: {}.
+        """
+        return {}
 
     def _num_pixels(self, *, ood: bool) -> int:
         """
@@ -88,8 +124,87 @@ class Puzzle:
 
     def generate_single_example(self, *, rule_color: Optional[int], ood: bool) -> tuple[np.ndarray, np.ndarray]:
         inp = self.make_input(ood=ood)
+        inp = _maybe_shrink_and_perturb(inp, rng=self.rng, spec=self.shrink_perturb)
         out = self.apply(inp, rule_color)
         return inp, out
+
+
+def _bbox_nonzero(grid: np.ndarray) -> Optional[tuple[int, int, int, int]]:
+    rs, cs = np.nonzero(grid)
+    if rs.size == 0:
+        return None
+    r0 = int(rs.min())
+    r1 = int(rs.max())
+    c0 = int(cs.min())
+    c1 = int(cs.max())
+    return r0, r1, c0, c1
+
+
+def _resize_nearest(patch: np.ndarray, *, out_h: int, out_w: int) -> np.ndarray:
+    in_h, in_w = int(patch.shape[0]), int(patch.shape[1])
+    out_h_i, out_w_i = int(out_h), int(out_w)
+    if out_h_i <= 0 or out_w_i <= 0:
+        raise ValueError(f"Invalid resize target: {(out_h_i, out_w_i)}")
+    if in_h <= 0 or in_w <= 0:
+        raise ValueError(f"Invalid resize source: {(in_h, in_w)}")
+    if in_h == out_h_i and in_w == out_w_i:
+        return patch.copy()
+
+    # Nearest-neighbor sampling indices.
+    rr = (np.linspace(0, in_h - 1, out_h_i)).round().astype(np.int64)
+    cc = (np.linspace(0, in_w - 1, out_w_i)).round().astype(np.int64)
+    return patch[rr[:, None], cc[None, :]].astype(np.int64, copy=False)
+
+
+def _maybe_shrink_and_perturb(
+    grid: np.ndarray, *, rng: np.random.Generator, spec: Optional[ShrinkPerturbSpec]
+) -> np.ndarray:
+    if spec is None or not bool(spec.enabled):
+        return grid
+    p = float(spec.prob)
+    if p <= 0.0:
+        return grid
+    if p < 1.0 and float(rng.random()) >= p:
+        return grid
+
+    size = int(grid.shape[0])
+    if grid.ndim != 2 or int(grid.shape[1]) != size:
+        raise ValueError(f"Expected square 2D grid, got shape={grid.shape}")
+
+    bbox = _bbox_nonzero(grid)
+    if bbox is None:
+        return grid
+    r0, r1, c0, c1 = bbox
+    patch = grid[r0 : r1 + 1, c0 : c1 + 1]
+
+    smin = float(spec.shrink_min)
+    smax = float(spec.shrink_max)
+    if not (0.0 < smin <= smax <= 1.0):
+        raise ValueError(f"shrink_min/max must satisfy 0 < min <= max <= 1, got {smin}, {smax}")
+    scale = float(rng.uniform(smin, smax))
+
+    h, w = int(patch.shape[0]), int(patch.shape[1])
+    new_h = max(1, int(np.rint(h * scale)))
+    new_w = max(1, int(np.rint(w * scale)))
+    resized = _resize_nearest(patch, out_h=new_h, out_w=new_w)
+
+    shift_max = int(spec.shift_max)
+    if shift_max < 0:
+        raise ValueError(f"shift_max must be >= 0, got {shift_max}")
+    dr = int(rng.integers(-shift_max, shift_max + 1)) if shift_max > 0 else 0
+    dc = int(rng.integers(-shift_max, shift_max + 1)) if shift_max > 0 else 0
+
+    # Keep the object roughly in its original region; clamp to bounds.
+    base_r0 = int(r0) + dr
+    base_c0 = int(c0) + dc
+    max_r0 = int(size - new_h)
+    max_c0 = int(size - new_w)
+    rr0 = int(min(max(base_r0, 0), max_r0))
+    cc0 = int(min(max(base_c0, 0), max_c0))
+
+    out = np.zeros_like(grid)
+    out[rr0 : rr0 + new_h, cc0 : cc0 + new_w] = resized
+    return out
 
     def generate_prompt(
         self,
@@ -458,44 +573,146 @@ def _try_place_solid_rect(
 
 def _count_components_4(mask: np.ndarray) -> int:
     """Count 4-connected components in a boolean mask."""
+    return _count_components(mask, connectivity=4)
+
+
+def _count_components(mask: np.ndarray, *, connectivity: int) -> int:
+    """Count connected components in a boolean mask (connectivity ∈ {4,8})."""
+    conn = int(connectivity)
+    if conn not in (4, 8):
+        raise ValueError(f"Unsupported connectivity={conn}; expected 4 or 8")
+
+    if conn == 4:
+        neigh = [(-1, 0), (1, 0), (0, -1), (0, 1)]
+    else:
+        neigh = [
+            (-1, -1),
+            (-1, 0),
+            (-1, 1),
+            (0, -1),
+            (0, 1),
+            (1, -1),
+            (1, 0),
+            (1, 1),
+        ]
+
     h, w = int(mask.shape[0]), int(mask.shape[1])
     visited = np.zeros_like(mask, dtype=bool)
     count = 0
+
     for r in range(h):
         for c in range(w):
             if not bool(mask[r, c]) or bool(visited[r, c]):
                 continue
             count += 1
-            stack = [(r, c)]
+            stack = [(int(r), int(c))]
             visited[r, c] = True
             while stack:
                 cr, cc = stack.pop()
-                nr = cr - 1
-                if nr >= 0 and bool(mask[nr, cc]) and not bool(visited[nr, cc]):
-                    visited[nr, cc] = True
-                    stack.append((nr, cc))
-                nr = cr + 1
-                if nr < h and bool(mask[nr, cc]) and not bool(visited[nr, cc]):
-                    visited[nr, cc] = True
-                    stack.append((nr, cc))
-                nc = cc - 1
-                if nc >= 0 and bool(mask[cr, nc]) and not bool(visited[cr, nc]):
-                    visited[cr, nc] = True
-                    stack.append((cr, nc))
-                nc = cc + 1
-                if nc < w and bool(mask[cr, nc]) and not bool(visited[cr, nc]):
-                    visited[cr, nc] = True
-                    stack.append((cr, nc))
+                for dr, dc in neigh:
+                    nr = cr + int(dr)
+                    nc = cc + int(dc)
+                    if 0 <= nr < h and 0 <= nc < w and bool(mask[nr, nc]) and not bool(visited[nr, nc]):
+                        visited[nr, nc] = True
+                        stack.append((nr, nc))
     return int(count)
 
 
-def _component_counts_by_color(grid: np.ndarray) -> dict[int, int]:
-    """Return {color: n_components} for each non-zero color in the grid (4-connected)."""
+def _component_counts_by_color(grid: np.ndarray, *, connectivity: int = 4) -> dict[int, int]:
+    """Return {color: n_components} for each non-zero color in the grid."""
     colors_present = sorted({int(c) for c in grid.flatten().tolist() if int(c) != 0})
     out: dict[int, int] = {}
+    conn = int(connectivity)
     for c in colors_present:
-        out[int(c)] = int(_count_components_4(grid == int(c)))
+        out[int(c)] = int(_count_components(grid == int(c), connectivity=conn))
     return out
+
+
+def _rect_touches_color(
+    grid: np.ndarray,
+    *,
+    color: int,
+    r0: int,
+    r1: int,
+    c0: int,
+    c1: int,
+    connectivity: int,
+) -> bool:
+    """
+    Returns True if a candidate solid rect at [r0:r1, c0:c1] (inclusive) would be adjacent
+    (per connectivity) to an existing cell of `color` in the grid.
+    """
+    conn = int(connectivity)
+    if conn not in (4, 8):
+        raise ValueError(f"Unsupported connectivity={conn}; expected 4 or 8")
+
+    h, w = int(grid.shape[0]), int(grid.shape[1])
+    color_i = int(color)
+    r0_i, r1_i, c0_i, c1_i = int(r0), int(r1), int(c0), int(c1)
+
+    if conn == 4:
+        neigh = [(-1, 0), (1, 0), (0, -1), (0, 1)]
+    else:
+        neigh = [
+            (-1, -1),
+            (-1, 0),
+            (-1, 1),
+            (0, -1),
+            (0, 1),
+            (1, -1),
+            (1, 0),
+            (1, 1),
+        ]
+
+    for rr in range(r0_i, r1_i + 1):
+        for cc in range(c0_i, c1_i + 1):
+            for dr, dc in neigh:
+                nr = rr + int(dr)
+                nc = cc + int(dc)
+                if nr < 0 or nr >= h or nc < 0 or nc >= w:
+                    continue
+                # Ignore neighbors that are inside the candidate rectangle; those cells are empty pre-placement.
+                if r0_i <= nr <= r1_i and c0_i <= nc <= c1_i:
+                    continue
+                if int(grid[nr, nc]) == color_i:
+                    return True
+    return False
+
+
+def _try_place_solid_rect_no_touch(
+    grid: np.ndarray,
+    *,
+    color: int,
+    h: int,
+    w: int,
+    connectivity: int,
+    rng: np.random.Generator,
+    max_tries: int = 200,
+) -> Optional[tuple[int, int, int, int]]:
+    """
+    Like `_try_place_solid_rect`, but also enforces that the new rectangle does NOT touch
+    an existing component of the same color (per connectivity). This keeps components separated.
+    """
+    size_r, size_c = int(grid.shape[0]), int(grid.shape[1])
+    hh = int(h)
+    ww = int(w)
+    if hh <= 0 or ww <= 0:
+        return None
+    if hh > size_r or ww > size_c:
+        return None
+
+    for _ in range(int(max_tries)):
+        r0 = int(rng.integers(0, size_r - hh + 1))
+        c0 = int(rng.integers(0, size_c - ww + 1))
+        r1 = r0 + hh - 1
+        c1 = c0 + ww - 1
+        if np.any(grid[r0 : r1 + 1, c0 : c1 + 1] != 0):
+            continue
+        if _rect_touches_color(grid, color=int(color), r0=r0, r1=r1, c0=c0, c1=c1, connectivity=int(connectivity)):
+            continue
+        grid[r0 : r1 + 1, c0 : c1 + 1] = int(color)
+        return (r0, r1, c0, c1)
+    return None
 
 
 def _make_unique_rects_grid(
@@ -504,25 +721,56 @@ def _make_unique_rects_grid(
     colors: Sequence[int],
     rng: np.random.Generator,
     ood: bool,
+    rect_sizes: Optional[Sequence[tuple[int, int]]] = None,
+    unique_components: int = 1,
+    connectivity: int = 4,
 ) -> tuple[np.ndarray, int]:
     """
     Create a grid containing solid non-overlapping rectangles with:
-    - exactly one "unique" color that appears in exactly one component
-    - distractor colors that appear in >=2 disconnected components each
+    - exactly one "unique" color that appears in exactly `unique_components` components
+    - distractor colors that appear in >=2 disconnected components each (and NOT equal to `unique_components`)
 
-    Allowed rectangle sizes: 1x1, 1x2, 2x1, 2x2.
+    Allowed rectangle sizes are controlled by `rect_sizes`.
     Returns (grid, unique_color).
     """
     size = int(size)
-    rect_sizes = [(1, 1), (1, 2), (2, 1), (2, 2)]
+    conn = int(connectivity)
+    if conn not in (4, 8):
+        raise ValueError(f"Unsupported connectivity={conn}; expected 4 or 8")
+
+    u_k = int(unique_components)
+    if u_k < 1:
+        u_k = 1
+
+    if rect_sizes is None:
+        rect_sizes = [(1, 1), (1, 2), (2, 1), (2, 2)]
+    rect_sizes_f = [(int(h), int(w)) for (h, w) in rect_sizes if int(h) > 0 and int(w) > 0 and int(h) <= size and int(w) <= size]
+    if not rect_sizes_f:
+        rect_sizes_f = [(1, 1)]
 
     for _ in range(200):
         grid = np.zeros((size, size), dtype=np.int64)
         unique_color = int(rng.choice(np.asarray(colors)))
 
-        # Place unique rectangle.
-        uh, uw = rect_sizes[int(rng.integers(0, len(rect_sizes)))]
-        if _try_place_solid_rect(grid, color=unique_color, h=uh, w=uw, rng=rng, max_tries=200) is None:
+        # Place the UNIQUE color as exactly u_k disconnected components.
+        ok_unique = True
+        for _u in range(u_k):
+            uh, uw = rect_sizes_f[int(rng.integers(0, len(rect_sizes_f)))]
+            if (
+                _try_place_solid_rect_no_touch(
+                    grid,
+                    color=unique_color,
+                    h=int(uh),
+                    w=int(uw),
+                    connectivity=conn,
+                    rng=rng,
+                    max_tries=500,
+                )
+                is None
+            ):
+                ok_unique = False
+                break
+        if not ok_unique:
             continue
 
         available_distractors = [int(c) for c in colors if int(c) != unique_color]
@@ -536,11 +784,30 @@ def _make_unique_rects_grid(
 
         ok = True
         for d_color in distractor_colors:
-            n_objs = int(rng.integers(2, 4)) if not ood else int(rng.integers(2, 6))
+            # Choose number of components for this distractor, ensuring it differs from u_k.
+            if not ood:
+                choices = [2, 3]
+            else:
+                choices = [2, 3, 4, 5]
+            choices = [k for k in choices if int(k) != u_k]
+            if not choices:
+                choices = [max(2, u_k + 1)]
+            n_objs = int(rng.choice(np.asarray(choices)))
             placed = 0
             for _obj in range(n_objs):
-                h, w = rect_sizes[int(rng.integers(0, len(rect_sizes)))]
-                if _try_place_solid_rect(grid, color=int(d_color), h=h, w=w, rng=rng, max_tries=200) is None:
+                h, w = rect_sizes_f[int(rng.integers(0, len(rect_sizes_f)))]
+                if (
+                    _try_place_solid_rect_no_touch(
+                        grid,
+                        color=int(d_color),
+                        h=int(h),
+                        w=int(w),
+                        connectivity=conn,
+                        rng=rng,
+                        max_tries=500,
+                    )
+                    is None
+                ):
                     ok = False
                     break
                 placed += 1
@@ -554,20 +821,23 @@ def _make_unique_rects_grid(
             continue
 
         # Validate the uniqueness property by connected components.
-        counts = _component_counts_by_color(grid)
-        if int(counts.get(unique_color, 0)) != 1:
+        counts = _component_counts_by_color(grid, connectivity=conn)
+        if int(counts.get(unique_color, 0)) != u_k:
             continue
         distractor_ok = True
         for d_color in distractor_colors:
             if int(counts.get(int(d_color), 0)) < 2:
                 distractor_ok = False
                 break
+            if int(counts.get(int(d_color), 0)) == u_k:
+                distractor_ok = False
+                break
         if not distractor_ok:
             continue
 
-        # Also ensure *only one* color has exactly one component (for unambiguous rule).
-        singles = [c for c, k in counts.items() if int(k) == 1]
-        if len(singles) != 1:
+        # Also ensure *only one* color has exactly u_k components (for an unambiguous rule).
+        targets = [c for c, k in counts.items() if int(k) == u_k]
+        if len(targets) != 1:
             continue
 
         return grid, unique_color
@@ -575,10 +845,37 @@ def _make_unique_rects_grid(
     # Fallback: simple minimal valid construction.
     grid = np.zeros((size, size), dtype=np.int64)
     unique_color = int(colors[0]) if len(colors) > 0 else 1
-    _try_place_solid_rect(grid, color=unique_color, h=1, w=1, rng=rng, max_tries=10_000)
+    # Place unique components as isolated 1x1 pixels.
+    placed_u = 0
+    for r in range(size):
+        for c in range(size):
+            if placed_u >= u_k:
+                break
+            if int(grid[r, c]) != 0:
+                continue
+            if _rect_touches_color(grid, color=unique_color, r0=r, r1=r, c0=c, c1=c, connectivity=conn):
+                continue
+            grid[r, c] = unique_color
+            placed_u += 1
+        if placed_u >= u_k:
+            break
+
     distractor_color = int(colors[1]) if len(colors) > 1 else 2
-    _try_place_solid_rect(grid, color=distractor_color, h=1, w=1, rng=rng, max_tries=10_000)
-    _try_place_solid_rect(grid, color=distractor_color, h=1, w=1, rng=rng, max_tries=10_000)
+    # Place 2 components of distractor_color (or 3 if u_k==2).
+    need_d = 3 if u_k == 2 else 2
+    placed_d = 0
+    for r in range(size):
+        for c in range(size):
+            if placed_d >= need_d:
+                break
+            if int(grid[r, c]) != 0:
+                continue
+            if _rect_touches_color(grid, color=distractor_color, r0=r, r1=r, c0=c, c1=c, connectivity=conn):
+                continue
+            grid[r, c] = distractor_color
+            placed_d += 1
+        if placed_d >= need_d:
+            break
     return grid, unique_color
 
 
@@ -1051,6 +1348,35 @@ def _explosion_offsets_extended(mode: str) -> list[tuple[int, int]]:
         return [(-1, 1), (0, 0), (1, -1)]
     if mode == "cross3":
         return [(-1, 0), (0, -1), (0, 0), (0, 1), (1, 0)]
+    if mode == "square5":
+        return [(dr, dc) for dr in (-2, -1, 0, 1, 2) for dc in (-2, -1, 0, 1, 2)]
+    if mode == "line5_h":
+        return [(0, -2), (0, -1), (0, 0), (0, 1), (0, 2)]
+    if mode == "line5_v":
+        return [(-2, 0), (-1, 0), (0, 0), (1, 0), (2, 0)]
+    if mode == "ray5_right":
+        return [(0, 0), (0, 1), (0, 2), (0, 3), (0, 4)]
+    if mode == "ray5_left":
+        return [(0, 0), (0, -1), (0, -2), (0, -3), (0, -4)]
+    if mode == "ray5_down":
+        return [(0, 0), (1, 0), (2, 0), (3, 0), (4, 0)]
+    if mode == "ray5_up":
+        return [(0, 0), (-1, 0), (-2, 0), (-3, 0), (-4, 0)]
+    if mode == "diag5_main":
+        return [(-2, -2), (-1, -1), (0, 0), (1, 1), (2, 2)]
+    if mode == "diag5_anti":
+        return [(-2, 2), (-1, 1), (0, 0), (1, -1), (2, -2)]
+    if mode == "cross5":
+        return [(-2, 0), (-1, 0), (0, -2), (0, -1), (0, 0), (0, 1), (0, 2), (1, 0), (2, 0)]
+    if mode == "diamond5":
+        return [(dr, dc) for dr in (-2, -1, 0, 1, 2) for dc in (-2, -1, 0, 1, 2) if abs(dr) + abs(dc) <= 2]
+    if mode == "ring5_square":
+        return [
+            (dr, dc)
+            for dr in (-2, -1, 0, 1, 2)
+            for dc in (-2, -1, 0, 1, 2)
+            if max(abs(dr), abs(dc)) == 2
+        ]
     return _explosion_offsets(mode)
 
 
@@ -1185,17 +1511,73 @@ class Skill14FilterUniqueVariants(Puzzle):
     name = "filter_unique_variants"
     uses_rule_color = False
 
+    def __init__(
+        self,
+        *,
+        size: int = 5,
+        colors: Sequence[int] = (1, 2, 3, 4),
+        ood_spec: OODSpec = OODSpec(),
+        shrink_perturb: Optional[ShrinkPerturbSpec] = None,
+        rng: Optional[np.random.Generator] = None,
+    ) -> None:
+        super().__init__(size=size, colors=colors, ood_spec=ood_spec, shrink_perturb=shrink_perturb, rng=rng)
+        size_i = int(self.size)
+
+        # Variant knobs:
+        # - connectivity (4 vs 8) affects component counting when same-color objects touch diagonally
+        # - unique_components: keep the color that has exactly K components (K is task-specific)
+        # - shape_set controls allowed rectangle sizes
+        self._connectivity = int(self.rng.choice(np.asarray([4, 8])))
+
+        k_choices = [1, 2, 3] if size_i >= 5 else [1, 2]
+        self._unique_components = int(self.rng.choice(np.asarray(k_choices)))
+
+        shape_sets: list[tuple[str, list[tuple[int, int]]]] = [
+            ("tiny", [(1, 1), (1, 2), (2, 1), (2, 2)]),
+            ("bars3", [(1, 1), (1, 2), (2, 1), (2, 2), (1, 3), (3, 1)]),
+            ("mix3", [(1, 1), (1, 2), (2, 1), (2, 2), (1, 3), (3, 1), (2, 3), (3, 2)]),
+            ("big3", [(1, 1), (2, 2), (3, 3), (1, 3), (3, 1), (2, 3), (3, 2)]),
+        ]
+        if size_i >= 6:
+            shape_sets.append(("bars4", [(1, 4), (4, 1), (1, 3), (3, 1), (2, 2), (1, 2), (2, 1), (1, 1)]))
+        self._shape_set_name, self._rect_sizes = shape_sets[int(self.rng.integers(0, len(shape_sets)))]
+
+        # Filter sizes to be valid for the current grid.
+        self._rect_sizes = [(int(h), int(w)) for (h, w) in self._rect_sizes if int(h) <= size_i and int(w) <= size_i]
+        if not self._rect_sizes:
+            self._rect_sizes = [(1, 1)]
+
+    @property
+    def variant_id(self) -> Optional[str]:
+        return f"conn{int(self._connectivity)}_k{int(self._unique_components)}_{self._shape_set_name}"
+
+    def variant_params(self) -> dict[str, object]:
+        return {
+            "connectivity": int(self._connectivity),
+            "unique_components": int(self._unique_components),
+            "shape_set": str(self._shape_set_name),
+            "rect_sizes": [(int(h), int(w)) for (h, w) in self._rect_sizes],
+        }
+
     def make_input(self, *, ood: bool) -> np.ndarray:
-        grid, _unique_color = _make_unique_rects_grid(size=self.size, colors=self.colors, rng=self.rng, ood=ood)
+        grid, _unique_color = _make_unique_rects_grid(
+            size=self.size,
+            colors=self.colors,
+            rng=self.rng,
+            ood=ood,
+            rect_sizes=self._rect_sizes,
+            unique_components=int(self._unique_components),
+            connectivity=int(self._connectivity),
+        )
         return grid
 
     def apply(self, grid: np.ndarray, rule_color: Optional[int]) -> np.ndarray:
         _ = rule_color
-        counts = _component_counts_by_color(grid)
-        unique_colors = [c for c, k in counts.items() if int(k) == 1]
-        if not unique_colors:
+        counts = _component_counts_by_color(grid, connectivity=int(self._connectivity))
+        target_colors = [c for c, k in counts.items() if int(k) == int(self._unique_components)]
+        if not target_colors:
             return np.zeros_like(grid)
-        unique_c = int(sorted(unique_colors)[0])
+        unique_c = int(sorted(target_colors)[0])
         out = np.zeros_like(grid)
         out[grid == unique_c] = unique_c
         return out
@@ -1221,9 +1603,10 @@ class Skill15PixelExplosionVariants(Puzzle):
         size: int = 5,
         colors: Sequence[int] = (1, 2, 3, 4),
         ood_spec: OODSpec = OODSpec(),
+        shrink_perturb: Optional[ShrinkPerturbSpec] = None,
         rng: Optional[np.random.Generator] = None,
     ) -> None:
-        super().__init__(size=size, colors=colors, ood_spec=ood_spec, rng=rng)
+        super().__init__(size=size, colors=colors, ood_spec=ood_spec, shrink_perturb=shrink_perturb, rng=rng)
         modes = [
             "square3",
             "line3_h",
@@ -1235,9 +1618,28 @@ class Skill15PixelExplosionVariants(Puzzle):
             "diag3_main",
             "diag3_anti",
             "cross3",
+            # Larger kernels / extra shapes (still per-task and demo-inferable)
+            "square5",
+            "line5_h",
+            "line5_v",
+            "diag5_main",
+            "diag5_anti",
+            "cross5",
+            "diamond5",
+            "ring5_square",
         ]
         self._explosion_mode = str(self.rng.choice(np.asarray(modes)))
         self._offsets = _explosion_offsets_extended(self._explosion_mode)
+
+    @property
+    def variant_id(self) -> Optional[str]:
+        return str(self._explosion_mode)
+
+    def variant_params(self) -> dict[str, object]:
+        return {
+            "explosion_mode": str(self._explosion_mode),
+            "offsets": [(int(dr), int(dc)) for (dr, dc) in self._offsets],
+        }
 
     def make_input(self, *, ood: bool) -> np.ndarray:
         grid = self.blank()
@@ -1289,9 +1691,10 @@ class Skill16ExplodeUniqueVariants(Puzzle):
         size: int = 5,
         colors: Sequence[int] = (1, 2, 3, 4),
         ood_spec: OODSpec = OODSpec(),
+        shrink_perturb: Optional[ShrinkPerturbSpec] = None,
         rng: Optional[np.random.Generator] = None,
     ) -> None:
-        super().__init__(size=size, colors=colors, ood_spec=ood_spec, rng=rng)
+        super().__init__(size=size, colors=colors, ood_spec=ood_spec, shrink_perturb=shrink_perturb, rng=rng)
         modes = [
             "square3",
             "line3_h",
@@ -1303,9 +1706,27 @@ class Skill16ExplodeUniqueVariants(Puzzle):
             "diag3_main",
             "diag3_anti",
             "cross3",
+            "square5",
+            "line5_h",
+            "line5_v",
+            "diag5_main",
+            "diag5_anti",
+            "cross5",
+            "diamond5",
+            "ring5_square",
         ]
         self._explosion_mode = str(self.rng.choice(np.asarray(modes)))
         self._offsets = _explosion_offsets_extended(self._explosion_mode)
+
+    @property
+    def variant_id(self) -> Optional[str]:
+        return str(self._explosion_mode)
+
+    def variant_params(self) -> dict[str, object]:
+        return {
+            "explosion_mode": str(self._explosion_mode),
+            "offsets": [(int(dr), int(dc)) for (dr, dc) in self._offsets],
+        }
 
     def make_input(self, *, ood: bool) -> np.ndarray:
         size = int(self.size)
@@ -1433,40 +1854,46 @@ class Skill16ExplodeUniqueVariants(Puzzle):
 
 # --- Update the Factory ---
 
-def build_puzzle(skill_id: int, *, size: int, rng: Optional[np.random.Generator] = None) -> Puzzle:
+def build_puzzle(
+    skill_id: int,
+    *,
+    size: int,
+    rng: Optional[np.random.Generator] = None,
+    shrink_perturb: Optional[ShrinkPerturbSpec] = None,
+) -> Puzzle:
     if skill_id == 1:
-        return Skill1Gravity(size=size, rng=rng)
+        return Skill1Gravity(size=size, shrink_perturb=shrink_perturb, rng=rng)
     if skill_id == 2:
-        return Skill2BottomRecolor(size=size, rng=rng)
+        return Skill2BottomRecolor(size=size, shrink_perturb=shrink_perturb, rng=rng)
     if skill_id == 3:
-        return Skill3GravityThenRecolor(size=size, rng=rng)
+        return Skill3GravityThenRecolor(size=size, shrink_perturb=shrink_perturb, rng=rng)
     if skill_id == 4:
-        return Skill4PlaceCenterDot(size=size, rng=rng)
+        return Skill4PlaceCenterDot(size=size, shrink_perturb=shrink_perturb, rng=rng)
     if skill_id == 5:
-        return Skill5FillRectangleInterior(size=size, rng=rng)
+        return Skill5FillRectangleInterior(size=size, shrink_perturb=shrink_perturb, rng=rng)
     if skill_id == 6:
-        return Skill6RightGravity(size=size, rng=rng)
+        return Skill6RightGravity(size=size, shrink_perturb=shrink_perturb, rng=rng)
     if skill_id == 7:
-        return Skill7DownThenRight(size=size, rng=rng)
+        return Skill7DownThenRight(size=size, shrink_perturb=shrink_perturb, rng=rng)
     if skill_id == 8:
-        return Skill8DropThenShootRay(size=size, rng=rng)
+        return Skill8DropThenShootRay(size=size, shrink_perturb=shrink_perturb, rng=rng)
     if skill_id == 9:
-        return Skill9ShootRay(size=size, rng=rng)
+        return Skill9ShootRay(size=size, shrink_perturb=shrink_perturb, rng=rng)
     if skill_id == 10:
-        return Skill10BoxesToNearestWall(size=size, rng=rng)
+        return Skill10BoxesToNearestWall(size=size, shrink_perturb=shrink_perturb, rng=rng)
     # New Skills
     if skill_id == 11:
-        return Skill11FilterUnique(size=size, rng=rng)
+        return Skill11FilterUnique(size=size, shrink_perturb=shrink_perturb, rng=rng)
     if skill_id == 12:
-        return Skill12PixelExplosion(size=size, rng=rng)
+        return Skill12PixelExplosion(size=size, shrink_perturb=shrink_perturb, rng=rng)
     if skill_id == 13:
-        return Skill13ExplodeUnique(size=size, rng=rng)
+        return Skill13ExplodeUnique(size=size, shrink_perturb=shrink_perturb, rng=rng)
     if skill_id == 14:
-        return Skill14FilterUniqueVariants(size=size, rng=rng)
+        return Skill14FilterUniqueVariants(size=size, shrink_perturb=shrink_perturb, rng=rng)
     if skill_id == 15:
-        return Skill15PixelExplosionVariants(size=size, rng=rng)
+        return Skill15PixelExplosionVariants(size=size, shrink_perturb=shrink_perturb, rng=rng)
     if skill_id == 16:
-        return Skill16ExplodeUniqueVariants(size=size, rng=rng)
+        return Skill16ExplodeUniqueVariants(size=size, shrink_perturb=shrink_perturb, rng=rng)
         
     raise ValueError(f"Unknown skill_id={skill_id}")
 
