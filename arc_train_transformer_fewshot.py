@@ -506,7 +506,9 @@ def main(
         if sid < 1:
             raise ValueError(f"Invalid skill id: {sid}")
 
-    # Load and group by (skill,variant); use ID split only for this fewshot admission training.
+    # Load and group by (skill,variant).
+    # - We train/admit on the ID "train" split (with an internal heldout partition controlled by val_frac).
+    # - We also load the OOD split for evaluation (also internally split by val_frac so each key has eval data).
     train_pools, val_pools = load_variant_pools(
         data_dir=Path(data_dir),
         skill_ids=skills,
@@ -514,6 +516,22 @@ def main(
         rng=rng,
         val_frac=float(val_frac),
     )
+    ood_train_pools, ood_val_pools = load_variant_pools(
+        data_dir=Path(data_dir),
+        skill_ids=skills,
+        split="ood",
+        rng=rng,
+        val_frac=float(val_frac),
+    )
+
+    # Ensure OOD pools cover all keys seen in ID training (needed for consistent learning curves).
+    missing_ood = [k for k in train_pools.keys() if k not in ood_val_pools]
+    if missing_ood:
+        miss_s = ", ".join(k.to_str() for k in missing_ood[:8])
+        raise ValueError(
+            "Some (skill,variant) keys exist in train split but are missing from OOD split. "
+            f"Examples: {miss_s}"
+        )
 
     # Sanity: grid sizes must match the configured grid_size for this run.
     for k, p in list(train_pools.items()) + list(val_pools.items()):
@@ -560,6 +578,8 @@ def main(
 
     train_pools = {k: maybe_move_pool(p) for k, p in train_pools.items()}
     val_pools = {k: maybe_move_pool(p) for k, p in val_pools.items()}
+    ood_train_pools = {k: maybe_move_pool(p) for k, p in ood_train_pools.items()}
+    ood_val_pools = {k: maybe_move_pool(p) for k, p in ood_val_pools.items()}
 
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -607,9 +627,14 @@ def main(
         curves.ensure_skill(int(sid))
 
     def _eval_skill_acc(*, which: str) -> dict[int, float]:
-        if which not in {"train", "val"}:
-            raise ValueError(f"which must be 'train' or 'val', got {which!r}")
-        pools = train_pools if which == "train" else val_pools
+        if which not in {"train", "test", "ood"}:
+            raise ValueError(f"which must be 'train', 'test', or 'ood', got {which!r}")
+        if which == "train":
+            pools = train_pools
+        elif which == "test":
+            pools = val_pools
+        else:
+            pools = ood_val_pools
         out: dict[int, float] = {}
         for sid, kk_list in sorted(keys_by_skill.items()):
             if len(kk_list) == 0:
@@ -641,7 +666,8 @@ def main(
 
         model.eval()
         acc_train = _eval_skill_acc(which="train")
-        acc_val = _eval_skill_acc(which="val")
+        acc_test = _eval_skill_acc(which="test")
+        acc_ood = _eval_skill_acc(which="ood")
 
         curves.steps.append(int(step))
         curves.loss.append(float(last_loss))
@@ -649,9 +675,8 @@ def main(
         curves.probe_fully_heldout_ood.append(0.0)
         for sid in sorted(keys_by_skill.keys()):
             curves.acc_train[int(sid)].append(float(acc_train.get(int(sid), 0.0)))
-            curves.acc_id[int(sid)].append(float(acc_val.get(int(sid), 0.0)))
-            # No separate OOD split in this fewshot script; mirror val for plotting compatibility.
-            curves.acc_ood[int(sid)].append(float(acc_val.get(int(sid), 0.0)))
+            curves.acc_id[int(sid)].append(float(acc_test.get(int(sid), 0.0)))
+            curves.acc_ood[int(sid)].append(float(acc_ood.get(int(sid), 0.0)))
 
         metrics_csv = out_dir / "plots" / "learning_curves_latest.csv"
         write_learning_curves_csv(curves=curves, skills=sorted(keys_by_skill.keys()), out_path=metrics_csv)
@@ -672,7 +697,7 @@ def main(
 
         print(
             f"eval step={int(step):6d} loss={float(last_loss):.4f} | "
-            f"train: {fmt(acc_train)} | val: {fmt(acc_val)}"
+            f"train: {fmt(acc_train)} | test: {fmt(acc_test)} | ood: {fmt(acc_ood)}"
         )
         model.train()
 
