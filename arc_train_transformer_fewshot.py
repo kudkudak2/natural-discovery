@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import argparse
+import json
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -260,6 +262,69 @@ class VariantExpert(nn.Module):
         return self.fc_out(hh)
 
 
+class Adapter(nn.Module):
+    """Per-layer residual adapter (bottleneck MLP), typically trained per-variant."""
+
+    def __init__(self, *, embed_dim: int, adapter_dim: int, scale: float) -> None:
+        super().__init__()
+        d = int(embed_dim)
+        r = int(adapter_dim)
+        if r <= 0:
+            raise ValueError(f"adapter_dim must be >= 1, got {r}")
+        self.down = nn.Linear(d, r, bias=False)
+        self.up = nn.Linear(r, d, bias=False)
+        self.scale = float(scale)
+
+        # Small init so adapters start near-no-op.
+        with torch.no_grad():
+            self.down.weight.mul_(0.02)
+            self.up.weight.zero_()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x + float(self.scale) * self.up(torch.nn.functional.gelu(self.down(x)))
+
+
+class SkillExpert(nn.Module):
+    """
+    Shared per-skill expert stack. Optionally applies per-layer adapters (e.g., per variant).
+    """
+
+    def __init__(
+        self,
+        *,
+        embed_dim: int,
+        num_heads: int,
+        ff_dim: int,
+        dropout: float,
+        num_layers: int = 2,
+        vocab_size: int = VOCAB_SIZE,
+    ) -> None:
+        super().__init__()
+        self.layers = nn.ModuleList(
+            [
+                nn.TransformerEncoderLayer(
+                    d_model=int(embed_dim),
+                    nhead=int(num_heads),
+                    dim_feedforward=int(ff_dim),
+                    batch_first=True,
+                    dropout=float(dropout),
+                )
+                for _ in range(int(num_layers))
+            ]
+        )
+        self.fc_out = nn.Linear(int(embed_dim), int(vocab_size))
+
+    def forward(self, h: torch.Tensor, *, adapters: Optional[nn.ModuleList] = None) -> torch.Tensor:
+        x = h
+        if adapters is not None and len(adapters) != len(self.layers):
+            raise ValueError(f"Adapter count {len(adapters)} != num_layers {len(self.layers)}")
+        for i, layer in enumerate(self.layers):
+            x = layer(x)
+            if adapters is not None:
+                x = adapters[int(i)](x)
+        return self.fc_out(x)
+
+
 class WarmupTrunk(nn.Module):
     """
     Generic trunk-only model for warmup pretraining on the mixed pool (ignores variants).
@@ -344,7 +409,9 @@ def _make_mixed_pool(*, pools: dict[VariantKey, VariantPool], split: str) -> Var
 class TrunkPlusExperts(nn.Module):
     """
     Shared token embedding + (optional) 2D positional encoding + 4-layer trunk Transformer,
-    followed by a per-(skill,variant) 2-layer Transformer expert with its own output head.
+    followed by either:
+      - per-(skill,variant) Transformer expert (legacy), OR
+      - per-skill Transformer expert + per-(skill,variant) per-layer adapters (default).
     """
 
     def __init__(
@@ -360,6 +427,9 @@ class TrunkPlusExperts(nn.Module):
         ff_dim: int = 256,
         dropout: float = 0.0,
         vocab_size: int = VOCAB_SIZE,
+        expert_mode: str = "skill_adapter",
+        adapter_dim: int = 32,
+        adapter_scale: float = 1.0,
     ) -> None:
         super().__init__()
         self.grid_size = int(grid_size)
@@ -391,22 +461,65 @@ class TrunkPlusExperts(nn.Module):
         self._embed_dim = int(embed_dim)
         self._vocab_size = int(vocab_size)
 
+        self.expert_mode = str(expert_mode).lower()
+        if self.expert_mode not in {"variant", "skill_adapter"}:
+            raise ValueError(f"expert_mode must be one of {{'variant','skill_adapter'}}, got {expert_mode!r}")
+        self._adapter_dim = int(adapter_dim)
+        self._adapter_scale = float(adapter_scale)
+
+        # Legacy: per-(skill,variant) experts.
         self.experts = nn.ModuleDict()
+        # New default: shared per-skill experts + per-(skill,variant) adapters.
+        self.skill_experts = nn.ModuleDict()
+        self.adapters = nn.ModuleDict()
+
+    @staticmethod
+    def _skill_key_from_expert_key(expert_key: str) -> str:
+        # expert_key comes from VariantKey.to_str(): "s{skill_id}__v{variant}"
+        s = str(expert_key)
+        if not s.startswith("s"):
+            raise ValueError(f"Bad expert_key (expected 's<id>__v...'): {expert_key!r}")
+        cut = s.split("__v", 1)[0]
+        sid = int(cut[1:])
+        return f"s{int(sid)}"
 
     def ensure_expert(self, key: VariantKey) -> str:
         k = key.to_str()
-        if k not in self.experts:
-            # IMPORTANT: experts are created dynamically; if the parent model was already moved
-            # to GPU, newly-added submodules will otherwise stay on CPU and cause device mismatch.
-            device = self.embed.weight.device
-            self.experts[k] = VariantExpert(
-                embed_dim=int(self._embed_dim),
-                num_heads=int(self._expert_heads),
-                ff_dim=int(self._expert_ff_dim),
-                dropout=float(self._dropout),
-                num_layers=int(self._expert_layers),
-                vocab_size=int(self._vocab_size),
-            ).to(device)
+        # IMPORTANT: submodules are created dynamically; if the parent model was already moved
+        # to GPU, newly-added submodules will otherwise stay on CPU and cause device mismatch.
+        device = self.embed.weight.device
+        if self.expert_mode == "variant":
+            if k not in self.experts:
+                self.experts[k] = VariantExpert(
+                    embed_dim=int(self._embed_dim),
+                    num_heads=int(self._expert_heads),
+                    ff_dim=int(self._expert_ff_dim),
+                    dropout=float(self._dropout),
+                    num_layers=int(self._expert_layers),
+                    vocab_size=int(self._vocab_size),
+                ).to(device)
+        else:
+            sk = f"s{int(key.skill_id)}"
+            if sk not in self.skill_experts:
+                self.skill_experts[sk] = SkillExpert(
+                    embed_dim=int(self._embed_dim),
+                    num_heads=int(self._expert_heads),
+                    ff_dim=int(self._expert_ff_dim),
+                    dropout=float(self._dropout),
+                    num_layers=int(self._expert_layers),
+                    vocab_size=int(self._vocab_size),
+                ).to(device)
+            if k not in self.adapters:
+                self.adapters[k] = nn.ModuleList(
+                    [
+                        Adapter(
+                            embed_dim=int(self._embed_dim),
+                            adapter_dim=int(self._adapter_dim),
+                            scale=float(self._adapter_scale),
+                        )
+                        for _ in range(int(self._expert_layers))
+                    ]
+                ).to(device)
         return k
 
     def forward(self, x: torch.Tensor, *, expert_key: str) -> torch.Tensor:
@@ -432,12 +545,24 @@ class TrunkPlusExperts(nn.Module):
             emb = emb + pos_emb_2d.unsqueeze(0)
 
         h = self.trunk(emb)
-        expert = self.experts[expert_key]
-        if next(expert.parameters()).device != h.device:
-            # Defensive: ensures correct device even if an expert was created before .to(device).
-            expert = expert.to(h.device)
-            self.experts[expert_key] = expert
-        return expert(h)
+        if self.expert_mode == "variant":
+            expert = self.experts[expert_key]
+            if next(expert.parameters()).device != h.device:
+                # Defensive: ensures correct device even if an expert was created before .to(device).
+                expert = expert.to(h.device)
+                self.experts[expert_key] = expert
+            return expert(h)
+
+        sk = self._skill_key_from_expert_key(expert_key)
+        expert2 = self.skill_experts[sk]
+        adapters = self.adapters[expert_key]
+        if next(expert2.parameters()).device != h.device:
+            expert2 = expert2.to(h.device)
+            self.skill_experts[sk] = expert2
+        if len(list(adapters.parameters())) > 0 and next(adapters.parameters()).device != h.device:
+            adapters = adapters.to(h.device)
+            self.adapters[expert_key] = adapters
+        return expert2(h, adapters=adapters)
 
 
 @torch.no_grad()
@@ -472,6 +597,15 @@ def main(
     grid_size: int,
     pos_encoding: str,
     train_skills: Optional[list[int]],
+    skill_allowed_times: Optional[list[int]] = None,
+    curriculum_unadmitted_prob: float = 0.0,
+    balanced_skill_sampling: bool = True,
+    skill_freeze_admit_ratio_threshold: float = 0.05,
+    skill_freeze_min_new_tries: int = 10,
+    skill_freeze_outer_steps: int = 20,
+    expert_mode: str = "skill_adapter",
+    adapter_dim: int = 32,
+    adapter_scale: float = 1.0,
     n_warmup: int = 2000,
     n_outer: int = 2000,
     n_inner_steps: int = 100,
@@ -550,6 +684,9 @@ def main(
         ff_dim=int(ff_dim),
         dropout=float(dropout),
         vocab_size=int(VOCAB_SIZE),
+        expert_mode=str(expert_mode),
+        adapter_dim=int(adapter_dim),
+        adapter_scale=float(adapter_scale),
     ).to(device_t)
 
     # Pre-create experts for all variant keys for deterministic parameter counts.
@@ -558,7 +695,13 @@ def main(
         model.ensure_expert(k)
 
     total_params, trainable_params = count_params(model)
-    print(f"Model params: total={total_params:,} trainable={trainable_params:,} | experts={len(model.experts)}")
+    if model.expert_mode == "variant":
+        print(f"Model params: total={total_params:,} trainable={trainable_params:,} | experts={len(model.experts)}")
+    else:
+        print(
+            f"Model params: total={total_params:,} trainable={trainable_params:,} | "
+            f"skill_experts={len(model.skill_experts)} adapters={len(model.adapters)}"
+        )
 
     # Optionally move datasets to GPU for speed.
     def maybe_move_pool(pool: VariantPool) -> VariantPool:
@@ -583,7 +726,58 @@ def main(
 
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+    plots_dir = out_dir / "plots"
+    plots_dir.mkdir(parents=True, exist_ok=True)
     plots_enabled = not bool(no_plots)
+
+    # Save run config (CLI args) alongside plots/CSV/weights so downstream scripts can reconstruct the model.
+    run_config = {
+        "data_dir": str(Path(data_dir)),
+        "out_dir": str(out_dir),
+        "grid_size": int(grid_size),
+        "pos_encoding": str(pos_encoding),
+        "train_skills": [int(s) for s in skills],
+        "val_frac": float(val_frac),
+        "seed": int(seed),
+        "device": str(device),
+        "dataset_device": str(dataset_device),
+        # Curriculum / sampling
+        "skill_allowed_times": [int(x) for x in skill_allowed_times] if skill_allowed_times is not None else None,
+        "curriculum_unadmitted_prob": float(curriculum_unadmitted_prob),
+        "balanced_skill_sampling": bool(balanced_skill_sampling),
+        # Additional gating heuristic
+        "skill_freeze_admit_ratio_threshold": float(skill_freeze_admit_ratio_threshold),
+        "skill_freeze_min_new_tries": int(skill_freeze_min_new_tries),
+        "skill_freeze_outer_steps": int(skill_freeze_outer_steps),
+        # Model hyperparams (must match checkpoint load)
+        "embed_dim": int(embed_dim),
+        "num_heads": int(num_heads),
+        "ff_dim": int(ff_dim),
+        "dropout": float(dropout),
+        "trunk_layers": 4,
+        "expert_layers": 2,
+        "expert_mode": str(expert_mode),
+        "adapter_dim": int(adapter_dim),
+        "adapter_scale": float(adapter_scale),
+        "vocab_size": int(VOCAB_SIZE),
+        "num_demos": 3,
+        # Training schedule (useful metadata)
+        "n_warmup": int(n_warmup),
+        "n_outer": int(n_outer),
+        "n_inner_steps": int(n_inner_steps),
+        "inner_batch_size": int(inner_batch_size),
+        "warmup_batch_size": int(warmup_batch_size),
+        "admit_threshold": float(admit_threshold),
+        "lr_warmup": float(lr_warmup),
+        "lr_inner": float(lr_inner),
+        "lr_trunk_inner": float(lr_trunk_inner),
+        "eval_batch_size": int(eval_batch_size),
+        "eval_every": int(eval_every),
+        "eval_keys_per_skill": int(eval_keys_per_skill),
+        "outer_log_every": int(outer_log_every),
+        "no_plots": bool(no_plots),
+    }
+    (plots_dir / "run_config.json").write_text(json.dumps(run_config, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
     # Warmup: mix *all examples* together and train a generic trunk-only model.
     # This warmup model is thrown away after warmup; we only copy its trunk weights.
@@ -625,6 +819,83 @@ def main(
         keys_by_skill.setdefault(int(kk.skill_id), []).append(kk)
     for sid in sorted(keys_by_skill.keys()):
         curves.ensure_skill(int(sid))
+
+    # Curriculum over skills: restrict which (skill,variant) keys can be sampled at each outer step.
+    # skill_allowed_times is a list [n_0, n_1, ...] aligned to the --train_skills order (NOT sorted).
+    # This makes curricula easier to reason about when you want a specific progression.
+    skill_ids_ordered = [int(sid) for sid in skills]
+    missing_in_data = [int(sid) for sid in skill_ids_ordered if int(sid) not in keys_by_skill]
+    if missing_in_data:
+        raise ValueError(
+            "Some skills from --train_skills have no (skill,variant) keys in the loaded dataset. "
+            f"Missing skills: {missing_in_data}"
+        )
+    allowed_time_by_skill: dict[int, int] = {int(sid): 0 for sid in skill_ids_ordered}
+    if skill_allowed_times is not None:
+        times = [int(x) for x in skill_allowed_times]
+        if len(times) != len(skill_ids_ordered):
+            raise ValueError(
+                "--skill_allowed_times must have exactly one entry per --train_skills entry (aligned to that order). "
+                f"Got len(times)={len(times)} for train_skills={skill_ids_ordered}"
+            )
+        if any(int(t) < 0 for t in times):
+            raise ValueError(f"--skill_allowed_times entries must be >= 0, got {times}")
+        if times and int(times[0]) != 0:
+            raise ValueError(
+                "The first skill must be allowed at outer step 0 (n_0 == 0), otherwise no keys are available to train."
+            )
+        for i in range(1, len(times)):
+            if int(times[i]) < int(times[i - 1]):
+                raise ValueError(
+                    "--skill_allowed_times must be non-decreasing to form a curriculum. "
+                    f"Got times={times} for train_skills={skill_ids_ordered}"
+                )
+        allowed_time_by_skill = {int(skill_ids_ordered[i]): int(times[i]) for i in range(len(skill_ids_ordered))}
+
+    def _is_skill_allowed(*, skill_id: int, outer_step: int) -> bool:
+        return int(outer_step) >= int(allowed_time_by_skill.get(int(skill_id), 0))
+
+    # Additional gating heuristic:
+    # If a skill's recent admitted ratio is very low, temporarily freeze it to avoid repeatedly spending
+    # compute on variants that almost always RESET. This uses gating-only counters that reset on each freeze.
+    freeze_until_by_skill: dict[int, int] = {int(sid): 0 for sid in skill_ids_ordered}
+    gate_tries_by_skill: dict[int, int] = {int(sid): 0 for sid in skill_ids_ordered}
+    gate_admits_by_skill: dict[int, int] = {int(sid): 0 for sid in skill_ids_ordered}
+
+    ratio_thr = float(skill_freeze_admit_ratio_threshold)
+    if not (0.0 <= ratio_thr <= 1.0):
+        raise ValueError(f"skill_freeze_admit_ratio_threshold must be in [0,1], got {ratio_thr}")
+    min_new_tries = int(skill_freeze_min_new_tries)
+    if min_new_tries < 1:
+        raise ValueError(f"skill_freeze_min_new_tries must be >= 1, got {min_new_tries}")
+    freeze_steps = int(skill_freeze_outer_steps)
+    if freeze_steps < 0:
+        raise ValueError(f"skill_freeze_outer_steps must be >= 0, got {freeze_steps}")
+
+    def _is_skill_frozen(*, skill_id: int, outer_step: int) -> bool:
+        return int(outer_step) < int(freeze_until_by_skill.get(int(skill_id), 0))
+
+    def _fmt_skill_gate_stats(*, outer_step: int) -> str:
+        parts: list[str] = []
+        for sid in skill_ids_ordered:
+            sid_i = int(sid)
+            tries = int(gate_tries_by_skill.get(sid_i, 0))
+            admits = int(gate_admits_by_skill.get(sid_i, 0))
+            ratio = float(admits) / float(max(1, tries))
+            rem = max(0, int(freeze_until_by_skill.get(sid_i, 0)) - int(outer_step))
+            if rem > 0:
+                parts.append(f"s{sid_i} {admits}/{tries}={ratio:.1%} frozen={rem}")
+            else:
+                parts.append(f"s{sid_i} {admits}/{tries}={ratio:.1%}")
+        return " | ".join(parts)
+
+    # Sampling policy:
+    # - Historically we only sampled from unadmitted keys until they were admitted.
+    # - With a curriculum, that can starve earlier skills once a new skill unlocks.
+    # So: when curriculum is enabled, sample from unadmitted keys with probability p, else from all allowed keys.
+    p_unadmitted = float(curriculum_unadmitted_prob)
+    if not (0.0 <= p_unadmitted <= 1.0):
+        raise ValueError(f"curriculum_unadmitted_prob must be in [0,1], got {p_unadmitted}")
 
     def _eval_skill_acc(*, which: str) -> dict[int, float]:
         if which not in {"train", "test", "ood"}:
@@ -678,8 +949,17 @@ def main(
             curves.acc_id[int(sid)].append(float(acc_test.get(int(sid), 0.0)))
             curves.acc_ood[int(sid)].append(float(acc_ood.get(int(sid), 0.0)))
 
-        metrics_csv = out_dir / "plots" / "learning_curves_latest.csv"
+        metrics_csv = plots_dir / "learning_curves_latest.csv"
         write_learning_curves_csv(curves=curves, skills=sorted(keys_by_skill.keys()), out_path=metrics_csv)
+
+        # Save weights alongside CSV/PNG.
+        # - weights_latest.pt is overwritten each eval
+        ckpt_latest = plots_dir / "weights_latest.pt"
+        payload = {
+            "step": int(step),
+            "model_state_dict": model.state_dict(),
+        }
+        torch.save(payload, ckpt_latest)
 
         if plots_enabled:
             title = (
@@ -689,7 +969,7 @@ def main(
                 f"resets={sum(int(v) for v in fail_count.values())} | "
                 f"lr_warmup={float(lr_warmup):.2e} lr_inner={float(lr_inner):.2e} lr_trunk_inner={float(lr_trunk_inner):.2e}"
             )
-            latest = out_dir / "plots" / "learning_curves_latest.png"
+            latest = plots_dir / "learning_curves_latest.png"
             plot_learning_curves(curves=curves, skills=sorted(keys_by_skill.keys()), out_path=latest, title=title)
 
         def fmt(d: dict[int, float]) -> str:
@@ -735,19 +1015,8 @@ def main(
             print(f"warmup step={int(step):5d} | mixed_val_acc={acc:.3f}")
             warm_model.train()
 
-    # Re-initialize the fewshot model and copy in the warmup trunk weights.
-    model = TrunkPlusExperts(
-        grid_size=int(grid_size),
-        max_len=int(seq_len),
-        pos_encoding=str(pos_encoding),
-        embed_dim=int(embed_dim),
-        num_heads=int(num_heads),
-        trunk_layers=4,
-        expert_layers=2,
-        ff_dim=int(ff_dim),
-        dropout=float(dropout),
-        vocab_size=int(VOCAB_SIZE),
-    ).to(device_t)
+    # Copy warmup trunk weights into the existing fewshot model (do NOT re-initialize the model).
+    # This preserves expert initialization and avoids a second model construction after warmup.
     with torch.no_grad():
         model.embed.weight.copy_(warm_model.embed.weight)
         model.global_pos_enc.copy_(warm_model.global_pos_enc)
@@ -755,11 +1024,8 @@ def main(
             model.row_embed.weight.copy_(warm_model.row_embed.weight)  # type: ignore[attr-defined]
             model.col_embed.weight.copy_(warm_model.col_embed.weight)  # type: ignore[attr-defined]
         model.trunk.load_state_dict(warm_model.trunk.state_dict())
-
-    for k in keys:
-        model.ensure_expert(k)
-    total_params, trainable_params = count_params(model)
-    print(f"Model params: total={total_params:,} trainable={trainable_params:,} | experts={len(model.experts)}")
+    # Free warmup model memory (useful on GPU).
+    del warm_model
 
     # Reset admission bookkeeping and training step counter for the fewshot phase.
     admitted.clear()
@@ -775,14 +1041,76 @@ def main(
     for outer_step in outer_iter:
         # Sample a candidate (skill,variant) pair.
         # Prefer unadmitted keys while there are any; otherwise sample from all keys.
-        unadmitted = [k for k in keys if model.ensure_expert(k) not in admitted]
-        cand = unadmitted if len(unadmitted) > 0 else keys
-        k = cand[int(rng.integers(0, len(cand)))]
+        # Optionally balance across skills by sampling skill uniformly, then variant within skill.
+        allowed_skill_ids = [
+            int(sid)
+            for sid in skill_ids_ordered
+            if _is_skill_allowed(skill_id=int(sid), outer_step=int(outer_step))
+        ]
+        if len(allowed_skill_ids) == 0:
+            # Should be prevented by validation (n_0 == 0), but keep this explicit and readable.
+            raise ValueError(
+                f"No skills are allowed at outer_step={int(outer_step)}. "
+                f"--skill_allowed_times={skill_allowed_times} train_skills={skill_ids_ordered}"
+            )
+
+        eligible_skill_ids = [
+            int(sid) for sid in allowed_skill_ids if not _is_skill_frozen(skill_id=int(sid), outer_step=int(outer_step))
+        ]
+        # If everything is frozen, fall back to allowed skills so training can still proceed.
+        if len(eligible_skill_ids) == 0:
+            eligible_skill_ids = allowed_skill_ids
+
+        prefer_unadmitted = float(rng.random()) < float(p_unadmitted)
+
+        if bool(balanced_skill_sampling):
+            # Balanced sampling means: pick a skill uniformly, then pick a variant uniformly within that skill.
+            # We still "prefer unadmitted" *within the chosen skill*, but we do NOT drop the skill entirely if it
+            # has no unadmitted variants (otherwise skills with many variants dominate after early admissions).
+            cand_by_skill: dict[int, list[VariantKey]] = {}
+            for sid in eligible_skill_ids:
+                all_kk = keys_by_skill.get(int(sid), [])
+                if len(all_kk) == 0:
+                    continue
+                if prefer_unadmitted:
+                    unadm = [kk for kk in all_kk if model.ensure_expert(kk) not in admitted]
+                    kk_list = unadm if len(unadm) > 0 else all_kk
+                else:
+                    kk_list = all_kk
+                cand_by_skill[int(sid)] = kk_list
+            if len(cand_by_skill) == 0:
+                raise ValueError(f"No variant keys available for eligible skills={eligible_skill_ids}")
+
+            pick_skills = list(cand_by_skill.keys())
+            sid = int(pick_skills[int(rng.integers(0, len(pick_skills)))])
+            kk_list2 = cand_by_skill[int(sid)]
+            k = kk_list2[int(rng.integers(0, len(kk_list2)))]
+        else:
+            allowed_keys = [k for sid in eligible_skill_ids for k in keys_by_skill.get(int(sid), [])]
+            if len(allowed_keys) == 0:
+                raise ValueError(f"No variant keys available for eligible skills={eligible_skill_ids}")
+            if prefer_unadmitted:
+                unadmitted = [kk for kk in allowed_keys if model.ensure_expert(kk) not in admitted]
+                cand = unadmitted if len(unadmitted) > 0 else allowed_keys
+            else:
+                cand = allowed_keys
+            k = cand[int(rng.integers(0, len(cand)))]
+
         ek = model.ensure_expert(k)
 
         # Snapshot expert params so we can revert if not admitted.
-        expert: VariantExpert = model.experts[ek]  # type: ignore[assignment]
-        before = {name: p.detach().clone() for name, p in expert.named_parameters()}
+        if model.expert_mode == "variant":
+            fast_module: nn.Module = model.experts[ek]
+            reset_module: nn.Module = fast_module
+            fast_params = list(fast_module.parameters())
+        else:
+            # Shared skill expert + per-variant adapters. We only RESET the adapters on failure.
+            sk = f"s{int(k.skill_id)}"
+            skill_module = model.skill_experts[sk]
+            adapter_module = model.adapters[ek]
+            reset_module = adapter_module
+            fast_params = list(skill_module.parameters()) + list(adapter_module.parameters())
+        before = {name: p.detach().clone() for name, p in reset_module.named_parameters()}
 
         # Inner-loop optimizer: fast expert + slow trunk (and embeddings/pos).
         trunk_params: list[torch.nn.Parameter] = []
@@ -796,7 +1124,7 @@ def main(
 
         inner_opt = optim.AdamW(
             [
-                {"params": list(expert.parameters()), "lr": float(lr_inner), "weight_decay": 0.0},
+                {"params": fast_params, "lr": float(lr_inner), "weight_decay": 0.0},
                 {"params": trunk_params, "lr": float(lr_trunk_inner), "weight_decay": 0.01},
             ]
         )
@@ -836,9 +1164,28 @@ def main(
             # Reset expert weights (do not admit yet). Importantly, we do NOT revert the trunk:
             # even "failed" variants can still provide useful trunk learning signal.
             with torch.no_grad():
-                for name, p in expert.named_parameters():
+                for name, p in reset_module.named_parameters():
                     p.copy_(before[name])
             fail_count[k.to_str()] = int(fail_count.get(k.to_str(), 0)) + 1
+
+        # Update gating-only stats for this skill and possibly freeze.
+        sid_int = int(k.skill_id)
+        gate_tries_by_skill[sid_int] = int(gate_tries_by_skill.get(sid_int, 0)) + 1
+        if ok:
+            gate_admits_by_skill[sid_int] = int(gate_admits_by_skill.get(sid_int, 0)) + 1
+        tries = int(gate_tries_by_skill.get(sid_int, 0))
+        admits = int(gate_admits_by_skill.get(sid_int, 0))
+        admit_ratio = float(admits) / float(max(1, tries))
+        if freeze_steps > 0 and tries >= int(min_new_tries) and float(admit_ratio) < float(ratio_thr):
+            freeze_until_by_skill[sid_int] = int(outer_step) + int(freeze_steps)
+            resets = int(tries) - int(admits)
+            print(
+                f"FREEZE | skill=s{sid_int} | admit_ratio={float(admit_ratio):.3%} "
+                f"(admits={admits} resets={resets} tries={tries}) | frozen_for={int(freeze_steps)} outer steps"
+            )
+            # Reset gating-only counters for this skill (does NOT touch global admission/fail_count).
+            gate_tries_by_skill[sid_int] = 0
+            gate_admits_by_skill[sid_int] = 0
 
         log_every = int(outer_log_every)
         if log_every <= 0:
@@ -848,6 +1195,10 @@ def main(
                 f"outer step={int(outer_step):5d} | key={k.to_str():>20s} | val_acc={acc:.3f} | "
                 f"{'ADMIT' if ok else 'RESET'} | admitted={len(admitted)} resets={sum(int(v) for v in fail_count.values())}"
             )
+            print(f"  per-skill gate: {_fmt_skill_gate_stats(outer_step=int(outer_step))}")
+
+    # Final weights snapshot.
+    torch.save({"step": int(global_step), "model_state_dict": model.state_dict()}, plots_dir / "weights_final.pt")
 
 
 def _build_arg_parser() -> argparse.ArgumentParser:
@@ -856,6 +1207,40 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--grid_size", type=int, default=6)
     p.add_argument("--pos_encoding", type=str, default="2d", choices=["2d", "1d"])
     p.add_argument("--train_skills", type=int, nargs="*", default=None)
+    p.add_argument(
+        "--skill_allowed_times",
+        type=int,
+        nargs="*",
+        default=None,
+        help=(
+            "Curriculum over skills: list of outer-step thresholds [n_0, n_1, ...] aligned to the --train_skills order. "
+            "Skill i (in that order) is only allowed when outer_step >= n_i. Must be non-decreasing and start with 0."
+        ),
+    )
+    p.add_argument(
+        "--curriculum_unadmitted_prob",
+        type=float,
+        default=0.0,
+        help=(
+            "Sample from unadmitted keys with probability p (otherwise sample from any allowed key). "
+            "Default 0.0 means no bias toward unadmitted (more replay, less forgetting)."
+        ),
+    )
+    p.add_argument(
+        "--balanced_skill_sampling",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="If set (default), sample skill uniformly then variant uniformly within skill (prevents skills with many variants from dominating).",
+    )
+    p.add_argument(
+        "--expert_mode",
+        type=str,
+        default="skill_adapter",
+        choices=["skill_adapter", "variant"],
+        help="Expert parameterization. Default uses shared per-skill experts plus per-variant per-layer adapters.",
+    )
+    p.add_argument("--adapter_dim", type=int, default=32, help="Adapter bottleneck dim (for --expert_mode=skill_adapter).")
+    p.add_argument("--adapter_scale", type=float, default=1.0, help="Adapter residual scale (for --expert_mode=skill_adapter).")
 
     p.add_argument("--n_warmup", type=int, default=2000)
     p.add_argument("--n_outer", type=int, default=2000)
@@ -864,13 +1249,31 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--warmup_batch_size", type=int, default=64)
     p.add_argument("--val_frac", type=float, default=0.2)
     p.add_argument("--admit_threshold", type=float, default=0.5)
+    p.add_argument(
+        "--skill_freeze_admit_ratio_threshold",
+        type=float,
+        default=0.05,
+        help="If a skill's recent admitted ratio (admits/tries) is below this threshold and it has enough new tries, freeze it temporarily.",
+    )
+    p.add_argument(
+        "--skill_freeze_min_new_tries",
+        type=int,
+        default=10,
+        help="Minimum number of new tries (since last gating reset) before considering freezing a skill.",
+    )
+    p.add_argument(
+        "--skill_freeze_outer_steps",
+        type=int,
+        default=20,
+        help="How many outer steps to freeze a skill for when the freeze heuristic triggers. Set to 0 to disable.",
+    )
 
     p.add_argument("--embed_dim", type=int, default=128)
-    p.add_argument("--num_heads", type=int, default=4)
+    p.add_argument("--num_heads", type=int, default=10)
     p.add_argument("--ff_dim", type=int, default=256)
     p.add_argument("--dropout", type=float, default=0.0)
     p.add_argument("--lr_warmup", type=float, default=5e-4)
-    p.add_argument("--lr_inner", type=float, default=5e-4)
+    p.add_argument("--lr_inner", type=float, default=1e-3)
     p.add_argument(
         "--lr_trunk_inner",
         type=float,
@@ -901,12 +1304,37 @@ def _build_arg_parser() -> argparse.ArgumentParser:
 
 
 def cli_main(argv: Optional[list[str]] = None) -> None:
-    args = _build_arg_parser().parse_args(argv)
+    # Normalize argv to support both:
+    # - --skill_allowed_times 0 300 400
+    # - --skill_allowed_times=0 300 400
+    # Argparse will not treat the latter as a multi-arg option unless we rewrite it.
+    if argv is None:
+        argv = sys.argv[1:]
+    norm_argv: list[str] = []
+    for a in argv:
+        if str(a).startswith("--skill_allowed_times="):
+            _, v = str(a).split("=", 1)
+            norm_argv.append("--skill_allowed_times")
+            if v != "":
+                norm_argv.append(v)
+        else:
+            norm_argv.append(str(a))
+
+    args = _build_arg_parser().parse_args(norm_argv)
     main(
         data_dir=Path(args.data_dir),
         grid_size=int(args.grid_size),
         pos_encoding=str(args.pos_encoding),
         train_skills=[int(s) for s in args.train_skills] if args.train_skills is not None else None,
+        skill_allowed_times=[int(x) for x in args.skill_allowed_times] if args.skill_allowed_times is not None else None,
+        curriculum_unadmitted_prob=float(args.curriculum_unadmitted_prob),
+        balanced_skill_sampling=bool(args.balanced_skill_sampling),
+        skill_freeze_admit_ratio_threshold=float(args.skill_freeze_admit_ratio_threshold),
+        skill_freeze_min_new_tries=int(args.skill_freeze_min_new_tries),
+        skill_freeze_outer_steps=int(args.skill_freeze_outer_steps),
+        expert_mode=str(args.expert_mode),
+        adapter_dim=int(args.adapter_dim),
+        adapter_scale=float(args.adapter_scale),
         n_warmup=int(args.n_warmup),
         n_outer=int(args.n_outer),
         n_inner_steps=int(args.n_inner_steps),
