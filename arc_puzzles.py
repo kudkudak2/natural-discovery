@@ -128,6 +128,22 @@ class Puzzle:
         out = self.apply(inp, rule_color)
         return inp, out
 
+    def generate_prompt(
+        self,
+        *,
+        num_demos: int = 3,
+        ood_test: bool = False,
+    ) -> tuple[list[tuple[np.ndarray, np.ndarray]], tuple[np.ndarray, np.ndarray], Optional[int]]:
+        rule_color: Optional[int] = None
+        if self.uses_rule_color:
+            rule_color = int(self.rng.choice(self.colors))
+
+        demos: list[tuple[np.ndarray, np.ndarray]] = [
+            self.generate_single_example(rule_color=rule_color, ood=False) for _ in range(int(num_demos))
+        ]
+        test_pair = self.generate_single_example(rule_color=rule_color, ood=bool(ood_test))
+        return demos, test_pair, rule_color
+
 
 def _bbox_nonzero(grid: np.ndarray) -> Optional[tuple[int, int, int, int]]:
     rs, cs = np.nonzero(grid)
@@ -205,22 +221,6 @@ def _maybe_shrink_and_perturb(
     out = np.zeros_like(grid)
     out[rr0 : rr0 + new_h, cc0 : cc0 + new_w] = resized
     return out
-
-    def generate_prompt(
-        self,
-        *,
-        num_demos: int = 3,
-        ood_test: bool = False,
-    ) -> tuple[list[tuple[np.ndarray, np.ndarray]], tuple[np.ndarray, np.ndarray], Optional[int]]:
-        rule_color: Optional[int] = None
-        if self.uses_rule_color:
-            rule_color = int(self.rng.choice(self.colors))
-
-        demos: list[tuple[np.ndarray, np.ndarray]] = [
-            self.generate_single_example(rule_color=rule_color, ood=False) for _ in range(num_demos)
-        ]
-        test_pair = self.generate_single_example(rule_color=rule_color, ood=ood_test)
-        return demos, test_pair, rule_color
 
 
 def apply_gravity(grid: np.ndarray) -> np.ndarray:
@@ -574,6 +574,66 @@ def _try_place_solid_rect(
 def _count_components_4(mask: np.ndarray) -> int:
     """Count 4-connected components in a boolean mask."""
     return _count_components(mask, connectivity=4)
+
+
+def _components(mask: np.ndarray, *, connectivity: int) -> list[list[tuple[int, int]]]:
+    """
+    Return connected components for a boolean mask as lists of (r,c) coords.
+    Connectivity ∈ {4,8}.
+    """
+    conn = int(connectivity)
+    if conn not in (4, 8):
+        raise ValueError(f"Unsupported connectivity={conn}; expected 4 or 8")
+
+    if conn == 4:
+        neigh = [(-1, 0), (1, 0), (0, -1), (0, 1)]
+    else:
+        neigh = [
+            (-1, -1),
+            (-1, 0),
+            (-1, 1),
+            (0, -1),
+            (0, 1),
+            (1, -1),
+            (1, 0),
+            (1, 1),
+        ]
+
+    h, w = int(mask.shape[0]), int(mask.shape[1])
+    visited = np.zeros_like(mask, dtype=bool)
+    comps: list[list[tuple[int, int]]] = []
+
+    for r in range(h):
+        for c in range(w):
+            if not bool(mask[r, c]) or bool(visited[r, c]):
+                continue
+            stack = [(int(r), int(c))]
+            visited[r, c] = True
+            comp: list[tuple[int, int]] = []
+            while stack:
+                cr, cc = stack.pop()
+                comp.append((int(cr), int(cc)))
+                for dr, dc in neigh:
+                    nr = cr + int(dr)
+                    nc = cc + int(dc)
+                    if 0 <= nr < h and 0 <= nc < w and bool(mask[nr, nc]) and not bool(visited[nr, nc]):
+                        visited[nr, nc] = True
+                        stack.append((int(nr), int(nc)))
+            comps.append(comp)
+    return comps
+
+
+def _components_sorted(mask: np.ndarray, *, connectivity: int) -> list[list[tuple[int, int]]]:
+    """Connected components sorted by (min_row, min_col) reading order."""
+    comps = _components(mask, connectivity=int(connectivity))
+
+    def key(comp: list[tuple[int, int]]) -> tuple[int, int]:
+        rs = [r for r, _c in comp]
+        cs = [c for _r, c in comp]
+        return (int(min(rs)), int(min(cs)))
+
+    comps.sort(key=key)
+    return comps
 
 
 def _count_components(mask: np.ndarray, *, connectivity: int) -> int:
@@ -1852,6 +1912,211 @@ class Skill16ExplodeUniqueVariants(Puzzle):
             _apply_explosion(out=out, row=int(r), col=int(c), color=unique_c, offsets=self._offsets)
         return out
 
+
+class Skill17ComponentLabeling(Puzzle):
+    """
+    Component labeling skill (simplified): recolor each blob by its CENTER pixel color.
+
+    Input: multiple disconnected solid rectangles, but with RANDOM colors inside each rectangle.
+           Each rectangle has odd height/width ∈ {1,3} so it has a well-defined center pixel.
+    Output: for each connected component (4-connected over non-zero), recolor ALL pixels in that
+            component to match the component's center pixel color from the input.
+    """
+
+    skill_id = 17
+    name = "component_labeling"
+    uses_rule_color = False
+
+    def __init__(
+        self,
+        *,
+        size: int = 5,
+        colors: Sequence[int] = (1, 2, 3, 4),
+        ood_spec: OODSpec = OODSpec(),
+        shrink_perturb: Optional[ShrinkPerturbSpec] = None,
+        rng: Optional[np.random.Generator] = None,
+    ) -> None:
+        super().__init__(size=size, colors=colors, ood_spec=ood_spec, shrink_perturb=shrink_perturb, rng=rng)
+        # Keep this skill focused: fixed 4-connectivity.
+        self._connectivity = 4
+
+    @property
+    def variant_id(self) -> Optional[str]:
+        return f"conn{int(self._connectivity)}"
+
+    def variant_params(self) -> dict[str, object]:
+        return {"connectivity": int(self._connectivity)}
+
+    def make_input(self, *, ood: bool) -> np.ndarray:
+        grid = self.blank()
+        max_components = min(4, int(self.size))  # keep sparse + always placeable
+        if not ood:
+            n_comp = int(self.rng.integers(2, min(3, max_components) + 1))
+        else:
+            n_comp = int(self.rng.integers(min(3, max_components), max_components + 1))
+
+        # Only odd dimensions so the center pixel is unambiguous.
+        rect_sizes: list[tuple[int, int]] = [(1, 1), (1, 3), (3, 1), (3, 3)]
+        size_r, size_c = int(grid.shape[0]), int(grid.shape[1])
+
+        def can_place(r0: int, c0: int, h: int, w: int) -> bool:
+            r1 = r0 + int(h) - 1
+            c1 = c0 + int(w) - 1
+            if r0 < 0 or c0 < 0 or r1 >= size_r or c1 >= size_c:
+                return False
+            # Enforce a 1-cell buffer around the rectangle (Chebyshev), so blobs stay disconnected.
+            rr0 = max(0, r0 - 1)
+            rr1 = min(size_r - 1, r1 + 1)
+            cc0 = max(0, c0 - 1)
+            cc1 = min(size_c - 1, c1 + 1)
+            return not bool(np.any(grid[rr0 : rr1 + 1, cc0 : cc1 + 1] != 0))
+
+        placed = 0
+        tries = 0
+        while placed < n_comp and tries < 800:
+            tries += 1
+            h, w = rect_sizes[int(self.rng.integers(0, len(rect_sizes)))]
+            h_i, w_i = int(h), int(w)
+            if h_i > size_r or w_i > size_c:
+                continue
+            r0 = int(self.rng.integers(0, size_r - h_i + 1))
+            c0 = int(self.rng.integers(0, size_c - w_i + 1))
+            if not can_place(r0, c0, h_i, w_i):
+                continue
+            # Fill the rectangle with random colors (non-zero).
+            patch = self.rng.choice(np.asarray(self.colors), size=(h_i, w_i), replace=True).astype(np.int64)
+            grid[r0 : r0 + h_i, c0 : c0 + w_i] = patch
+            placed += 1
+        return grid
+
+    def apply(self, grid: np.ndarray, rule_color: Optional[int]) -> np.ndarray:
+        _ = rule_color
+        mask = grid != 0
+        comps = _components_sorted(mask, connectivity=int(self._connectivity))
+        out = np.zeros_like(grid)
+
+        for comp in comps:
+            rs = [int(r) for r, _c in comp]
+            cs = [int(c) for _r, c in comp]
+            r0, r1 = int(min(rs)), int(max(rs))
+            c0, c1 = int(min(cs)), int(max(cs))
+            cr = (r0 + r1) // 2
+            cc = (c0 + c1) // 2
+            color = int(grid[cr, cc])
+            for r, c in comp:
+                out[int(r), int(c)] = color
+        return out
+
+
+class Skill18PerComponentPixelCount(Puzzle):
+    """
+    Per-component feature extraction skill (pixel count) -- simplified to a single blob.
+
+    Input: exactly ONE connected component (4-connected over non-zero).
+    Output: a single vertical bar in column 0 whose height equals the blob's pixel count,
+            drawn from the bottom up.
+    """
+
+    skill_id = 18
+    name = "per_component_pixel_count"
+    uses_rule_color = False
+
+    def __init__(
+        self,
+        *,
+        size: int = 5,
+        colors: Sequence[int] = (1, 2, 3, 4),
+        ood_spec: OODSpec = OODSpec(),
+        shrink_perturb: Optional[ShrinkPerturbSpec] = None,
+        rng: Optional[np.random.Generator] = None,
+    ) -> None:
+        super().__init__(size=size, colors=colors, ood_spec=ood_spec, shrink_perturb=shrink_perturb, rng=rng)
+        self._connectivity = 4
+
+        # Restrict shapes so pixel-count fits in the grid height (bar height <= size).
+        size_i = int(self.size)
+        shapes: list[tuple[int, int]] = [(1, 1), (1, 2), (2, 1), (2, 2)]
+        if size_i >= 4:
+            shapes += [(1, 3), (3, 1)]
+        if size_i >= 5:
+            shapes += [(1, 4), (4, 1)]
+        # Filter by area <= size (so bar height fits).
+        self._rect_sizes = [(int(h), int(w)) for (h, w) in shapes if int(h) * int(w) <= size_i]
+        if not self._rect_sizes:
+            self._rect_sizes = [(1, 1)]
+
+        # Per-task input coloring mode (still one connected component: mask is "non-zero").
+        self._fill_mode = str(self.rng.choice(np.asarray(["solid_1", "solid_random", "random_cells", "stripes"])))
+
+    @property
+    def variant_id(self) -> Optional[str]:
+        return f"conn{int(self._connectivity)}_{self._fill_mode}"
+
+    def variant_params(self) -> dict[str, object]:
+        return {
+            "connectivity": int(self._connectivity),
+            "fill_mode": str(self._fill_mode),
+            "rect_sizes": [(int(h), int(w)) for (h, w) in self._rect_sizes],
+        }
+
+    def make_input(self, *, ood: bool) -> np.ndarray:
+        _ = ood
+        grid = self.blank()
+        # Always place exactly ONE rectangle, with area <= size so the output bar fits.
+        size_i = int(self.size)
+        for _ in range(600):
+            h, w = self._rect_sizes[int(self.rng.integers(0, len(self._rect_sizes)))]
+            h_i, w_i = int(h), int(w)
+            if h_i <= 0 or w_i <= 0 or (h_i * w_i) > size_i:
+                continue
+            if h_i > size_i or w_i > size_i:
+                continue
+            r0 = int(self.rng.integers(0, size_i - h_i + 1))
+            c0 = int(self.rng.integers(0, size_i - w_i + 1))
+            if bool(np.any(grid[r0 : r0 + h_i, c0 : c0 + w_i] != 0)):
+                continue
+            if self._fill_mode == "solid_1":
+                patch = np.ones((h_i, w_i), dtype=np.int64)
+            elif self._fill_mode == "solid_random":
+                c = int(self.rng.choice(np.asarray(self.colors))) if len(self.colors) > 0 else 1
+                patch = np.full((h_i, w_i), int(c), dtype=np.int64)
+            elif self._fill_mode == "stripes":
+                # Alternating row stripes of two colors (both non-zero).
+                if len(self.colors) >= 2:
+                    c1, c2 = (int(self.colors[0]), int(self.colors[1]))
+                elif len(self.colors) == 1:
+                    c1, c2 = (int(self.colors[0]), int(self.colors[0]))
+                else:
+                    c1, c2 = (1, 2)
+                patch = np.zeros((h_i, w_i), dtype=np.int64)
+                for rr in range(h_i):
+                    patch[rr, :] = c1 if (rr % 2 == 0) else c2
+            else:
+                # random_cells
+                palette = np.asarray(self.colors, dtype=np.int64)
+                if palette.size == 0:
+                    palette = np.asarray([1, 2, 3, 4], dtype=np.int64)
+                patch = self.rng.choice(palette, size=(h_i, w_i), replace=True).astype(np.int64)
+            grid[r0 : r0 + h_i, c0 : c0 + w_i] = patch
+            break
+        return grid
+
+    def apply(self, grid: np.ndarray, rule_color: Optional[int]) -> np.ndarray:
+        _ = rule_color
+        size_i = int(grid.shape[0])
+        mask = grid != 0
+        comps = _components_sorted(mask, connectivity=int(self._connectivity))
+        if not comps:
+            return np.zeros_like(grid)
+        comp = comps[0]
+        height = int(len(comp))
+        if height > size_i:
+            height = size_i
+        out = np.zeros_like(grid)
+        bar_color = int(self.colors[0]) if len(self.colors) > 0 else 1
+        out[size_i - height : size_i, 0] = int(bar_color)
+        return out
+
 # --- Update the Factory ---
 
 def build_puzzle(
@@ -1894,6 +2159,10 @@ def build_puzzle(
         return Skill15PixelExplosionVariants(size=size, shrink_perturb=shrink_perturb, rng=rng)
     if skill_id == 16:
         return Skill16ExplodeUniqueVariants(size=size, shrink_perturb=shrink_perturb, rng=rng)
+    if skill_id == 17:
+        return Skill17ComponentLabeling(size=size, shrink_perturb=shrink_perturb, rng=rng)
+    if skill_id == 18:
+        return Skill18PerComponentPixelCount(size=size, shrink_perturb=shrink_perturb, rng=rng)
         
     raise ValueError(f"Unknown skill_id={skill_id}")
 

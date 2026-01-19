@@ -421,7 +421,8 @@ class TrunkPlusExperts(nn.Module):
         max_len: int,
         pos_encoding: str,
         embed_dim: int,
-        num_heads: int,
+        num_heads_trunk: int,
+        num_heads_expert: int,
         trunk_layers: int = 4,
         expert_layers: int = 2,
         ff_dim: int = 256,
@@ -438,6 +439,17 @@ class TrunkPlusExperts(nn.Module):
         if self.pos_encoding not in {"2d", "1d"}:
             raise ValueError(f"pos_encoding must be one of {{'2d','1d'}}, got {pos_encoding!r}")
 
+        trunk_heads = int(num_heads_trunk)
+        expert_heads = int(num_heads_expert)
+        if trunk_heads < 1:
+            raise ValueError(f"num_heads_trunk must be >= 1, got {trunk_heads}")
+        if expert_heads < 1:
+            raise ValueError(f"num_heads_expert must be >= 1, got {expert_heads}")
+        if int(embed_dim) % trunk_heads != 0:
+            raise ValueError(f"embed_dim ({int(embed_dim)}) must be divisible by num_heads_trunk ({trunk_heads})")
+        if int(embed_dim) % expert_heads != 0:
+            raise ValueError(f"embed_dim ({int(embed_dim)}) must be divisible by num_heads_expert ({expert_heads})")
+
         self.embed = nn.Embedding(int(vocab_size), int(embed_dim))
         self.global_pos_enc = nn.Parameter(torch.randn(1, int(max_len), int(embed_dim)) * 0.02)
 
@@ -447,7 +459,7 @@ class TrunkPlusExperts(nn.Module):
 
         trunk_layer = nn.TransformerEncoderLayer(
             d_model=int(embed_dim),
-            nhead=int(num_heads),
+            nhead=int(trunk_heads),
             dim_feedforward=int(ff_dim),
             batch_first=True,
             dropout=float(dropout),
@@ -456,7 +468,7 @@ class TrunkPlusExperts(nn.Module):
 
         self._expert_layers = int(expert_layers)
         self._expert_ff_dim = int(ff_dim)
-        self._expert_heads = int(num_heads)
+        self._expert_heads = int(expert_heads)
         self._dropout = float(dropout)
         self._embed_dim = int(embed_dim)
         self._vocab_size = int(vocab_size)
@@ -615,6 +627,10 @@ def main(
     admit_threshold: float = 0.50,
     embed_dim: int = 128,
     num_heads: int = 4,
+    num_heads_trunk: Optional[int] = None,
+    num_heads_expert: Optional[int] = None,
+    trunk_layers: int = 4,
+    expert_layers: int = 2,
     ff_dim: int = 256,
     dropout: float = 0.0,
     lr_warmup: float = 5e-4,
@@ -673,14 +689,23 @@ def main(
             raise ValueError(f"Pool {k.to_str()} grid_size={p.grid_size} != --grid_size={grid_size}")
 
     seq_len = prompt_seq_len(grid_size=int(grid_size), num_demos=3)
+    trunk_heads = int(num_heads) if num_heads_trunk is None else int(num_heads_trunk)
+    expert_heads = int(num_heads) if num_heads_expert is None else int(num_heads_expert)
+    trunk_layers_i = int(trunk_layers)
+    expert_layers_i = int(expert_layers)
+    if trunk_layers_i < 1:
+        raise ValueError(f"trunk_layers must be >= 1, got {trunk_layers_i}")
+    if expert_layers_i < 1:
+        raise ValueError(f"expert_layers must be >= 1, got {expert_layers_i}")
     model = TrunkPlusExperts(
         grid_size=int(grid_size),
         max_len=int(seq_len),
         pos_encoding=str(pos_encoding),
         embed_dim=int(embed_dim),
-        num_heads=int(num_heads),
-        trunk_layers=4,
-        expert_layers=2,
+        num_heads_trunk=int(trunk_heads),
+        num_heads_expert=int(expert_heads),
+        trunk_layers=int(trunk_layers_i),
+        expert_layers=int(expert_layers_i),
         ff_dim=int(ff_dim),
         dropout=float(dropout),
         vocab_size=int(VOCAB_SIZE),
@@ -751,11 +776,15 @@ def main(
         "skill_freeze_outer_steps": int(skill_freeze_outer_steps),
         # Model hyperparams (must match checkpoint load)
         "embed_dim": int(embed_dim),
-        "num_heads": int(num_heads),
+        # Keep legacy "num_heads" for backwards compatibility with older analysis scripts/config readers.
+        # When trunk/expert head counts differ, "num_heads" is set to the trunk value.
+        "num_heads": int(trunk_heads),
+        "num_heads_trunk": int(trunk_heads),
+        "num_heads_expert": int(expert_heads),
         "ff_dim": int(ff_dim),
         "dropout": float(dropout),
-        "trunk_layers": 4,
-        "expert_layers": 2,
+        "trunk_layers": int(trunk_layers_i),
+        "expert_layers": int(expert_layers_i),
         "expert_mode": str(expert_mode),
         "adapter_dim": int(adapter_dim),
         "adapter_scale": float(adapter_scale),
@@ -789,8 +818,8 @@ def main(
         max_len=int(seq_len),
         pos_encoding=str(pos_encoding),
         embed_dim=int(embed_dim),
-        num_heads=int(num_heads),
-        trunk_layers=4,
+        num_heads=int(trunk_heads),
+        trunk_layers=int(trunk_layers_i),
         ff_dim=int(ff_dim),
         dropout=float(dropout),
         vocab_size=int(VOCAB_SIZE),
@@ -1269,7 +1298,26 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     )
 
     p.add_argument("--embed_dim", type=int, default=128)
-    p.add_argument("--num_heads", type=int, default=10)
+    p.add_argument(
+        "--num_heads",
+        type=int,
+        default=10,
+        help="Legacy alias for both trunk and expert heads. Prefer --num_heads_trunk / --num_heads_expert.",
+    )
+    p.add_argument(
+        "--num_heads_trunk",
+        type=int,
+        default=None,
+        help="Number of attention heads for the shared trunk transformer. Defaults to --num_heads when omitted.",
+    )
+    p.add_argument(
+        "--num_heads_expert",
+        type=int,
+        default=None,
+        help="Number of attention heads for the expert transformer(s). Defaults to --num_heads when omitted.",
+    )
+    p.add_argument("--trunk_layers", type=int, default=4, help="Number of transformer layers in the shared trunk.")
+    p.add_argument("--expert_layers", type=int, default=2, help="Number of transformer layers in the expert stack(s).")
     p.add_argument("--ff_dim", type=int, default=256)
     p.add_argument("--dropout", type=float, default=0.0)
     p.add_argument("--lr_warmup", type=float, default=5e-4)
@@ -1344,6 +1392,10 @@ def cli_main(argv: Optional[list[str]] = None) -> None:
         admit_threshold=float(args.admit_threshold),
         embed_dim=int(args.embed_dim),
         num_heads=int(args.num_heads),
+        num_heads_trunk=(int(args.num_heads_trunk) if args.num_heads_trunk is not None else None),
+        num_heads_expert=(int(args.num_heads_expert) if args.num_heads_expert is not None else None),
+        trunk_layers=int(args.trunk_layers),
+        expert_layers=int(args.expert_layers),
         ff_dim=int(args.ff_dim),
         dropout=float(args.dropout),
         lr_warmup=float(args.lr_warmup),

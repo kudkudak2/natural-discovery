@@ -119,7 +119,24 @@ def _build_arg_parser() -> argparse.ArgumentParser:
 
     # Model architecture (must match the checkpoint).
     p.add_argument("--embed_dim", type=int, default=128)
-    p.add_argument("--num_heads", type=int, default=4)
+    p.add_argument(
+        "--num_heads",
+        type=int,
+        default=4,
+        help="Legacy alias for both trunk and expert heads. Prefer --num_heads_trunk / --num_heads_expert.",
+    )
+    p.add_argument(
+        "--num_heads_trunk",
+        type=int,
+        default=None,
+        help="Number of attention heads for the shared trunk transformer. Defaults to --num_heads when omitted.",
+    )
+    p.add_argument(
+        "--num_heads_expert",
+        type=int,
+        default=None,
+        help="Number of attention heads for the expert transformer(s). Defaults to --num_heads when omitted.",
+    )
     p.add_argument("--ff_dim", type=int, default=256)
     p.add_argument("--dropout", type=float, default=0.0)
     p.add_argument("--trunk_layers", type=int, default=4)
@@ -176,6 +193,8 @@ def main(
     train_skills: Optional[list[int]],
     embed_dim: int,
     num_heads: int,
+    num_heads_trunk: Optional[int],
+    num_heads_expert: Optional[int],
     ff_dim: int,
     dropout: float,
     trunk_layers: int,
@@ -231,12 +250,15 @@ def main(
         raise ValueError(f"Unexpected --subset: {subset!r}")
 
     seq_len = prompt_seq_len(grid_size=int(grid_size), num_demos=3)
+    trunk_heads = int(num_heads) if num_heads_trunk is None else int(num_heads_trunk)
+    expert_heads = int(num_heads) if num_heads_expert is None else int(num_heads_expert)
     model = TrunkPlusExperts(
         grid_size=int(grid_size),
         max_len=int(seq_len),
         pos_encoding=str(pos_encoding),
         embed_dim=int(embed_dim),
-        num_heads=int(num_heads),
+        num_heads_trunk=int(trunk_heads),
+        num_heads_expert=int(expert_heads),
         trunk_layers=int(trunk_layers),
         expert_layers=int(expert_layers),
         ff_dim=int(ff_dim),
@@ -523,6 +545,12 @@ def cli_main(argv: Optional[list[str]] = None) -> None:
     if data_dir is None:
         raise ValueError("Missing --data_dir and no run_config.json found (or it lacked data_dir).")
 
+    picked_num_heads = int(pick("num_heads", args.num_heads, "--num_heads"))
+    picked_num_heads_trunk_raw = pick("num_heads_trunk", args.num_heads_trunk, "--num_heads_trunk")
+    picked_num_heads_expert_raw = pick("num_heads_expert", args.num_heads_expert, "--num_heads_expert")
+    picked_num_heads_trunk = int(picked_num_heads_trunk_raw) if picked_num_heads_trunk_raw is not None else None
+    picked_num_heads_expert = int(picked_num_heads_expert_raw) if picked_num_heads_expert_raw is not None else None
+
     main(
         weights_path=Path(args.weights_path),
         data_dir=Path(str(data_dir)),
@@ -536,7 +564,9 @@ def cli_main(argv: Optional[list[str]] = None) -> None:
             else ([int(s) for s in (run_cfg.get("train_skills") or [])] if run_cfg.get("train_skills") is not None else None)
         ),
         embed_dim=int(pick("embed_dim", args.embed_dim, "--embed_dim")),
-        num_heads=int(pick("num_heads", args.num_heads, "--num_heads")),
+        num_heads=int(picked_num_heads),
+        num_heads_trunk=picked_num_heads_trunk,
+        num_heads_expert=picked_num_heads_expert,
         ff_dim=int(pick("ff_dim", args.ff_dim, "--ff_dim")),
         dropout=float(pick("dropout", args.dropout, "--dropout")),
         trunk_layers=int(pick("trunk_layers", args.trunk_layers, "--trunk_layers")),

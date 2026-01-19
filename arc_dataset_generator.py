@@ -251,7 +251,7 @@ def main() -> None:
     p.add_argument("--out_dir", type=str, required=True, help="Output directory")
     p.add_argument("--n_tasks", type=int, default=400, help="Number of tasks per skill per split")
     p.add_argument("--grid_size", type=int, default=6, help="Grid size (NxN)")
-    p.add_argument("--skills", type=int, nargs="*", default=range(11,17), help="Skills to generate (e.g. 1 2 3)")
+    p.add_argument("--skills", type=int, nargs="*", default=range(11,19), help="Skills to generate (e.g. 1 2 3)")
     p.add_argument("--seed", type=int, default=0, help="Base RNG seed")
     p.add_argument("--png_per_skill", type=int, default=8, help="How many tasks to render as PNG per skill per split")
     p.add_argument(
@@ -270,15 +270,6 @@ def main() -> None:
         action="store_true",
         help="Disable creating a zip archive of the generated dataset folder.",
     )
-    p.add_argument(
-        "--shrink_perturb",
-        action="store_true",
-        help="Enable an extra input-space augmentation step: shrink non-zero content and slightly translate it, then recompute outputs.",
-    )
-    p.add_argument("--sp_prob", type=float, default=1.0, help="Probability of applying shrink+perturb per example (only used when --shrink_perturb is set).")
-    p.add_argument("--sp_shrink_min", type=float, default=0.6, help="Minimum shrink factor in (0,1] (only used when --shrink_perturb is set).")
-    p.add_argument("--sp_shrink_max", type=float, default=0.9, help="Maximum shrink factor in (0,1] (only used when --shrink_perturb is set).")
-    p.add_argument("--sp_shift_max", type=int, default=1, help="Max translation (pixels) applied to the content bbox (only used when --shrink_perturb is set).")
 
     args = p.parse_args()
 
@@ -288,14 +279,6 @@ def main() -> None:
     show_progress = not bool(args.no_progress)
 
     shrink_perturb: Optional[ShrinkPerturbSpec] = None
-    if bool(args.shrink_perturb):
-        shrink_perturb = ShrinkPerturbSpec(
-            enabled=True,
-            prob=float(args.sp_prob),
-            shrink_min=float(args.sp_shrink_min),
-            shrink_max=float(args.sp_shrink_max),
-            shift_max=int(args.sp_shift_max),
-        )
 
     for skill_id in skills:
         # Two splits: train-style (easy test) and ood test

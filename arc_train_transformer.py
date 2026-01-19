@@ -28,13 +28,54 @@ from arc_train_utils import (
     split_dataset,
     write_learning_curves_csv,
 )
+from checkpointing import load_pretrained_weights
 
-
-DEFAULT_TRAIN_SKILLS = (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13)
-DEFAULT_TRAIN_WITH_OOD_SKILLS = (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13)
 
 DEFAULT_TRAIN_SKILLS = (11, 12, 14, 15, 16)
 DEFAULT_TRAIN_WITH_OOD_SKILLS = (11, 12, 14, 15, 16)
+
+
+def _unique_ints(xs: list[int]) -> list[int]:
+    """Stable unique (preserves first occurrence order)."""
+    out: list[int] = []
+    seen: set[int] = set()
+    for x in xs:
+        xi = int(x)
+        if xi in seen:
+            continue
+        seen.add(xi)
+        out.append(xi)
+    return out
+
+
+def _curriculum_delay_from_phases(
+    *,
+    phase1_skills: list[int],
+    phase2_skills: list[int],
+    phase2_start_step: int,
+) -> tuple[list[int], list[int], list[int]]:
+    """
+    Convert a 2-phase curriculum into (train_skills, delay_train_skills, delay_train_until_steps).
+
+    Phase 1: train only on `phase1_skills` starting at step 0.
+    Phase 2: train on `phase2_skills` starting at `phase2_start_step`.
+    """
+    p1 = _unique_ints([int(s) for s in phase1_skills])
+    p2 = _unique_ints([int(s) for s in phase2_skills])
+    if len(p1) == 0:
+        raise ValueError("phase1_skills must be non-empty")
+    if len(p2) == 0:
+        raise ValueError("phase2_skills must be non-empty")
+
+    start = int(phase2_start_step)
+    if start < 0:
+        raise ValueError(f"phase2_start_step must be >= 0, got {start}")
+
+    train_skills = _unique_ints(p1 + p2)
+    phase2_only = [s for s in p2 if s not in set(p1)]
+    delay_skills = _unique_ints(phase2_only)
+    delay_steps = [int(start) for _ in delay_skills]
+    return train_skills, delay_skills, delay_steps
 class ARCTransformer(nn.Module):
     def __init__(
         self,
@@ -115,6 +156,7 @@ def main(
     data_dir: Path = Path("tmp"),
     grid_size: int = 5,
     pos_encoding: str = "2d",
+    pretrained: Optional[Path] = None,
     train_skills: Optional[list[int]] = None,
     delay_train_skill: Optional[int] = None,
     delay_train_until_step: int = 0,
@@ -130,6 +172,8 @@ def main(
     steps: int = 3000,
     batch_size: int = 32,
     lr: float = 5e-4,
+    lr_decay: str = "cosine",
+    min_lr: float = 0.0,
     weight_decay: float = 0.01, # 0.1 seems too high actually
     seed: int = 0,
     device: str = "cuda", # if torch.cuda.is_available() else "cpu",
@@ -139,6 +183,7 @@ def main(
     ff_dim: int = 256,
     dropout: float = 0.0,
     eval_every: int = 500,
+    save_every: int = 500,
     eval_tasks: int = 128,
     eval_batch_size: int = 256,
     progress: bool = False,
@@ -153,7 +198,10 @@ def main(
     grid_tokens = grid_size * grid_size
     seq_len = prompt_seq_len(grid_size=grid_size, num_demos=3)
     device = torch.device(device)
+    out_dir = Path(out_dir).expanduser().resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / "plots").mkdir(parents=True, exist_ok=True)
+    (out_dir / "checkpoints").mkdir(parents=True, exist_ok=True)
     plots_enabled = not bool(no_plots)
 
     if device.type == "cuda":
@@ -331,6 +379,17 @@ def main(
         dropout=float(dropout),
     ).to(device)
 
+    if pretrained is not None:
+        report = load_pretrained_weights(model, pretrained)
+        print(
+            "Loaded pretrained weights:"
+            f" loaded={report.loaded}"
+            f" skipped_unexpected={report.skipped_unexpected}"
+            f" skipped_shape_mismatch={report.skipped_shape_mismatch}"
+            f" missing_after_load={report.missing_after_load}",
+            flush=True,
+        )
+
     total_params, trainable_params = count_params(model)
     print(f"Model params: total={total_params:,} trainable={trainable_params:,}")
 
@@ -352,10 +411,52 @@ def main(
         ],
         lr=float(lr),
     )
+    lr_decay = str(lr_decay).lower().strip()
+    if lr_decay not in {"cosine", "none"}:
+        raise ValueError(f"--lr_decay must be one of {{'cosine','none'}}, got {lr_decay!r}")
+    if float(min_lr) < 0.0:
+        raise ValueError(f"--min_lr must be >= 0, got {min_lr}")
+    if lr_decay == "cosine":
+        # Decay from --lr to --min_lr over the full training horizon.
+        scheduler = optim.lr_scheduler.CosineAnnealingLR(
+            opt,
+            T_max=int(steps),
+            eta_min=float(min_lr),
+        )
+    else:
+        scheduler = None
     loss_fn = nn.CrossEntropyLoss()
+
+    def save_latest_checkpoint(*, step: int) -> None:
+        ckpt = {
+            "step": int(step),
+            "model": model.state_dict(),
+            "optimizer": opt.state_dict(),
+            "seed": int(seed),
+            "grid_size": int(grid_size),
+            "seq_len": int(seq_len),
+            "train_skills": [int(s) for s in train_skills],
+            "delay_until_by_skill": {int(k): int(v) for k, v in delay_until_by_skill.items()},
+        }
+        torch.save(ckpt, out_dir / "checkpoints" / "latest.pt")
+
+    def save_best_val_checkpoint(*, step: int, val_score: float) -> None:
+        ckpt = {
+            "step": int(step),
+            "val_score": float(val_score),
+            "model": model.state_dict(),
+            "optimizer": opt.state_dict(),
+            "seed": int(seed),
+            "grid_size": int(grid_size),
+            "seq_len": int(seq_len),
+            "train_skills": [int(s) for s in train_skills],
+            "delay_until_by_skill": {int(k): int(v) for k, v in delay_until_by_skill.items()},
+        }
+        torch.save(ckpt, out_dir / "checkpoints" / "best_val.pt")
 
     # Baseline training: mixed skills, only ID prompts (no OOD in train; notably no Skill 3 OOD).
     model.train()
+    best_val = float("-inf")
     curves = LearningCurves(
         steps=[],
         loss=[],
@@ -388,6 +489,11 @@ def main(
         loss = loss_fn(pred_logits.reshape(-1, VOCAB_SIZE), tgt.reshape(-1))
         loss.backward()
         opt.step()
+        if scheduler is not None:
+            scheduler.step()
+
+        if (int(save_every) > 0) and ((step % int(save_every) == 0) or (step == int(steps) - 1)):
+            save_latest_checkpoint(step=int(step))
 
         if (step % int(eval_every) == 0) or (step == int(steps) - 1):
             model.eval()
@@ -459,6 +565,9 @@ def main(
                 f"  ood: {fmt(acc_ood, eval_ids)}  "
                 f"(probe: s{probe_skill} train-ood={acc_probe_train:.3f} fully-heldout-ood={acc_probe_ood:.3f})"
             )
+            if scheduler is not None:
+                # All param groups share the same LR schedule (we only vary weight_decay).
+                print(f"  lr : {opt.param_groups[0]['lr']:.6g}")
 
             # Track and plot learning curves
             curves.steps.append(int(step))
@@ -474,6 +583,13 @@ def main(
             # Save metrics CSV next to the plot output (even if --no_plots).
             metrics_csv = out_dir / "plots" / "learning_curves_latest.csv"
             write_learning_curves_csv(curves=curves, skills=sorted(eval_ids), out_path=metrics_csv)
+
+            # "Val" model selection: mean ID accuracy across eval_id splits.
+            if len(eval_ids) > 0:
+                val_score = float(sum(float(acc_id[sid]) for sid in eval_ids)) / float(len(eval_ids))
+                if val_score > best_val:
+                    best_val = val_score
+                    save_best_val_checkpoint(step=int(step), val_score=float(val_score))
 
             if plots_enabled:
                 delay_s = (
@@ -510,7 +626,63 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="Directory produced by arc_dataset_generator.py (contains skill_<id>/{train,ood}.json).",
     )
     p.add_argument("--grid_size", type=int, default=5)
-    p.add_argument("--train_skills", type=int, nargs="*", default=list(DEFAULT_TRAIN_SKILLS))
+    p.add_argument(
+        "--pretrained",
+        type=Path,
+        default=None,
+        help="Optional path to pretrained weights (.pt checkpoint with `model` or a raw state_dict). "
+        "Weights are loaded permissively (matching names+shapes); new layers stay randomly initialized.",
+    )
+    p.add_argument(
+        "--tasks",
+        type=int,
+        nargs="*",
+        default=None,
+        help="Alias for --train_skills (skill IDs to load for training/eval). Example: --tasks 14 15",
+    )
+    p.add_argument(
+        "--train_skills",
+        type=int,
+        nargs="*",
+        default=None,
+        help=f"Skill IDs to load for training/eval. Default: {list(DEFAULT_TRAIN_SKILLS)}",
+    )
+    p.add_argument(
+        "--phase1_skills",
+        type=int,
+        nargs="*",
+        default=None,
+        help=(
+            "Optional 2-phase curriculum. Phase 1 trains ONLY on these skills. "
+            "Phase 2 adds skills (see --phase2_skills) at --phase2_start_step / --phase2_start_frac. "
+            "Mutually exclusive with --delay_train_skills/--delay_train_until_steps."
+        ),
+    )
+    p.add_argument(
+        "--phase2_skills",
+        type=int,
+        nargs="*",
+        default=None,
+        help=(
+            "Optional 2-phase curriculum. Phase 2 skill set (joint training pool after curriculum switch). "
+            "If omitted, defaults to phase1_skills (no-op)."
+        ),
+    )
+    p.add_argument(
+        "--phase2_start_step",
+        type=int,
+        default=None,
+        help="Optional 2-phase curriculum: step at which to start Phase 2 (adding phase2-only skills).",
+    )
+    p.add_argument(
+        "--phase2_start_frac",
+        type=float,
+        default=None,
+        help=(
+            "Optional 2-phase curriculum: fraction of total --steps at which to start Phase 2. "
+            "Example: 0.5 means switch at half the steps. Ignored if --phase2_start_step is set."
+        ),
+    )
     p.add_argument(
         "--delay_train_skill",
         "--delay_train_skills",
@@ -596,6 +768,19 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--steps", type=int, default=3000)
     p.add_argument("--batch_size", type=int, default=32)
     p.add_argument("--lr", type=float, default=5e-4)
+    p.add_argument(
+        "--lr_decay",
+        type=str,
+        default="cosine",
+        choices=["cosine", "none"],
+        help="LR schedule. Default is cosine decay over --steps; set 'none' for constant LR.",
+    )
+    p.add_argument(
+        "--min_lr",
+        type=float,
+        default=0.0,
+        help="Minimum LR for cosine decay (eta_min). Ignored when --lr_decay=none.",
+    )
     p.add_argument("--weight_decay", type=float, default=0.01, help="AdamW weight decay (L2).")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
@@ -612,6 +797,12 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="Positional encoding scheme. '2d' (default) uses row+col embeddings per grid; '1d' uses the old absolute learned positions.",
     )
     p.add_argument("--eval_every", type=int, default=1000)
+    p.add_argument(
+        "--save_every",
+        type=int,
+        default=500,
+        help="How often to update checkpoints/latest.pt (in steps). Set 0 to disable.",
+    )
     p.add_argument("--eval_tasks", type=int, default=128)
     p.add_argument(
         "--eval_batch_size",
@@ -634,11 +825,40 @@ def _build_arg_parser() -> argparse.ArgumentParser:
 
 def cli_main(argv: Optional[list[str]] = None) -> None:
     args = _build_arg_parser().parse_args(argv)
+    if args.tasks is not None and args.train_skills is not None:
+        raise ValueError("Use either --tasks or --train_skills (alias), not both.")
+
+    # Resolve the "base" training skill list (before curriculum/delay tweaks).
+    train_skills = args.tasks if args.tasks is not None else args.train_skills
+
+    # Optional 2-phase curriculum, compiled down to the existing delay mechanism.
+    if args.phase1_skills is not None:
+        if (args.delay_train_skills is not None) or (args.delay_train_until_steps is not None):
+            raise ValueError("--phase1_skills cannot be combined with --delay_train_skills/--delay_train_until_steps.")
+        phase1 = [int(s) for s in args.phase1_skills]
+        phase2 = phase1 if args.phase2_skills is None else [int(s) for s in args.phase2_skills]
+
+        if args.phase2_start_step is not None:
+            phase2_start_step = int(args.phase2_start_step)
+        else:
+            frac = 0.5 if args.phase2_start_frac is None else float(args.phase2_start_frac)
+            if not (0.0 <= frac <= 1.0):
+                raise ValueError(f"--phase2_start_frac must be in [0,1], got {frac}")
+            phase2_start_step = int(round(frac * float(int(args.steps))))
+
+        train_skills, delay_skills, delay_steps = _curriculum_delay_from_phases(
+            phase1_skills=phase1,
+            phase2_skills=phase2,
+            phase2_start_step=int(phase2_start_step),
+        )
+        args.delay_train_skills = delay_skills
+        args.delay_train_until_steps = delay_steps
     main(
         data_dir=Path(args.data_dir),
         grid_size=int(args.grid_size),
         pos_encoding=str(args.pos_encoding),
-        train_skills=[int(s) for s in args.train_skills] if args.train_skills is not None else None,
+        pretrained=Path(args.pretrained) if args.pretrained is not None else None,
+        train_skills=[int(s) for s in train_skills] if train_skills is not None else None,
         delay_train_skills=[int(s) for s in args.delay_train_skills] if args.delay_train_skills is not None else None,
         delay_train_until_steps=[int(s) for s in args.delay_train_until_steps] if args.delay_train_until_steps is not None else None,
         probe_skill=int(args.probe_skill),
@@ -651,6 +871,8 @@ def cli_main(argv: Optional[list[str]] = None) -> None:
         steps=int(args.steps),
         batch_size=int(args.batch_size),
         lr=float(args.lr),
+        lr_decay=str(args.lr_decay),
+        min_lr=float(args.min_lr),
         weight_decay=float(args.weight_decay),
         seed=int(args.seed),
         device=str(args.device),
@@ -660,6 +882,7 @@ def cli_main(argv: Optional[list[str]] = None) -> None:
         ff_dim=int(args.ff_dim),
         dropout=float(args.dropout),
         eval_every=int(args.eval_every),
+        save_every=int(args.save_every),
         eval_tasks=int(args.eval_tasks),
         eval_batch_size=int(args.eval_batch_size),
         progress=bool(args.progress),
