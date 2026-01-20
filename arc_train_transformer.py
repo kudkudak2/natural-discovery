@@ -76,6 +76,69 @@ def _curriculum_delay_from_phases(
     delay_skills = _unique_ints(phase2_only)
     delay_steps = [int(start) for _ in delay_skills]
     return train_skills, delay_skills, delay_steps
+
+
+def _curriculum_delay_from_3phases(
+    *,
+    phase1_skills: list[int],
+    phase2_skills: list[int],
+    phase2_start_step: int,
+    phase3_skills: list[int],
+    phase3_start_step: int,
+) -> tuple[list[int], list[int], list[int]]:
+    """
+    Convert a 3-phase curriculum into (train_skills, delay_train_skills, delay_train_until_steps).
+
+    Phase 1: train only on `phase1_skills` starting at step 0.
+    Phase 2: train on `phase2_skills` starting at `phase2_start_step`.
+    Phase 3: train on `phase3_skills` starting at `phase3_start_step`.
+
+    Note: the delayed-skill mechanism is *additive* (skills can be introduced later but not removed),
+    so we require phase sets to be monotonic: phase1 ⊆ phase2 ⊆ phase3.
+    """
+    p1 = _unique_ints([int(s) for s in phase1_skills])
+    p2 = _unique_ints([int(s) for s in phase2_skills])
+    p3 = _unique_ints([int(s) for s in phase3_skills])
+    if len(p1) == 0:
+        raise ValueError("phase1_skills must be non-empty")
+    if len(p2) == 0:
+        raise ValueError("phase2_skills must be non-empty")
+    if len(p3) == 0:
+        raise ValueError("phase3_skills must be non-empty")
+
+    s2 = int(phase2_start_step)
+    s3 = int(phase3_start_step)
+    if s2 < 0:
+        raise ValueError(f"phase2_start_step must be >= 0, got {s2}")
+    if s3 < 0:
+        raise ValueError(f"phase3_start_step must be >= 0, got {s3}")
+    if s3 < s2:
+        raise ValueError(f"phase3_start_step must be >= phase2_start_step, got {s3} < {s2}")
+
+    p1_set = set(p1)
+    p2_set = set(p2)
+    p3_set = set(p3)
+    if not p1_set.issubset(p2_set):
+        missing = sorted(p1_set - p2_set)
+        raise ValueError(f"phase2_skills must include all phase1_skills (missing: {missing})")
+    if not p2_set.issubset(p3_set):
+        missing = sorted(p2_set - p3_set)
+        raise ValueError(f"phase3_skills must include all phase2_skills (missing: {missing})")
+
+    train_skills = _unique_ints(p1 + p2 + p3)
+
+    phase2_only = [s for s in p2 if s not in p1_set]
+    phase3_only = [s for s in p3 if s not in p2_set]
+    delay_skills = _unique_ints(phase2_only + phase3_only)
+    delay_steps = [int(s2) for _ in phase2_only] + [int(s3) for _ in phase3_only]
+    # Align delay_steps with delay_skills' stable-unique behavior.
+    step_by_skill: dict[int, int] = {}
+    for sid, until in zip(phase2_only, [int(s2) for _ in phase2_only]):
+        step_by_skill[int(sid)] = int(until)
+    for sid, until in zip(phase3_only, [int(s3) for _ in phase3_only]):
+        step_by_skill[int(sid)] = int(until)
+    delay_steps_aligned = [int(step_by_skill[int(sid)]) for sid in delay_skills]
+    return train_skills, delay_skills, delay_steps_aligned
 class ARCTransformer(nn.Module):
     def __init__(
         self,
@@ -186,6 +249,7 @@ def main(
     save_every: int = 500,
     eval_tasks: int = 128,
     eval_batch_size: int = 256,
+    plot_unsolved_n: int = 3,
     progress: bool = False,
     out_dir: Path = Path("arc_train_runs"),
     no_plots: bool = False,
@@ -203,6 +267,9 @@ def main(
     (out_dir / "plots").mkdir(parents=True, exist_ok=True)
     (out_dir / "checkpoints").mkdir(parents=True, exist_ok=True)
     plots_enabled = not bool(no_plots)
+    plot_unsolved_n_i = int(plot_unsolved_n)
+    if plot_unsolved_n_i < 0:
+        raise ValueError(f"plot_unsolved_n must be >= 0, got {plot_unsolved_n_i}")
 
     if device.type == "cuda":
         # More throughput on Ampere+; safe for this kind of toy transformer.
@@ -501,6 +568,17 @@ def main(
             acc_train = {}
             acc_id = {}
             acc_ood = {}
+            # Only render unsolved examples on the FINAL step, and write them into a single folder.
+            # This avoids creating a new folder every eval and keeps the most relevant failures easy to find.
+            is_last_step = int(step) == (int(steps) - 1)
+            unsolved_dir = out_dir / "plots" / "unsolved_examples" if is_last_step else None
+            if unsolved_dir is not None:
+                # Refresh the folder so it only contains the last-step results.
+                if unsolved_dir.exists():
+                    import shutil
+
+                    shutil.rmtree(unsolved_dir)
+                unsolved_dir.mkdir(parents=True, exist_ok=True)
 
             for sid in eval_ids:
                 acc_train[sid] = evaluate_accuracy(
@@ -520,6 +598,10 @@ def main(
                     grid_tokens=grid_tokens,
                     dataset=eval_id_sets[sid],
                     eval_batch_size=int(eval_batch_size),
+                    save_unsolved_dir=unsolved_dir,
+                    save_unsolved_max=int(plot_unsolved_n_i),
+                    save_unsolved_step=int(step),
+                    save_unsolved_tag="id",
                 )
                 acc_ood[sid] = evaluate_accuracy(
                     model=model,
@@ -529,6 +611,10 @@ def main(
                     grid_tokens=grid_tokens,
                     dataset=eval_ood_sets[sid],
                     eval_batch_size=int(eval_batch_size),
+                    save_unsolved_dir=unsolved_dir,
+                    save_unsolved_max=int(plot_unsolved_n_i),
+                    save_unsolved_step=int(step),
+                    save_unsolved_tag="ood",
                 )
 
             # Ensure the strict OOD probe is always visible.
@@ -653,8 +739,9 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         nargs="*",
         default=None,
         help=(
-            "Optional 2-phase curriculum. Phase 1 trains ONLY on these skills. "
+            "Optional 2/3-phase curriculum. Phase 1 trains ONLY on these skills. "
             "Phase 2 adds skills (see --phase2_skills) at --phase2_start_step / --phase2_start_frac. "
+            "Phase 3 (optional) adds skills (see --phase3_skills) at --phase3_start_step / --phase3_start_frac. "
             "Mutually exclusive with --delay_train_skills/--delay_train_until_steps."
         ),
     )
@@ -664,23 +751,48 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         nargs="*",
         default=None,
         help=(
-            "Optional 2-phase curriculum. Phase 2 skill set (joint training pool after curriculum switch). "
-            "If omitted, defaults to phase1_skills (no-op)."
+            "Optional curriculum. Phase 2 skill set (joint training pool after the first switch). "
+            "Must include all phase1_skills. If omitted, defaults to phase1_skills (no-op)."
         ),
     )
     p.add_argument(
         "--phase2_start_step",
         type=int,
         default=None,
-        help="Optional 2-phase curriculum: step at which to start Phase 2 (adding phase2-only skills).",
+        help="Optional curriculum: step at which to start Phase 2 (adding phase2-only skills).",
     )
     p.add_argument(
         "--phase2_start_frac",
         type=float,
         default=None,
         help=(
-            "Optional 2-phase curriculum: fraction of total --steps at which to start Phase 2. "
+            "Optional curriculum: fraction of total --steps at which to start Phase 2. "
             "Example: 0.5 means switch at half the steps. Ignored if --phase2_start_step is set."
+        ),
+    )
+    p.add_argument(
+        "--phase3_skills",
+        type=int,
+        nargs="*",
+        default=None,
+        help=(
+            "Optional 3-phase curriculum. Phase 3 skill set (joint training pool after the second switch). "
+            "Must include all phase2_skills. If omitted, Phase 3 is disabled."
+        ),
+    )
+    p.add_argument(
+        "--phase3_start_step",
+        type=int,
+        default=None,
+        help="Optional 3-phase curriculum: step at which to start Phase 3 (adding phase3-only skills).",
+    )
+    p.add_argument(
+        "--phase3_start_frac",
+        type=float,
+        default=None,
+        help=(
+            "Optional 3-phase curriculum: fraction of total --steps at which to start Phase 3. "
+            "Example: 0.75 means switch at 75% of the steps. Ignored if --phase3_start_step is set."
         ),
     )
     p.add_argument(
@@ -810,6 +922,12 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         default=256,
         help="Batch size for evaluation (bigger is faster; uses more VRAM).",
     )
+    p.add_argument(
+        "--plot_unsolved_n",
+        type=int,
+        default=3,
+        help="Per-skill number of unsolved test examples to render as PNG during eval (0 disables).",
+    )
     p.add_argument("--progress", action="store_true", help="Show tqdm progress if installed")
     p.add_argument("--out_dir", type=Path, default=Path("arc_train_runs"), help="Where to write plots/metrics")
     p.add_argument("--no_plots", action="store_true", help="Disable saving learning-curve PNGs")
@@ -838,19 +956,46 @@ def cli_main(argv: Optional[list[str]] = None) -> None:
         phase1 = [int(s) for s in args.phase1_skills]
         phase2 = phase1 if args.phase2_skills is None else [int(s) for s in args.phase2_skills]
 
-        if args.phase2_start_step is not None:
-            phase2_start_step = int(args.phase2_start_step)
-        else:
-            frac = 0.5 if args.phase2_start_frac is None else float(args.phase2_start_frac)
-            if not (0.0 <= frac <= 1.0):
-                raise ValueError(f"--phase2_start_frac must be in [0,1], got {frac}")
-            phase2_start_step = int(round(frac * float(int(args.steps))))
+        if args.phase3_skills is None:
+            if args.phase2_start_step is not None:
+                phase2_start_step = int(args.phase2_start_step)
+            else:
+                frac = 0.5 if args.phase2_start_frac is None else float(args.phase2_start_frac)
+                if not (0.0 <= frac <= 1.0):
+                    raise ValueError(f"--phase2_start_frac must be in [0,1], got {frac}")
+                phase2_start_step = int(round(frac * float(int(args.steps))))
 
-        train_skills, delay_skills, delay_steps = _curriculum_delay_from_phases(
-            phase1_skills=phase1,
-            phase2_skills=phase2,
-            phase2_start_step=int(phase2_start_step),
-        )
+            train_skills, delay_skills, delay_steps = _curriculum_delay_from_phases(
+                phase1_skills=phase1,
+                phase2_skills=phase2,
+                phase2_start_step=int(phase2_start_step),
+            )
+        else:
+            phase3 = [int(s) for s in args.phase3_skills]
+
+            if args.phase2_start_step is not None:
+                phase2_start_step = int(args.phase2_start_step)
+            else:
+                frac2 = 0.5 if args.phase2_start_frac is None else float(args.phase2_start_frac)
+                if not (0.0 <= frac2 <= 1.0):
+                    raise ValueError(f"--phase2_start_frac must be in [0,1], got {frac2}")
+                phase2_start_step = int(round(frac2 * float(int(args.steps))))
+
+            if args.phase3_start_step is not None:
+                phase3_start_step = int(args.phase3_start_step)
+            else:
+                frac3 = 0.75 if args.phase3_start_frac is None else float(args.phase3_start_frac)
+                if not (0.0 <= frac3 <= 1.0):
+                    raise ValueError(f"--phase3_start_frac must be in [0,1], got {frac3}")
+                phase3_start_step = int(round(frac3 * float(int(args.steps))))
+
+            train_skills, delay_skills, delay_steps = _curriculum_delay_from_3phases(
+                phase1_skills=phase1,
+                phase2_skills=phase2,
+                phase2_start_step=int(phase2_start_step),
+                phase3_skills=phase3,
+                phase3_start_step=int(phase3_start_step),
+            )
         args.delay_train_skills = delay_skills
         args.delay_train_until_steps = delay_steps
     main(
@@ -885,6 +1030,7 @@ def cli_main(argv: Optional[list[str]] = None) -> None:
         save_every=int(args.save_every),
         eval_tasks=int(args.eval_tasks),
         eval_batch_size=int(args.eval_batch_size),
+        plot_unsolved_n=int(args.plot_unsolved_n),
         progress=bool(args.progress),
         out_dir=Path(args.out_dir),
         no_plots=bool(args.no_plots),

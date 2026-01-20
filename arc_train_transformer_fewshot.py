@@ -18,9 +18,11 @@ from arc_train_utils import (
     SEP_TOKEN,
     VOCAB_SIZE,
     count_params,
+    decode_prompt_src,
     plot_learning_curves,
     progress,
     prompt_seq_len,
+    save_arc_prompt_prediction_png,
     write_learning_curves_csv,
 )
 
@@ -585,6 +587,11 @@ def _exact_match_acc(
     expert_key: str,
     device: torch.device,
     eval_batch_size: int,
+    save_unsolved_dir: Optional[Path] = None,
+    save_unsolved_max: int = 0,
+    save_unsolved_step: Optional[int] = None,
+    save_unsolved_tag: str = "test",
+    save_unsolved_class: Optional[str] = None,
 ) -> float:
     model.eval()
     grid_tokens = int(pool.grid_size) * int(pool.grid_size)
@@ -593,13 +600,49 @@ def _exact_match_acc(
         return 0.0
     bs = max(1, int(eval_batch_size))
     correct = 0
+    saved = 0
     for off in range(0, n, bs):
         xb = pool.src[off : off + bs].to(device, non_blocking=True)
         yb = pool.tgt[off : off + bs].to(device, non_blocking=True)
         logits = model(xb, expert_key=expert_key)  # (B,T,V)
         pred_logits = logits[:, -(grid_tokens + 1) : -1, :]
         pred = torch.argmax(pred_logits, dim=-1)
-        correct += int((pred == yb).all(dim=1).sum().item())
+        eq = (pred == yb).all(dim=1)
+        correct += int(eq.sum().item())
+
+        if save_unsolved_dir is not None and int(save_unsolved_max) > 0 and saved < int(save_unsolved_max):
+            bad = (~eq).nonzero(as_tuple=False).reshape(-1)
+            if int(bad.numel()) > 0:
+                for bi in bad.tolist():
+                    if saved >= int(save_unsolved_max):
+                        break
+                    g = int(pool.grid_size)
+                    demos, test_x = decode_prompt_src(
+                        src_tokens=xb[int(bi)].detach().cpu().numpy(),
+                        grid_size=g,
+                        num_demos=3,
+                    )
+                    pred_y = pred[int(bi)].detach().cpu().numpy().reshape(g, g)
+                    true_y = yb[int(bi)].detach().cpu().numpy().reshape(g, g)
+
+                    step_s = "na" if save_unsolved_step is None else f"{int(save_unsolved_step):07d}"
+                    cls = str(save_unsolved_class) if save_unsolved_class is not None else "unknown_class"
+                    out_path = (
+                        Path(save_unsolved_dir)
+                        / str(save_unsolved_tag)
+                        / cls
+                        / f"step{step_s}__row{int(off) + int(bi)}.png"
+                    )
+                    title = f"{save_unsolved_tag} unsolved | {cls} | step={step_s} | row={int(off) + int(bi)}"
+                    save_arc_prompt_prediction_png(
+                        demos=demos,
+                        test_x=test_x,
+                        pred_y=pred_y,
+                        true_y=true_y,
+                        out_path=out_path,
+                        title=title,
+                    )
+                    saved += 1
     return float(correct) / float(n)
 
 
@@ -639,6 +682,7 @@ def main(
     eval_batch_size: int = 256,
     eval_every: int = 500,
     eval_keys_per_skill: int = 8,
+    plot_unsolved_n: int = 3,
     outer_log_every: int = 5,
     seed: int = 0,
     device: str = "cuda",
@@ -754,6 +798,9 @@ def main(
     plots_dir = out_dir / "plots"
     plots_dir.mkdir(parents=True, exist_ok=True)
     plots_enabled = not bool(no_plots)
+    plot_unsolved_n_i = int(plot_unsolved_n)
+    if plot_unsolved_n_i < 0:
+        raise ValueError(f"plot_unsolved_n must be >= 0, got {plot_unsolved_n_i}")
 
     # Save run config (CLI args) alongside plots/CSV/weights so downstream scripts can reconstruct the model.
     run_config = {
@@ -926,7 +973,7 @@ def main(
     if not (0.0 <= p_unadmitted <= 1.0):
         raise ValueError(f"curriculum_unadmitted_prob must be in [0,1], got {p_unadmitted}")
 
-    def _eval_skill_acc(*, which: str) -> dict[int, float]:
+    def _eval_skill_acc(*, which: str, unsolved_dir: Optional[Path], unsolved_step: int) -> dict[int, float]:
         if which not in {"train", "test", "ood"}:
             raise ValueError(f"which must be 'train', 'test', or 'ood', got {which!r}")
         if which == "train":
@@ -953,6 +1000,11 @@ def main(
                         expert_key=ek2,
                         device=device_t,
                         eval_batch_size=int(eval_batch_size),
+                        save_unsolved_dir=unsolved_dir if which in {"test", "ood"} else None,
+                        save_unsolved_max=int(plot_unsolved_n_i) if which in {"test", "ood"} else 0,
+                        save_unsolved_step=int(unsolved_step),
+                        save_unsolved_tag=str(which),
+                        save_unsolved_class=str(kk2.to_str()),
                     )
                 )
             out[int(sid)] = float(np.mean(accs)) if len(accs) > 0 else 0.0
@@ -965,9 +1017,10 @@ def main(
             return
 
         model.eval()
-        acc_train = _eval_skill_acc(which="train")
-        acc_test = _eval_skill_acc(which="test")
-        acc_ood = _eval_skill_acc(which="ood")
+        unsolved_dir = plots_dir / "unsolved_examples" / f"step_{int(step):07d}"
+        acc_train = _eval_skill_acc(which="train", unsolved_dir=None, unsolved_step=int(step))
+        acc_test = _eval_skill_acc(which="test", unsolved_dir=unsolved_dir, unsolved_step=int(step))
+        acc_ood = _eval_skill_acc(which="ood", unsolved_dir=unsolved_dir, unsolved_step=int(step))
 
         curves.steps.append(int(step))
         curves.loss.append(float(last_loss))
@@ -1342,6 +1395,12 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         default=8,
         help="How many (skill,variant) keys to sample per skill during evaluation (bounds cost).",
     )
+    p.add_argument(
+        "--plot_unsolved_n",
+        type=int,
+        default=3,
+        help="Per-(skill,variant) number of unsolved eval examples to render as PNG during eval (0 disables).",
+    )
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--dataset_device", type=str, default="gpu", choices=["cpu", "gpu"])
@@ -1404,6 +1463,7 @@ def cli_main(argv: Optional[list[str]] = None) -> None:
         eval_batch_size=int(args.eval_batch_size),
         eval_every=int(args.eval_every),
         eval_keys_per_skill=int(args.eval_keys_per_skill),
+        plot_unsolved_n=int(args.plot_unsolved_n),
         outer_log_every=int(args.outer_log_every),
         seed=int(args.seed),
         device=str(args.device),

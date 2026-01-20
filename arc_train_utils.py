@@ -14,6 +14,13 @@ from arc_dataset_models import ARCDataset
 
 SEP_TOKEN = 5  # colors are 0..4; SEP=5
 VOCAB_SIZE = 6
+ARC_COLORS = [
+    "#000000",  # 0 background
+    "#1f77b4",  # 1 blue
+    "#d62728",  # 2 red
+    "#2ca02c",  # 3 green
+    "#ffdd00",  # 4 yellow
+]
 
 
 def prompt_seq_len(*, grid_size: int, num_demos: int = 3) -> int:
@@ -47,6 +54,138 @@ def progress(iterable, *, total: int, desc: str, enabled: bool):
 def render_ascii(grid: np.ndarray) -> str:
     chars = {0: ".", 1: "B", 2: "R", 3: "G", 4: "Y"}
     return "\n".join(" ".join(chars.get(int(c), "?") for c in row) for row in grid)
+
+
+def _decode_prompt_src(
+    *,
+    src_tokens: np.ndarray,
+    grid_size: int,
+    num_demos: int = 3,
+) -> tuple[list[tuple[np.ndarray, np.ndarray]], np.ndarray]:
+    """
+    Inverse of `_flatten_prompt` for visualization/debug.
+    Layout: (x SEP y SEP) repeated `num_demos` times, then (test_x SEP).
+    """
+    if src_tokens.ndim != 1:
+        raise ValueError(f"Expected 1D src_tokens, got shape={src_tokens.shape}")
+    g = int(grid_size)
+    if g <= 0:
+        raise ValueError(f"grid_size must be >= 1, got {g}")
+    grid_tokens = g * g
+    expected = prompt_seq_len(grid_size=g, num_demos=int(num_demos))
+    if int(src_tokens.shape[0]) != int(expected):
+        raise ValueError(f"Unexpected src length={int(src_tokens.shape[0])} (expected {expected})")
+
+    def unflatten(block: np.ndarray) -> np.ndarray:
+        return np.asarray(block, dtype=np.int64).reshape(g, g)
+
+    demos: list[tuple[np.ndarray, np.ndarray]] = []
+    off = 0
+    for _ in range(int(num_demos)):
+        x = unflatten(src_tokens[off : off + grid_tokens])
+        off += grid_tokens
+        if int(src_tokens[off]) != int(SEP_TOKEN):
+            raise ValueError(f"Expected SEP after demo x at off={off}, got {int(src_tokens[off])}")
+        off += 1
+
+        y = unflatten(src_tokens[off : off + grid_tokens])
+        off += grid_tokens
+        if int(src_tokens[off]) != int(SEP_TOKEN):
+            raise ValueError(f"Expected SEP after demo y at off={off}, got {int(src_tokens[off])}")
+        off += 1
+        demos.append((x, y))
+
+    test_x = unflatten(src_tokens[off : off + grid_tokens])
+    off += grid_tokens
+    if int(src_tokens[off]) != int(SEP_TOKEN):
+        raise ValueError(f"Expected trailing SEP after test_x at off={off}, got {int(src_tokens[off])}")
+    return demos, test_x
+
+
+def decode_prompt_src(
+    *,
+    src_tokens: np.ndarray,
+    grid_size: int,
+    num_demos: int = 3,
+) -> tuple[list[tuple[np.ndarray, np.ndarray]], np.ndarray]:
+    """Public wrapper for `_decode_prompt_src` (used by other scripts for plotting/debug)."""
+    return _decode_prompt_src(src_tokens=src_tokens, grid_size=grid_size, num_demos=num_demos)
+
+
+def _save_arc_failure_png(
+    *,
+    demos: list[tuple[np.ndarray, np.ndarray]],
+    test_x: np.ndarray,
+    pred_y: np.ndarray,
+    true_y: np.ndarray,
+    out_path: Path,
+    title: str,
+) -> None:
+    if not _has_matplotlib():
+        return
+    from matplotlib import pyplot as plt  # type: ignore
+    from matplotlib.colors import BoundaryNorm, ListedColormap  # type: ignore
+
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    cmap = ListedColormap(list(ARC_COLORS), name="arc5")
+    norm = BoundaryNorm(boundaries=[-0.5, 0.5, 1.5, 2.5, 3.5, 4.5], ncolors=5)
+
+    def clip5(a: np.ndarray) -> np.ndarray:
+        aa = np.asarray(a, dtype=np.int64)
+        return np.clip(aa, 0, 4)
+
+    panels: list[tuple[str, np.ndarray]] = []
+    for i, (dx, dy) in enumerate(demos):
+        panels.append((f"demo{i+1} x", clip5(dx)))
+        panels.append((f"demo{i+1} y", clip5(dy)))
+    panels.append(("test x", clip5(test_x)))
+    panels.append(("pred y", clip5(pred_y)))
+    panels.append(("true y", clip5(true_y)))
+
+    n = len(panels)
+    fig_w = max(8.0, 2.2 * float(n))
+    fig_h = 2.8
+    fig, axes = plt.subplots(1, n, figsize=(fig_w, fig_h))
+    if n == 1:
+        axes = [axes]
+    for ax, (lab, grid) in zip(axes, panels):
+        ax.imshow(grid, cmap=cmap, norm=norm, interpolation="nearest")
+        ax.set_title(lab, fontsize=10)
+        ax.set_xticks([])
+        ax.set_yticks([])
+        # light cell grid
+        g = int(grid.shape[0])
+        ax.set_xticks(np.arange(-0.5, g, 1), minor=True)
+        ax.set_yticks(np.arange(-0.5, g, 1), minor=True)
+        ax.grid(which="minor", color="white", linestyle="-", linewidth=1.0, alpha=0.4)
+        ax.tick_params(which="minor", bottom=False, left=False)
+
+    fig.suptitle(title, fontsize=12, y=1.02)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+
+
+def save_arc_prompt_prediction_png(
+    *,
+    demos: list[tuple[np.ndarray, np.ndarray]],
+    test_x: np.ndarray,
+    pred_y: np.ndarray,
+    true_y: np.ndarray,
+    out_path: Path,
+    title: str,
+) -> None:
+    """Save a compact multi-panel ARC prompt/prediction visualization as a PNG (no-op if matplotlib missing)."""
+    _save_arc_failure_png(
+        demos=demos,
+        test_x=test_x,
+        pred_y=pred_y,
+        true_y=true_y,
+        out_path=out_path,
+        title=title,
+    )
 
 
 @dataclass(frozen=True)
@@ -435,6 +574,10 @@ def evaluate_accuracy(
     grid_tokens: int,
     dataset: TensorizedDataset,
     eval_batch_size: int,
+    save_unsolved_dir: Optional[Path] = None,
+    save_unsolved_max: int = 0,
+    save_unsolved_step: Optional[int] = None,
+    save_unsolved_tag: str = "test",
 ) -> float:
     model.eval()
     k = min(int(n_tasks), dataset.n)
@@ -452,13 +595,46 @@ def evaluate_accuracy(
 
     bs = max(1, int(eval_batch_size))
     correct = 0
+    saved = 0
     for off in range(0, k, bs):
         xb = src[off : off + bs]
         yb = tgt[off : off + bs]  # (B, grid_tokens)
         logits = model(xb)  # (B, T, V)
         pred_logits = logits[:, -(grid_tokens + 1) : -1, :]  # (B, grid_tokens, V)
         pred = torch.argmax(pred_logits, dim=-1)  # (B, grid_tokens)
-        correct += int((pred == yb).all(dim=1).sum().item())
+        eq = (pred == yb).all(dim=1)
+        correct += int(eq.sum().item())
+
+        if save_unsolved_dir is not None and int(save_unsolved_max) > 0 and saved < int(save_unsolved_max):
+            bad = (~eq).nonzero(as_tuple=False).reshape(-1)
+            if int(bad.numel()) > 0:
+                for bi in bad.tolist():
+                    if saved >= int(save_unsolved_max):
+                        break
+                    # Decode + save on CPU.
+                    src_i = xb[int(bi)].detach().cpu().numpy()
+                    demos, test_x = _decode_prompt_src(src_tokens=src_i, grid_size=int(dataset.grid_size), num_demos=3)
+                    g = int(dataset.grid_size)
+                    true_y = yb[int(bi)].detach().cpu().numpy().reshape(g, g)
+                    pred_y = pred[int(bi)].detach().cpu().numpy().reshape(g, g)
+
+                    step_s = "na" if save_unsolved_step is None else f"{int(save_unsolved_step):07d}"
+                    ds_idx = int(idx_np[int(off + int(bi))])
+                    out_path = (
+                        Path(save_unsolved_dir)
+                        / f"{save_unsolved_tag}"
+                        / f"s{int(dataset.skill_id)}"
+                        / f"{dataset.split}"
+                        / f"step{step_s}__idx{ds_idx}.png"
+                    )
+                    title = (
+                        f"{save_unsolved_tag} unsolved | s{int(dataset.skill_id)} | split={dataset.split} | "
+                        f"step={step_s} | idx={ds_idx}"
+                    )
+                    save_arc_prompt_prediction_png(
+                        demos=demos, test_x=test_x, pred_y=pred_y, true_y=true_y, out_path=out_path, title=title
+                    )
+                    saved += 1
 
     return float(correct) / float(k)
 

@@ -1562,8 +1562,8 @@ class Skill14FilterUniqueVariants(Puzzle):
     Variant of Skill11 (filter_unique), but objects are solid rectangles, not just single pixels.
 
     Input: non-overlapping solid rectangles of sizes in {1x1,1x2,2x1,2x2}.
-           Exactly one color appears in exactly one connected component; all other colors appear
-           in >=2 disconnected components.
+           Exactly one color appears in exactly one connected component (per task connectivity);
+           all other present colors appear in >=2 disconnected components.
     Output: keep the entire unique-color object; remove everything else.
     """
 
@@ -1583,15 +1583,13 @@ class Skill14FilterUniqueVariants(Puzzle):
         super().__init__(size=size, colors=colors, ood_spec=ood_spec, shrink_perturb=shrink_perturb, rng=rng)
         size_i = int(self.size)
 
-        # Variant knobs:
-        # - connectivity (4 vs 8) affects component counting when same-color objects touch diagonally
-        # - unique_components: keep the color that has exactly K components (K is task-specific)
-        # - shape_set controls allowed rectangle sizes
+        # Variant knobs (kept), BUT we must preserve the core puzzle contract:
+        # exactly one color has exactly one connected component. Therefore `_unique_components`
+        # must be fixed to 1; other knobs can vary.
         self._connectivity = int(self.rng.choice(np.asarray([4, 8])))
+        self._unique_components = 1
 
-        k_choices = [1, 2, 3] if size_i >= 5 else [1, 2]
-        self._unique_components = int(self.rng.choice(np.asarray(k_choices)))
-
+        # Shapes: allow variants, but always include the small rectangles.
         shape_sets: list[tuple[str, list[tuple[int, int]]]] = [
             ("tiny", [(1, 1), (1, 2), (2, 1), (2, 2)]),
             ("bars3", [(1, 1), (1, 2), (2, 1), (2, 2), (1, 3), (3, 1)]),
@@ -1635,9 +1633,10 @@ class Skill14FilterUniqueVariants(Puzzle):
         _ = rule_color
         counts = _component_counts_by_color(grid, connectivity=int(self._connectivity))
         target_colors = [c for c, k in counts.items() if int(k) == int(self._unique_components)]
-        if not target_colors:
+        # Task contract: there should be exactly one such color; otherwise treat as invalid.
+        if len(target_colors) != 1:
             return np.zeros_like(grid)
-        unique_c = int(sorted(target_colors)[0])
+        unique_c = int(target_colors[0])
         out = np.zeros_like(grid)
         out[grid == unique_c] = unique_c
         return out
