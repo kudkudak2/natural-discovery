@@ -2116,6 +2116,854 @@ class Skill18PerComponentPixelCount(Puzzle):
         out[size_i - height : size_i, 0] = int(bar_color)
         return out
 
+
+class Skill19CountBlueComponents(Puzzle):
+    """
+    Skill19:
+    Input: like Skill14-style inputs — scattered solid rectangles on a blank background.
+           Blue (color=1) is always present as multiple disconnected rectangles.
+    Output: a same-size grid containing a vertical stack (bar) of 1x1 blue pixels whose height
+            equals the number of 4-connected components of blue in the input.
+            (Count is constrained to 1..4 so it fits the 0..4 palette contract.)
+    """
+
+    skill_id = 19
+    name = "count_blue_components"
+    uses_rule_color = False
+
+    def __init__(
+        self,
+        *,
+        size: int = 5,
+        colors: Sequence[int] = (1, 2, 3, 4),
+        ood_spec: OODSpec = OODSpec(),
+        shrink_perturb: Optional[ShrinkPerturbSpec] = None,
+        rng: Optional[np.random.Generator] = None,
+    ) -> None:
+        super().__init__(size=size, colors=colors, ood_spec=ood_spec, shrink_perturb=shrink_perturb, rng=rng)
+        size_i = int(self.size)
+
+        # Keep the rule simple + consistent across tasks: 4-connected components.
+        self._connectivity = 4
+
+        # Match Skill14's "rectangle palette" feel.
+        shape_sets: list[tuple[str, list[tuple[int, int]]]] = [
+            ("tiny", [(1, 1), (1, 2), (2, 1), (2, 2)]),
+            ("bars3", [(1, 1), (1, 2), (2, 1), (2, 2), (1, 3), (3, 1)]),
+            ("mix3", [(1, 1), (1, 2), (2, 1), (2, 2), (1, 3), (3, 1), (2, 3), (3, 2)]),
+            ("big3", [(1, 1), (2, 2), (3, 3), (1, 3), (3, 1), (2, 3), (3, 2)]),
+        ]
+        if size_i >= 6:
+            shape_sets.append(("bars4", [(1, 4), (4, 1), (1, 3), (3, 1), (2, 2), (1, 2), (2, 1), (1, 1)]))
+        self._shape_set_name, rect_sizes = shape_sets[int(self.rng.integers(0, len(shape_sets)))]
+        self._rect_sizes = [(int(h), int(w)) for (h, w) in rect_sizes if int(h) <= size_i and int(w) <= size_i]
+        if not self._rect_sizes:
+            self._rect_sizes = [(1, 1)]
+
+    @property
+    def variant_id(self) -> Optional[str]:
+        return f"conn{int(self._connectivity)}_{self._shape_set_name}"
+
+    def variant_params(self) -> dict[str, object]:
+        return {
+            "connectivity": int(self._connectivity),
+            "shape_set": str(self._shape_set_name),
+            "rect_sizes": [(int(h), int(w)) for (h, w) in self._rect_sizes],
+        }
+
+    def make_input(self, *, ood: bool) -> np.ndarray:
+        # ID: 1-3 blue components. OOD: 2-4 blue components.
+        target_k = int(self.rng.integers(2, 5)) if bool(ood) else int(self.rng.integers(1, 4))
+        target_k = max(1, min(4, int(target_k)))
+        return self._make_input_with_target_k(target_k=target_k, ood=bool(ood))
+
+    def _make_input_with_target_k(self, *, target_k: int, ood: bool) -> np.ndarray:
+        size = int(self.size)
+        blue = 1
+        target_k_i = max(1, min(4, int(target_k)))
+
+        for _attempt in range(250):
+            grid = self.blank()
+
+            # Place exactly target_k disconnected blue rectangles.
+            ok_blue = True
+            for _ in range(int(target_k_i)):
+                h, w = self._rect_sizes[int(self.rng.integers(0, len(self._rect_sizes)))]
+                placed = _try_place_solid_rect_no_touch(
+                    grid,
+                    color=int(blue),
+                    h=int(h),
+                    w=int(w),
+                    connectivity=int(self._connectivity),
+                    rng=self.rng,
+                    max_tries=600,
+                )
+                if placed is None:
+                    ok_blue = False
+                    break
+            if not ok_blue:
+                continue
+
+            # Add some non-blue rectangles (same "look" as Skill14, but without uniqueness constraints).
+            other_colors = [int(c) for c in self.colors if int(c) != blue and int(c) != 0]
+            if not other_colors:
+                other_colors = [2, 3, 4]
+            max_other_colors = min(len(other_colors), 2 if not bool(ood) else 3)
+            n_other_colors = int(self.rng.integers(1, max_other_colors + 1))
+            chosen = self.rng.choice(np.asarray(other_colors), size=n_other_colors, replace=False).tolist()
+            for c in chosen:
+                # ID: 1-2 components; OOD: 2-4 components.
+                n_comp = int(self.rng.integers(2, 5)) if bool(ood) else int(self.rng.integers(1, 3))
+                n_comp = max(1, min(4, int(n_comp)))
+                for _ in range(n_comp):
+                    h, w = self._rect_sizes[int(self.rng.integers(0, len(self._rect_sizes)))]
+                    _try_place_solid_rect_no_touch(
+                        grid,
+                        color=int(c),
+                        h=int(h),
+                        w=int(w),
+                        connectivity=int(self._connectivity),
+                        rng=self.rng,
+                        max_tries=250,
+                    )
+
+            # Validate blue is present and has the intended component count.
+            k = int(_count_components(grid == int(blue), connectivity=int(self._connectivity)))
+            if k != int(target_k_i):
+                continue
+            if not np.any(grid == int(blue)):
+                continue
+            return grid
+
+        # Fallback: always valid and always includes blue.
+        grid = self.blank()
+        grid[size // 2, size // 2] = int(blue)
+        return grid
+
+    def generate_prompt(
+        self,
+        *,
+        num_demos: int = 3,
+        ood_test: bool = False,
+    ) -> tuple[list[tuple[np.ndarray, np.ndarray]], tuple[np.ndarray, np.ndarray], Optional[int]]:
+        """
+        Ensure demos always include bar heights 1, 2, and 3 so the mapping from bar height -> count
+        is directly inferable from demonstrations.
+        """
+        if int(num_demos) < 3:
+            raise ValueError(f"Skill19 requires num_demos>=3 to include examples for 1,2,3; got num_demos={num_demos}")
+
+        blue = 1
+
+        def make_demo_for_k(k: int) -> tuple[np.ndarray, np.ndarray]:
+            # If shrink/perturb is enabled, it can change component counts.
+            # We therefore sample until the post-perturb input still yields the desired k.
+            for _ in range(600):
+                raw = self._make_input_with_target_k(target_k=int(k), ood=False)
+                inp = _maybe_shrink_and_perturb(raw, rng=self.rng, spec=self.shrink_perturb)
+                kk = int(_count_components(inp == int(blue), connectivity=int(self._connectivity)))
+                if kk == int(k) and bool(np.any(inp == int(blue))):
+                    out = self.apply(inp, rule_color=None)
+                    return inp, out
+            # As a last resort, accept whatever we got (still consistent y = apply(x)).
+            raw = self._make_input_with_target_k(target_k=int(k), ood=False)
+            inp = _maybe_shrink_and_perturb(raw, rng=self.rng, spec=self.shrink_perturb)
+            out = self.apply(inp, rule_color=None)
+            return inp, out
+
+        demo_ks: list[int] = [1, 2, 3]
+        if int(num_demos) > 3:
+            extra = [int(self.rng.integers(1, 5)) for _ in range(int(num_demos) - 3)]
+            demo_ks.extend(extra)
+
+        demos = [make_demo_for_k(k) for k in demo_ks]
+        test_pair = self.generate_single_example(rule_color=None, ood=bool(ood_test))
+        return demos, test_pair, None
+
+    def apply(self, grid: np.ndarray, rule_color: Optional[int]) -> np.ndarray:
+        _ = rule_color
+        blue = 1
+        k = int(_count_components(grid == int(blue), connectivity=int(self._connectivity)))
+        k = max(0, min(4, int(k)))
+        size_i = int(grid.shape[0])
+        if k > size_i:
+            k = size_i
+
+        out = np.zeros_like(grid)
+        if k > 0:
+            # Bottom-aligned vertical stack in the leftmost column.
+            out[size_i - k : size_i, 0] = int(blue)
+        return out
+
+
+class Skill20TranslateShape(Puzzle):
+    """
+    Skill20:
+    Input: exactly one simple shape (e.g., cross/box/square) in a single color.
+    Output: the same shape shifted by a fixed per-task offset (dr, dc).
+
+    Variant: (shape_kind, dr, dc).
+    """
+
+    skill_id = 20
+    name = "translate_shape"
+    uses_rule_color = False
+
+    def __init__(
+        self,
+        *,
+        size: int = 5,
+        colors: Sequence[int] = (1, 2, 3, 4),
+        ood_spec: OODSpec = OODSpec(),
+        shrink_perturb: Optional[ShrinkPerturbSpec] = None,
+        rng: Optional[np.random.Generator] = None,
+    ) -> None:
+        super().__init__(size=size, colors=colors, ood_spec=ood_spec, shrink_perturb=shrink_perturb, rng=rng)
+        size_i = int(self.size)
+
+        # Choose a per-task shape template.
+        # Keep these small so they can be placed with shifts on small grids.
+        shapes: list[str] = ["cross3", "box3", "square2"]
+        if size_i >= 5:
+            shapes.append("square3")
+        self._shape_kind = str(self.rng.choice(np.asarray(shapes)))
+
+        # Choose a per-task color for the shape (non-zero).
+        if len(self.colors) > 0:
+            self._shape_color = int(self.rng.choice(np.asarray(self.colors)))
+        else:
+            self._shape_color = 1
+
+        # Choose a per-task shift. Keep it small and always non-zero.
+        # Prefer cardinal shifts; allow diagonals if the grid is larger.
+        shifts: list[tuple[int, int]] = [(0, 1), (0, -1), (1, 0), (-1, 0)]
+        if size_i >= 6:
+            shifts += [(1, 1), (1, -1), (-1, 1), (-1, -1)]
+            shifts += [(0, 2), (0, -2), (2, 0), (-2, 0)]
+        dr, dc = shifts[int(self.rng.integers(0, len(shifts)))]
+        self._dr = int(dr)
+        self._dc = int(dc)
+
+    @property
+    def variant_id(self) -> Optional[str]:
+        return f"{self._shape_kind}_dr{int(self._dr)}_dc{int(self._dc)}"
+
+    def variant_params(self) -> dict[str, object]:
+        return {"shape_kind": str(self._shape_kind), "dr": int(self._dr), "dc": int(self._dc), "shape_color": int(self._shape_color)}
+
+    def _shape_mask(self) -> np.ndarray:
+        k = str(self._shape_kind)
+        if k == "square2":
+            return np.ones((2, 2), dtype=bool)
+        if k == "square3":
+            return np.ones((3, 3), dtype=bool)
+        if k == "cross3":
+            m = np.zeros((3, 3), dtype=bool)
+            m[1, 1] = True
+            m[0, 1] = True
+            m[2, 1] = True
+            m[1, 0] = True
+            m[1, 2] = True
+            return m
+        # box3
+        m = np.ones((3, 3), dtype=bool)
+        m[1, 1] = False
+        return m
+
+    def make_input(self, *, ood: bool) -> np.ndarray:
+        _ = ood
+        size = int(self.size)
+        dr, dc = int(self._dr), int(self._dc)
+        mask = self._shape_mask()
+        h, w = int(mask.shape[0]), int(mask.shape[1])
+
+        # Choose a top-left placement such that both the original and shifted shapes fit.
+        # Condition: 0 <= r0 <= size-h and 0 <= r0+dr <= size-h (same for c0).
+        r0_lo = max(0, -int(dr))
+        r0_hi = min(int(size - h), int(size - h - dr))
+        c0_lo = max(0, -int(dc))
+        c0_hi = min(int(size - w), int(size - w - dc))
+
+        if r0_hi < r0_lo or c0_hi < c0_lo:
+            # Fallback to a safe center-ish placement (best effort).
+            r0 = max(0, min(int(size - h), int((size - h) // 2)))
+            c0 = max(0, min(int(size - w), int((size - w) // 2)))
+        else:
+            r0 = int(self.rng.integers(int(r0_lo), int(r0_hi) + 1))
+            c0 = int(self.rng.integers(int(c0_lo), int(c0_hi) + 1))
+
+        grid = self.blank()
+        rs, cs = np.nonzero(mask)
+        for rr, cc in zip(rs.tolist(), cs.tolist()):
+            grid[int(r0) + int(rr), int(c0) + int(cc)] = int(self._shape_color)
+        return grid
+
+    def apply(self, grid: np.ndarray, rule_color: Optional[int]) -> np.ndarray:
+        _ = rule_color
+        size = int(grid.shape[0])
+        out = np.zeros_like(grid)
+        dr, dc = int(self._dr), int(self._dc)
+        rs, cs = np.nonzero(grid)
+        for r, c in zip(rs.tolist(), cs.tolist()):
+            nr = int(r) + int(dr)
+            nc = int(c) + int(dc)
+            if 0 <= nr < size and 0 <= nc < size:
+                out[nr, nc] = int(grid[int(r), int(c)])
+        return out
+
+
+# --- Shape helpers (used by skills 21+) ---
+
+def _shape_mask(kind: str, *, span: int) -> np.ndarray:
+    """
+    Return a boolean mask for a named shape inside a (span x span) bounding box.
+
+    Kinds:
+    - square: filled square
+    - cross: plus-shaped cross (row+col through center)
+    - diag_main: main diagonal
+    - diag_anti: anti-diagonal
+    - diamond: manhattan ball (|dr|+|dc| <= radius)
+    - box: hollow square border (center is False)
+    """
+    k = str(kind)
+    n = int(span)
+    if n <= 0:
+        raise ValueError(f"span must be > 0, got span={n}")
+
+    if k == "square":
+        return np.ones((n, n), dtype=bool)
+
+    if k == "cross":
+        m = np.zeros((n, n), dtype=bool)
+        c = n // 2
+        m[c, :] = True
+        m[:, c] = True
+        return m
+
+    if k == "diag_main":
+        m = np.zeros((n, n), dtype=bool)
+        idx = np.arange(n, dtype=np.int64)
+        m[idx, idx] = True
+        return m
+
+    if k == "diag_anti":
+        m = np.zeros((n, n), dtype=bool)
+        idx = np.arange(n, dtype=np.int64)
+        m[idx, (n - 1 - idx).astype(np.int64)] = True
+        return m
+
+    if k == "diamond":
+        m = np.zeros((n, n), dtype=bool)
+        c = n // 2
+        r = (n - 1) // 2
+        for rr in range(n):
+            for cc in range(n):
+                if abs(int(rr) - int(c)) + abs(int(cc) - int(c)) <= int(r):
+                    m[rr, cc] = True
+        return m
+
+    if k == "box":
+        m = np.ones((n, n), dtype=bool)
+        if n >= 3:
+            m[1:-1, 1:-1] = False
+        return m
+
+    raise ValueError(f"Unknown shape kind: {k}")
+
+
+def _mask_offsets(mask: np.ndarray) -> list[tuple[int, int]]:
+    """Return (dr,dc) offsets of True cells relative to the mask center."""
+    if mask.ndim != 2 or int(mask.shape[0]) != int(mask.shape[1]):
+        raise ValueError(f"Expected square 2D mask, got shape={mask.shape}")
+    n = int(mask.shape[0])
+    cr = n // 2
+    cc = n // 2
+    rs, cs = np.nonzero(mask)
+    return [(int(r) - int(cr), int(c) - int(cc)) for r, c in zip(rs.tolist(), cs.tolist())]
+
+
+def _apply_centered_shape(
+    out: np.ndarray, *, center_r: int, center_c: int, offsets: Sequence[tuple[int, int]], color: int
+) -> None:
+    """Write a shape (offset list) centered at (center_r, center_c) into out (in-place)."""
+    h, w = int(out.shape[0]), int(out.shape[1])
+    rr0 = int(center_r)
+    cc0 = int(center_c)
+    for dr, dc in offsets:
+        rr = rr0 + int(dr)
+        cc = cc0 + int(dc)
+        if 0 <= rr < h and 0 <= cc < w:
+            out[rr, cc] = int(color)
+
+
+def _safe_center_range_for_offsets(
+    *,
+    size: int,
+    offsets: Sequence[tuple[int, int]],
+    shift_dr: int = 0,
+    shift_dc: int = 0,
+    min_center_r: int = 0,
+) -> tuple[tuple[int, int], tuple[int, int]]:
+    """
+    Compute inclusive [lo,hi] ranges for choosing a center (r,c) such that the shape offsets fit
+    when applied at (r+shift_dr, c+shift_dc). Optionally enforce r >= min_center_r.
+    """
+    size_i = int(size)
+    if size_i <= 0:
+        return (0, -1), (0, -1)
+    drs = [int(dr) for dr, _dc in offsets] if offsets else [0]
+    dcs = [int(dc) for _dr, dc in offsets] if offsets else [0]
+    min_dr, max_dr = int(min(drs)), int(max(drs))
+    min_dc, max_dc = int(min(dcs)), int(max(dcs))
+
+    lo_r = int(-int(shift_dr) - int(min_dr))
+    hi_r = int((size_i - 1) - int(shift_dr) - int(max_dr))
+    lo_c = int(-int(shift_dc) - int(min_dc))
+    hi_c = int((size_i - 1) - int(shift_dc) - int(max_dc))
+    lo_r = max(int(lo_r), int(min_center_r))
+    return (int(lo_r), int(hi_r)), (int(lo_c), int(hi_c))
+
+
+class Skill21ShapeClassifier(Puzzle):
+    """
+    Skill21: Shape classifier.
+
+    Per-task: sample two shapes (kind+size). Each input shows exactly one of them, placed randomly.
+    Output: a single 1x1 label pixel:
+      - red (2) for class 0 (first shape)
+      - blue (1) for class 1 (second shape)
+    """
+
+    skill_id = 21
+    name = "shape_classifier"
+    uses_rule_color = False
+
+    def __init__(
+        self,
+        *,
+        size: int = 5,
+        colors: Sequence[int] = (1, 2, 3, 4),
+        ood_spec: OODSpec = OODSpec(),
+        shrink_perturb: Optional[ShrinkPerturbSpec] = None,
+        rng: Optional[np.random.Generator] = None,
+    ) -> None:
+        super().__init__(size=size, colors=colors, ood_spec=ood_spec, shrink_perturb=shrink_perturb, rng=rng)
+        size_i = int(self.size)
+
+        self._BLUE = 1
+        self._RED = 2
+        self._GREEN = 3
+
+        kinds = ["cross", "diag_main", "diag_anti", "diamond", "square", "box"]
+        spans = [s for s in (3, 5, 7) if int(s) <= size_i]
+        if not spans:
+            spans = [max(1, size_i)]
+
+        candidates: list[tuple[str, int]] = [(k, int(s)) for k in kinds for s in spans]
+        a_idx = int(self.rng.integers(0, len(candidates)))
+        b_idx = int(self.rng.integers(0, len(candidates) - 1))
+        if b_idx >= a_idx:
+            b_idx += 1
+        (k0, s0) = candidates[a_idx]
+        (k1, s1) = candidates[b_idx]
+
+        self._shape0 = (str(k0), int(s0))
+        self._shape1 = (str(k1), int(s1))
+        self._mask0 = _shape_mask(self._shape0[0], span=int(self._shape0[1]))
+        self._mask1 = _shape_mask(self._shape1[0], span=int(self._shape1[1]))
+
+    @property
+    def variant_id(self) -> Optional[str]:
+        k0, s0 = self._shape0
+        k1, s1 = self._shape1
+        return f"{k0}{int(s0)}_vs_{k1}{int(s1)}"
+
+    def variant_params(self) -> dict[str, object]:
+        k0, s0 = self._shape0
+        k1, s1 = self._shape1
+        return {"shape0": {"kind": k0, "span": int(s0)}, "shape1": {"kind": k1, "span": int(s1)}}
+
+    def _make_input_for_class(self, cls: int) -> np.ndarray:
+        grid = self.blank()
+        mask = self._mask0 if int(cls) == 0 else self._mask1
+        h, w = int(mask.shape[0]), int(mask.shape[1])
+        size = int(self.size)
+        r0 = int(self.rng.integers(0, max(1, size - h + 1)))
+        c0 = int(self.rng.integers(0, max(1, size - w + 1)))
+        rr, cc = np.nonzero(mask)
+        grid[(rr + r0).astype(np.int64), (cc + c0).astype(np.int64)] = int(self._GREEN)
+        return grid
+
+    def make_input(self, *, ood: bool) -> np.ndarray:
+        _ = ood
+        cls = int(self.rng.integers(0, 2))
+        return self._make_input_for_class(cls)
+
+    def apply(self, grid: np.ndarray, rule_color: Optional[int]) -> np.ndarray:
+        _ = rule_color
+        bbox = _bbox_nonzero(grid)
+        out = np.zeros_like(grid)
+        if bbox is None:
+            return out
+        r0, r1, c0, c1 = bbox
+        patch = (grid[r0 : r1 + 1, c0 : c1 + 1] != 0)
+        if patch.shape == self._mask0.shape and bool(np.array_equal(patch, self._mask0)):
+            label = int(self._RED)
+        elif patch.shape == self._mask1.shape and bool(np.array_equal(patch, self._mask1)):
+            label = int(self._BLUE)
+        else:
+            return out
+        center = int(self.size // 2)
+        out[center, center] = int(label)
+        return out
+
+    def generate_prompt(
+        self,
+        *,
+        num_demos: int = 3,
+        ood_test: bool = False,
+    ) -> tuple[list[tuple[np.ndarray, np.ndarray]], tuple[np.ndarray, np.ndarray], Optional[int]]:
+        if int(num_demos) < 2:
+            raise ValueError(f"Skill21 requires num_demos>=2 to show both classes; got num_demos={num_demos}")
+
+        demo_classes: list[int] = [0, 1]
+        if int(num_demos) > 2:
+            extra = [int(self.rng.integers(0, 2)) for _ in range(int(num_demos) - 2)]
+            demo_classes.extend(extra)
+        demo_classes = [int(c) for c in self.rng.permutation(np.asarray(demo_classes)).tolist()]
+
+        demos: list[tuple[np.ndarray, np.ndarray]] = []
+        for cls in demo_classes:
+            x = self._make_input_for_class(int(cls))
+            x = _maybe_shrink_and_perturb(x, rng=self.rng, spec=self.shrink_perturb)
+            y = self.apply(x, rule_color=None)
+            demos.append((x, y))
+
+        test_pair = self.generate_single_example(rule_color=None, ood=bool(ood_test))
+        return demos, test_pair, None
+
+
+class Skill22ShapePrinter(Puzzle):
+    """
+    Skill22: Shape printer.
+
+    Per-task: sample two shapes (odd span => unambiguous center).
+    Input: a single 1x1 center pixel, colored by class:
+      - red (2): print shape0
+      - blue (1): print shape1
+    Output: the corresponding printed shape centered at that pixel, drawn in the same color.
+    """
+
+    skill_id = 22
+    name = "shape_printer"
+    uses_rule_color = False
+
+    def __init__(
+        self,
+        *,
+        size: int = 5,
+        colors: Sequence[int] = (1, 2, 3, 4),
+        ood_spec: OODSpec = OODSpec(),
+        shrink_perturb: Optional[ShrinkPerturbSpec] = None,
+        rng: Optional[np.random.Generator] = None,
+    ) -> None:
+        super().__init__(size=size, colors=colors, ood_spec=ood_spec, shrink_perturb=shrink_perturb, rng=rng)
+        size_i = int(self.size)
+
+        self._BLUE = 1
+        self._RED = 2
+
+        kinds = ["cross", "diag_main", "diag_anti", "diamond", "square"]
+        spans = [s for s in (3, 5, 7) if int(s) <= size_i and (int(s) % 2 == 1)]
+        if not spans:
+            spans = [max(1, size_i | 1)]
+
+        candidates: list[tuple[str, int]] = [(k, int(s)) for k in kinds for s in spans]
+        a_idx = int(self.rng.integers(0, len(candidates)))
+        b_idx = int(self.rng.integers(0, len(candidates) - 1))
+        if b_idx >= a_idx:
+            b_idx += 1
+        (k0, s0) = candidates[a_idx]
+        (k1, s1) = candidates[b_idx]
+
+        self._shape0 = (str(k0), int(s0))
+        self._shape1 = (str(k1), int(s1))
+        self._offsets0 = _mask_offsets(_shape_mask(self._shape0[0], span=int(self._shape0[1])))
+        self._offsets1 = _mask_offsets(_shape_mask(self._shape1[0], span=int(self._shape1[1])))
+
+    @property
+    def variant_id(self) -> Optional[str]:
+        k0, s0 = self._shape0
+        k1, s1 = self._shape1
+        return f"{k0}{int(s0)}_vs_{k1}{int(s1)}"
+
+    def variant_params(self) -> dict[str, object]:
+        k0, s0 = self._shape0
+        k1, s1 = self._shape1
+        return {"shape0": {"kind": k0, "span": int(s0)}, "shape1": {"kind": k1, "span": int(s1)}}
+
+    def _make_input_for_class(self, cls: int) -> np.ndarray:
+        size = int(self.size)
+        grid = self.blank()
+        if int(cls) == 0:
+            offsets = self._offsets0
+            color = int(self._RED)
+        else:
+            offsets = self._offsets1
+            color = int(self._BLUE)
+
+        (r_lo, r_hi), (c_lo, c_hi) = _safe_center_range_for_offsets(size=size, offsets=offsets)
+        if r_hi < r_lo or c_hi < c_lo:
+            r = int(size // 2)
+            c = int(size // 2)
+        else:
+            r = int(self.rng.integers(int(r_lo), int(r_hi) + 1))
+            c = int(self.rng.integers(int(c_lo), int(c_hi) + 1))
+        grid[r, c] = int(color)
+        return grid
+
+    def make_input(self, *, ood: bool) -> np.ndarray:
+        _ = ood
+        cls = int(self.rng.integers(0, 2))
+        return self._make_input_for_class(cls)
+
+    def apply(self, grid: np.ndarray, rule_color: Optional[int]) -> np.ndarray:
+        _ = rule_color
+        out = np.zeros_like(grid)
+        rs, cs = np.nonzero(grid)
+        if rs.size == 0:
+            return out
+        r = int(rs[0])
+        c = int(cs[0])
+        col = int(grid[r, c])
+        if col == int(self._RED):
+            offsets = self._offsets0
+            color = int(self._RED)
+        elif col == int(self._BLUE):
+            offsets = self._offsets1
+            color = int(self._BLUE)
+        else:
+            return out
+        _apply_centered_shape(out, center_r=int(r), center_c=int(c), offsets=offsets, color=int(color))
+        return out
+
+    def generate_prompt(
+        self,
+        *,
+        num_demos: int = 3,
+        ood_test: bool = False,
+    ) -> tuple[list[tuple[np.ndarray, np.ndarray]], tuple[np.ndarray, np.ndarray], Optional[int]]:
+        if int(num_demos) < 2:
+            raise ValueError(f"Skill22 requires num_demos>=2 to show both shapes; got num_demos={num_demos}")
+
+        demo_classes: list[int] = [0, 1]
+        if int(num_demos) > 2:
+            extra = [int(self.rng.integers(0, 2)) for _ in range(int(num_demos) - 2)]
+            demo_classes.extend(extra)
+        demo_classes = [int(c) for c in self.rng.permutation(np.asarray(demo_classes)).tolist()]
+
+        demos: list[tuple[np.ndarray, np.ndarray]] = []
+        for cls in demo_classes:
+            x = self._make_input_for_class(int(cls))
+            x = _maybe_shrink_and_perturb(x, rng=self.rng, spec=self.shrink_perturb)
+            y = self.apply(x, rule_color=None)
+            demos.append((x, y))
+
+        test_pair = self.generate_single_example(rule_color=None, ood=bool(ood_test))
+        return demos, test_pair, None
+
+
+class Skill23ShapePrinterWithOffset(Puzzle):
+    """
+    Skill23: Shape printer with offset.
+
+    Per-task: sample two shapes (odd span => unambiguous center).
+    Input:
+      - one green (3) pixel indicating the reference center (always green)
+      - a single 1x1 shift-direction pixel:
+          * red (2) => shift +1 horizontally (to the RIGHT)
+          * blue (1) => shift +1 vertically (DOWN)
+      - optional yellow (4) selector pixel: if present, choose shape1; otherwise choose shape0
+
+    Output: print the selected shape centered at (green_center + shift), and set that (shifted) center pixel to green (3).
+    """
+
+    skill_id = 23
+    name = "shape_printer_with_offset"
+    uses_rule_color = False
+
+    def __init__(
+        self,
+        *,
+        size: int = 5,
+        colors: Sequence[int] = (1, 2, 3, 4),
+        ood_spec: OODSpec = OODSpec(),
+        shrink_perturb: Optional[ShrinkPerturbSpec] = None,
+        rng: Optional[np.random.Generator] = None,
+    ) -> None:
+        super().__init__(size=size, colors=colors, ood_spec=ood_spec, shrink_perturb=shrink_perturb, rng=rng)
+        size_i = int(self.size)
+
+        self._BLUE = 1
+        self._RED = 2
+        self._GREEN = 3
+        self._YELLOW = 4
+
+        kinds = ["cross", "diag_main", "diag_anti", "diamond", "square"]
+        spans = [s for s in (3, 5, 7) if int(s) <= size_i and (int(s) % 2 == 1)]
+        if not spans:
+            spans = [max(1, size_i | 1)]
+
+        candidates: list[tuple[str, int]] = [(k, int(s)) for k in kinds for s in spans]
+        a_idx = int(self.rng.integers(0, len(candidates)))
+        b_idx = int(self.rng.integers(0, len(candidates) - 1))
+        if b_idx >= a_idx:
+            b_idx += 1
+        (k0, s0) = candidates[a_idx]
+        (k1, s1) = candidates[b_idx]
+
+        self._shape0 = (str(k0), int(s0))
+        self._shape1 = (str(k1), int(s1))
+        self._offsets0 = _mask_offsets(_shape_mask(self._shape0[0], span=int(self._shape0[1])))
+        self._offsets1 = _mask_offsets(_shape_mask(self._shape1[0], span=int(self._shape1[1])))
+
+    @property
+    def variant_id(self) -> Optional[str]:
+        k0, s0 = self._shape0
+        k1, s1 = self._shape1
+        return f"{k0}{int(s0)}_vs_{k1}{int(s1)}"
+
+    def variant_params(self) -> dict[str, object]:
+        k0, s0 = self._shape0
+        k1, s1 = self._shape1
+        return {"shape0": {"kind": k0, "span": int(s0)}, "shape1": {"kind": k1, "span": int(s1)}}
+
+    def _make_input_for_shape(self, which: int) -> np.ndarray:
+        size = int(self.size)
+        grid = self.blank()
+
+        which_i = 0 if int(which) == 0 else 1
+        offsets = self._offsets0 if which_i == 0 else self._offsets1
+
+        # Only allow a +1 shift along a single axis.
+        axis = "h" if bool(self.rng.integers(0, 2)) == 0 else "v"
+        shift_dr = 1 if axis == "v" else 0
+        shift_dc = 1 if axis == "h" else 0
+
+        (r_lo, r_hi), (c_lo, c_hi) = _safe_center_range_for_offsets(
+            size=size, offsets=offsets, shift_dr=shift_dr, shift_dc=shift_dc, min_center_r=1
+        )
+        if r_hi < r_lo or c_hi < c_lo:
+            r = int(max(1, size // 2))
+            c = int(size // 2)
+        else:
+            r = int(self.rng.integers(int(r_lo), int(r_hi) + 1))
+            c = int(self.rng.integers(int(c_lo), int(c_hi) + 1))
+
+        grid[int(r), int(c)] = int(self._GREEN)
+
+        # Encode shift direction with a single pixel in the top-left corner.
+        code_color = int(self._RED) if axis == "h" else int(self._BLUE)
+        grid[0, 0] = int(code_color)
+
+        if which_i == 1:
+            grid[0, size - 1] = int(self._YELLOW)
+
+        return grid
+
+    def make_input(self, *, ood: bool) -> np.ndarray:
+        _ = ood
+        which = int(self.rng.integers(0, 2))
+        return self._make_input_for_shape(which)
+
+    def apply(self, grid: np.ndarray, rule_color: Optional[int]) -> np.ndarray:
+        _ = rule_color
+        out = np.zeros_like(grid)
+
+        gr = np.argwhere(grid == int(self._GREEN))
+        if gr.size == 0:
+            return out
+        r0, c0 = int(gr[0, 0]), int(gr[0, 1])
+
+        # Decode shift: exactly one axis should be present.
+        has_h = bool(np.any(grid == int(self._RED)))
+        has_v = bool(np.any(grid == int(self._BLUE)))
+        if has_h == has_v:
+            return out
+        dr = 1 if has_v else 0
+        dc = 1 if has_h else 0
+
+        which = 1 if bool(np.any(grid == int(self._YELLOW))) else 0
+        offsets = self._offsets1 if which == 1 else self._offsets0
+
+        rr = int(r0) + int(dr)
+        cc = int(c0) + int(dc)
+        size = int(grid.shape[0])
+        if rr < 0 or rr >= size or cc < 0 or cc >= size:
+            return out
+
+        _apply_centered_shape(out, center_r=int(rr), center_c=int(cc), offsets=offsets, color=int(self._BLUE))
+        out[int(rr), int(cc)] = int(self._GREEN)
+        return out
+
+    def generate_prompt(
+        self,
+        *,
+        num_demos: int = 3,
+        ood_test: bool = False,
+    ) -> tuple[list[tuple[np.ndarray, np.ndarray]], tuple[np.ndarray, np.ndarray], Optional[int]]:
+        if int(num_demos) < 3:
+            raise ValueError(f"Skill23 requires num_demos>=3 to show both shift directions; got num_demos={num_demos}")
+
+        # Ensure demos include BOTH shift directions (red and blue) at least once.
+        # Also ensure both shapes are shown at least once (fits in 3 demos).
+        demo_shapes: list[int] = [0, 1, int(self.rng.integers(0, 2))]
+        demo_shapes = [int(c) for c in self.rng.permutation(np.asarray(demo_shapes)).tolist()]
+
+        # We control the shift direction by temporarily forcing axis via a coinflip override:
+        # demo 0: horizontal (red), demo 1: vertical (blue), demo 2: random.
+        demo_axes: list[str] = ["h", "v", "h" if bool(self.rng.integers(0, 2)) == 0 else "v"]
+        # Shuffle axes in the same order as shapes to avoid leaking a fixed schedule.
+        perm = self.rng.permutation(np.arange(3)).tolist()
+        demo_shapes = [demo_shapes[int(i)] for i in perm]
+        demo_axes = [demo_axes[int(i)] for i in perm]
+
+        demos: list[tuple[np.ndarray, np.ndarray]] = []
+        for which, axis in zip(demo_shapes, demo_axes):
+            # Re-implement _make_input_for_shape's axis draw deterministically for demos.
+            # (Keeps generation clean without adding new state.)
+            size = int(self.size)
+            grid = self.blank()
+            which_i = 0 if int(which) == 0 else 1
+            offsets = self._offsets0 if which_i == 0 else self._offsets1
+            shift_dr = 1 if str(axis) == "v" else 0
+            shift_dc = 1 if str(axis) == "h" else 0
+
+            (r_lo, r_hi), (c_lo, c_hi) = _safe_center_range_for_offsets(
+                size=size, offsets=offsets, shift_dr=shift_dr, shift_dc=shift_dc, min_center_r=1
+            )
+            if r_hi < r_lo or c_hi < c_lo:
+                r = int(max(1, size // 2))
+                c = int(size // 2)
+            else:
+                r = int(self.rng.integers(int(r_lo), int(r_hi) + 1))
+                c = int(self.rng.integers(int(c_lo), int(c_hi) + 1))
+
+            grid[int(r), int(c)] = int(self._GREEN)
+            grid[0, 0] = int(self._RED) if str(axis) == "h" else int(self._BLUE)
+            if which_i == 1:
+                grid[0, size - 1] = int(self._YELLOW)
+
+            x = grid
+            x = _maybe_shrink_and_perturb(x, rng=self.rng, spec=self.shrink_perturb)
+            y = self.apply(x, rule_color=None)
+            demos.append((x, y))
+
+        test_pair = self.generate_single_example(rule_color=None, ood=bool(ood_test))
+        return demos, test_pair, None
+
+
 # --- Update the Factory ---
 
 def build_puzzle(
@@ -2162,6 +3010,16 @@ def build_puzzle(
         return Skill17ComponentLabeling(size=size, shrink_perturb=shrink_perturb, rng=rng)
     if skill_id == 18:
         return Skill18PerComponentPixelCount(size=size, shrink_perturb=shrink_perturb, rng=rng)
+    if skill_id == 19:
+        return Skill19CountBlueComponents(size=size, shrink_perturb=shrink_perturb, rng=rng)
+    if skill_id == 20:
+        return Skill20TranslateShape(size=size, shrink_perturb=shrink_perturb, rng=rng)
+    if skill_id == 21:
+        return Skill21ShapeClassifier(size=size, shrink_perturb=shrink_perturb, rng=rng)
+    if skill_id == 22:
+        return Skill22ShapePrinter(size=size, shrink_perturb=shrink_perturb, rng=rng)
+    if skill_id == 23:
+        return Skill23ShapePrinterWithOffset(size=size, shrink_perturb=shrink_perturb, rng=rng)
         
     raise ValueError(f"Unknown skill_id={skill_id}")
 

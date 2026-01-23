@@ -7,6 +7,7 @@ from typing import Optional
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 
 from arc_train_utils import (
@@ -33,6 +34,183 @@ from checkpointing import load_pretrained_weights
 
 DEFAULT_TRAIN_SKILLS = (11, 12, 14, 15, 16)
 DEFAULT_TRAIN_WITH_OOD_SKILLS = (11, 12, 14, 15, 16)
+
+
+def _prompt_rows_cols(*, t: int, grid_size: int, device: torch.device) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Compute per-token (row, col) coordinates for the ARC prompt sequence, plus an is_sep mask.
+
+    Prompt layout is a repetition of: [grid_tokens] + [SEP]
+    (see arc_train_utils.prompt_seq_len / _flatten_prompt).
+    """
+    g = int(grid_size)
+    if g <= 0:
+        raise ValueError(f"grid_size must be >= 1, got {g}")
+    grid_tokens = int(g * g)
+    block = int(grid_tokens + 1)
+
+    pos = torch.arange(int(t), device=device)
+    within = pos % block
+    is_sep = within == int(grid_tokens)
+    cell = torch.clamp(within, max=int(grid_tokens - 1))
+    row = (cell // int(g)).to(torch.long)
+    col = (cell % int(g)).to(torch.long)
+    return row, col, is_sep
+
+
+class RelPosBias2D(nn.Module):
+    """
+    Learned 2D relative position bias (per head), added to self-attention logits.
+
+    SEP tokens get 0 bias to avoid polluting attention through separators.
+    """
+
+    def __init__(self, *, grid_size: int, num_heads: int) -> None:
+        super().__init__()
+        g = int(grid_size)
+        h = int(num_heads)
+        if g <= 0:
+            raise ValueError(f"grid_size must be >= 1, got {g}")
+        if h <= 0:
+            raise ValueError(f"num_heads must be >= 1, got {h}")
+        self.grid_size = int(g)
+        self.num_heads = int(h)
+        self._span = int(2 * g - 1)
+        self._rel_size = int(self._span * self._span)
+        # (rel_size -> num_heads)
+        self.bias = nn.Embedding(int(self._rel_size), int(self.num_heads))
+
+    def forward(self, *, row: torch.Tensor, col: torch.Tensor, is_sep: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+          row/col: (T,) long
+          is_sep: (T,) bool
+        Returns:
+          bias: (H, T, T) float32
+        """
+        if row.ndim != 1 or col.ndim != 1 or is_sep.ndim != 1:
+            raise ValueError("row/col/is_sep must be 1D tensors")
+        if int(row.shape[0]) != int(col.shape[0]) or int(row.shape[0]) != int(is_sep.shape[0]):
+            raise ValueError("row/col/is_sep must have the same length")
+
+        t = int(row.shape[0])
+        g = int(self.grid_size)
+        span = int(self._span)
+
+        # dr,dc in [-(g-1)..(g-1)] -> [0..2g-2]
+        dr = (row[:, None] - row[None, :]).clamp(min=-(g - 1), max=(g - 1)) + (g - 1)
+        dc = (col[:, None] - col[None, :]).clamp(min=-(g - 1), max=(g - 1)) + (g - 1)
+        idx = (dr * span + dc).to(torch.long)  # (T, T)
+
+        # Zero any pair involving SEP tokens.
+        valid = (~is_sep).to(torch.bool)
+        valid_pair = (valid[:, None] & valid[None, :]).to(torch.float32)  # (T, T)
+
+        b = self.bias(idx.reshape(-1)).reshape(t, t, int(self.num_heads)).permute(2, 0, 1).contiguous()
+        return b * valid_pair.unsqueeze(0)
+
+
+class EncoderLayerRelPos2D(nn.Module):
+    """A minimal Transformer encoder layer with learned 2D relative position bias."""
+
+    def __init__(
+        self,
+        *,
+        embed_dim: int,
+        num_heads: int,
+        ff_dim: int,
+        dropout: float,
+        rel_pos: RelPosBias2D,
+    ) -> None:
+        super().__init__()
+        d = int(embed_dim)
+        h = int(num_heads)
+        if d <= 0:
+            raise ValueError(f"embed_dim must be >= 1, got {d}")
+        if h <= 0:
+            raise ValueError(f"num_heads must be >= 1, got {h}")
+        if d % h != 0:
+            raise ValueError(f"embed_dim must be divisible by num_heads, got {d} % {h} != 0")
+        self.embed_dim = int(d)
+        self.num_heads = int(h)
+        self.head_dim = int(d // h)
+        self.scale = float(self.head_dim) ** -0.5
+        self.rel_pos = rel_pos
+
+        self.ln1 = nn.LayerNorm(int(d))
+        self.ln2 = nn.LayerNorm(int(d))
+        self.qkv = nn.Linear(int(d), int(3 * d), bias=True)
+        self.proj = nn.Linear(int(d), int(d), bias=True)
+        self.drop = nn.Dropout(float(dropout))
+
+        self.ff1 = nn.Linear(int(d), int(ff_dim))
+        self.ff2 = nn.Linear(int(ff_dim), int(d))
+        self.act = nn.GELU()
+
+    def forward(self, x: torch.Tensor, *, row: torch.Tensor, col: torch.Tensor, is_sep: torch.Tensor) -> torch.Tensor:
+        # x: (B, T, D)
+        b, t, d = x.shape
+        if int(d) != int(self.embed_dim):
+            raise ValueError(f"Unexpected embed dim: got {int(d)} expected {int(self.embed_dim)}")
+
+        # Pre-norm attention
+        h1 = self.ln1(x)
+        qkv = self.qkv(h1)  # (B, T, 3D)
+        q, k, v = qkv.chunk(3, dim=-1)
+        q = q.reshape(int(b), int(t), int(self.num_heads), int(self.head_dim)).permute(0, 2, 1, 3)
+        k = k.reshape(int(b), int(t), int(self.num_heads), int(self.head_dim)).permute(0, 2, 1, 3)
+        v = v.reshape(int(b), int(t), int(self.num_heads), int(self.head_dim)).permute(0, 2, 1, 3)
+
+        logits = torch.matmul(q, k.transpose(-2, -1)) * float(self.scale)  # (B, H, T, T)
+        bias = self.rel_pos(row=row, col=col, is_sep=is_sep).to(dtype=logits.dtype)  # (H, T, T)
+        attn = F.softmax(logits + bias.unsqueeze(0), dim=-1)
+        attn = self.drop(attn)
+        out = torch.matmul(attn, v)  # (B, H, T, Hd)
+        out = out.permute(0, 2, 1, 3).reshape(int(b), int(t), int(self.embed_dim))
+        out = self.proj(out)
+        out = self.drop(out)
+        x = x + out
+
+        # Pre-norm FFN
+        h2 = self.ln2(x)
+        ff = self.ff2(self.drop(self.act(self.ff1(h2))))
+        ff = self.drop(ff)
+        return x + ff
+
+
+class EncoderRelPos2D(nn.Module):
+    """Stack of EncoderLayerRelPos2D layers sharing the same RelPosBias2D table."""
+
+    def __init__(
+        self,
+        *,
+        num_layers: int,
+        embed_dim: int,
+        num_heads: int,
+        ff_dim: int,
+        dropout: float,
+        grid_size: int,
+    ) -> None:
+        super().__init__()
+        rel = RelPosBias2D(grid_size=int(grid_size), num_heads=int(num_heads))
+        self.rel = rel
+        self.layers = nn.ModuleList(
+            [
+                EncoderLayerRelPos2D(
+                    embed_dim=int(embed_dim),
+                    num_heads=int(num_heads),
+                    ff_dim=int(ff_dim),
+                    dropout=float(dropout),
+                    rel_pos=rel,
+                )
+                for _ in range(int(num_layers))
+            ]
+        )
+
+    def forward(self, x: torch.Tensor, *, row: torch.Tensor, col: torch.Tensor, is_sep: torch.Tensor) -> torch.Tensor:
+        for layer in self.layers:
+            x = layer(x, row=row, col=col, is_sep=is_sep)
+        return x
 
 
 def _unique_ints(xs: list[int]) -> list[int]:
@@ -146,6 +324,7 @@ class ARCTransformer(nn.Module):
         vocab_size: int = VOCAB_SIZE,
         grid_size: int = 5,
         pos_encoding: str = "2d",
+        rel_pos_bias_2d: bool = True,
         embed_dim: int = 128,
         num_heads: int = 4,
         num_layers: int = 4,
@@ -169,19 +348,33 @@ class ARCTransformer(nn.Module):
         self.global_pos_enc = nn.Parameter(torch.randn(1, int(max_len), embed_dim) * 0.02)
 
         # Optional *local* 2D positional encoding (row + col) to restore spatial inductive bias.
+        # If rel_pos_bias_2d is enabled, we skip absolute 2D embeddings (relative bias provides the spatial signal).
         # Note: SEP tokens (between grids) will receive a 0 2D positional embedding.
         if self.pos_encoding == "2d":
             self.row_embed = nn.Embedding(self.grid_size, embed_dim)
             self.col_embed = nn.Embedding(self.grid_size, embed_dim)
 
-        layer = nn.TransformerEncoderLayer(
-            d_model=embed_dim,
-            nhead=num_heads,
-            dim_feedforward=ff_dim,
-            batch_first=True,
-            dropout=dropout,
-        )
-        self.transformer = nn.TransformerEncoder(layer, num_layers=num_layers)
+        self.rel_pos_bias_2d = bool(rel_pos_bias_2d)
+        if self.rel_pos_bias_2d:
+            self.transformer_rel = EncoderRelPos2D(
+                num_layers=int(num_layers),
+                embed_dim=int(embed_dim),
+                num_heads=int(num_heads),
+                ff_dim=int(ff_dim),
+                dropout=float(dropout),
+                grid_size=int(self.grid_size),
+            )
+            self.transformer = None
+        else:
+            layer = nn.TransformerEncoderLayer(
+                d_model=embed_dim,
+                nhead=num_heads,
+                dim_feedforward=ff_dim,
+                batch_first=True,
+                dropout=dropout,
+            )
+            self.transformer = nn.TransformerEncoder(layer, num_layers=num_layers)
+            self.transformer_rel = None
         self.fc_out = nn.Linear(embed_dim, vocab_size)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -195,23 +388,19 @@ class ARCTransformer(nn.Module):
 
         emb = self.embed(x) + self.global_pos_enc[:, :t, :]
 
-        if self.pos_encoding == "2d":
-            # NOTE: if we move to non-square grids, we need to adjust the positional embeddings.
-            # Prompt layout is a repetition of: [grid_tokens] + [SEP]
-            # So we can compute 2D positions by position-in-block and automatically reset per grid.
-            block = self.grid_tokens + 1
-            pos = torch.arange(t, device=x.device)
-            within = pos % block  # [0..grid_tokens] where grid_tokens is the SEP position
-            is_sep = within == self.grid_tokens
-            cell = torch.clamp(within, max=self.grid_tokens - 1)
+        row, col, is_sep = _prompt_rows_cols(t=int(t), grid_size=int(self.grid_size), device=x.device)
 
-            row = (cell // self.grid_size).to(torch.long)
-            col = (cell % self.grid_size).to(torch.long)
+        if self.pos_encoding == "2d" and (not bool(self.rel_pos_bias_2d)):
             pos_emb_2d = self.row_embed(row) + self.col_embed(col)  # (T, D)
             pos_emb_2d = pos_emb_2d.masked_fill(is_sep.unsqueeze(-1), 0.0)
             emb = emb + pos_emb_2d.unsqueeze(0)  # (B, T, D)
 
-        h = self.transformer(emb)
+        if self.rel_pos_bias_2d:
+            assert self.transformer_rel is not None
+            h = self.transformer_rel(emb, row=row, col=col, is_sep=is_sep)
+        else:
+            assert self.transformer is not None
+            h = self.transformer(emb)
         return self.fc_out(h)  # (B, T, vocab)
 
 
@@ -219,6 +408,7 @@ def main(
     data_dir: Path = Path("tmp"),
     grid_size: int = 5,
     pos_encoding: str = "2d",
+    rel_pos_bias_2d: bool = True,
     pretrained: Optional[Path] = None,
     train_skills: Optional[list[int]] = None,
     delay_train_skill: Optional[int] = None,
@@ -438,6 +628,7 @@ def main(
         vocab_size=VOCAB_SIZE,
         grid_size=grid_size,
         pos_encoding=str(pos_encoding),
+        rel_pos_bias_2d=bool(rel_pos_bias_2d),
         embed_dim=int(embed_dim),
         num_heads=int(num_heads),
         num_layers=int(num_layers),
@@ -908,6 +1099,15 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         choices=["2d", "1d"],
         help="Positional encoding scheme. '2d' (default) uses row+col embeddings per grid; '1d' uses the old absolute learned positions.",
     )
+    p.add_argument(
+        "--rel_pos_bias_2d",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Use learned 2D relative position bias in self-attention (enabled by default). "
+            "Disable with --no-rel_pos_bias_2d."
+        ),
+    )
     p.add_argument("--eval_every", type=int, default=1000)
     p.add_argument(
         "--save_every",
@@ -1002,6 +1202,7 @@ def cli_main(argv: Optional[list[str]] = None) -> None:
         data_dir=Path(args.data_dir),
         grid_size=int(args.grid_size),
         pos_encoding=str(args.pos_encoding),
+        rel_pos_bias_2d=bool(args.rel_pos_bias_2d),
         pretrained=Path(args.pretrained) if args.pretrained is not None else None,
         train_skills=[int(s) for s in train_skills] if train_skills is not None else None,
         delay_train_skills=[int(s) for s in args.delay_train_skills] if args.delay_train_skills is not None else None,
