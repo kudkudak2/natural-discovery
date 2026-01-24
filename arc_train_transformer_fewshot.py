@@ -610,39 +610,41 @@ def _exact_match_acc(
         eq = (pred == yb).all(dim=1)
         correct += int(eq.sum().item())
 
+        # Save fixed "latest" slots so evals overwrite in-place (no per-step file accumulation).
         if save_unsolved_dir is not None and int(save_unsolved_max) > 0 and saved < int(save_unsolved_max):
-            bad = (~eq).nonzero(as_tuple=False).reshape(-1)
-            if int(bad.numel()) > 0:
-                for bi in bad.tolist():
-                    if saved >= int(save_unsolved_max):
-                        break
-                    g = int(pool.grid_size)
-                    demos, test_x = decode_prompt_src(
-                        src_tokens=xb[int(bi)].detach().cpu().numpy(),
-                        grid_size=g,
-                        num_demos=3,
-                    )
-                    pred_y = pred[int(bi)].detach().cpu().numpy().reshape(g, g)
-                    true_y = yb[int(bi)].detach().cpu().numpy().reshape(g, g)
+            step_s = "na" if save_unsolved_step is None else f"{int(save_unsolved_step):07d}"
+            cls = str(save_unsolved_class) if save_unsolved_class is not None else "unknown_class"
+            base_dir = Path(save_unsolved_dir) / str(save_unsolved_tag) / cls
+            bad = (~eq).nonzero(as_tuple=False).reshape(-1).tolist()
+            good = (eq).nonzero(as_tuple=False).reshape(-1).tolist()
+            pick = bad + good
+            if len(pick) == 0:
+                continue
+            while saved < int(save_unsolved_max):
+                bi = int(pick[saved % len(pick)])
+                g = int(pool.grid_size)
+                demos, test_x = decode_prompt_src(
+                    src_tokens=xb[bi].detach().cpu().numpy(),
+                    grid_size=g,
+                    num_demos=3,
+                )
+                pred_y = pred[bi].detach().cpu().numpy().reshape(g, g)
+                true_y = yb[bi].detach().cpu().numpy().reshape(g, g)
 
-                    step_s = "na" if save_unsolved_step is None else f"{int(save_unsolved_step):07d}"
-                    cls = str(save_unsolved_class) if save_unsolved_class is not None else "unknown_class"
-                    out_path = (
-                        Path(save_unsolved_dir)
-                        / str(save_unsolved_tag)
-                        / cls
-                        / f"step{step_s}__row{int(off) + int(bi)}.png"
-                    )
-                    title = f"{save_unsolved_tag} unsolved | {cls} | step={step_s} | row={int(off) + int(bi)}"
-                    save_arc_prompt_prediction_png(
-                        demos=demos,
-                        test_x=test_x,
-                        pred_y=pred_y,
-                        true_y=true_y,
-                        out_path=out_path,
-                        title=title,
-                    )
-                    saved += 1
+                row = int(off) + int(bi)
+                out_path = base_dir / f"slot{int(saved):02d}.png"
+                title = f"{save_unsolved_tag} latest | {cls} | step={step_s} | row={row} | slot={int(saved):02d}"
+                save_arc_prompt_prediction_png(
+                    demos=demos,
+                    test_x=test_x,
+                    pred_y=pred_y,
+                    true_y=true_y,
+                    out_path=out_path,
+                    title=title,
+                )
+                saved += 1
+                if saved >= int(save_unsolved_max):
+                    break
     return float(correct) / float(n)
 
 
@@ -1017,7 +1019,7 @@ def main(
             return
 
         model.eval()
-        unsolved_dir = plots_dir / "unsolved_examples" / f"step_{int(step):07d}"
+        unsolved_dir = plots_dir / "unsolved_examples"
         acc_train = _eval_skill_acc(which="train", unsolved_dir=None, unsolved_step=int(step))
         acc_test = _eval_skill_acc(which="test", unsolved_dir=unsolved_dir, unsolved_step=int(step))
         acc_ood = _eval_skill_acc(which="ood", unsolved_dir=unsolved_dir, unsolved_step=int(step))

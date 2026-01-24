@@ -15,6 +15,7 @@ from arc_train_utils import (
     LearningCurves,
     TensorizedDataset,
     VOCAB_SIZE,
+    assert_disjoint_datasets,
     cap_dataset,
     concat_datasets,
     count_params,
@@ -845,11 +846,13 @@ def main(
         ds_train, ds_train_test = split_dataset(ds_train_full, train_frac=train_frac_f, rng=rng)
         train_sets[sid] = ds_train
         eval_id_sets[sid] = ds_train_test
+        assert_disjoint_datasets(a=ds_train, b=ds_train_test, label=f"skill_{sid}: id train vs id heldout")
 
         ds_ood_full = load_skill_split(data_dir=data_dir, skill_id=sid, split="ood")
         ds_ood_train, ds_ood_test = split_dataset(ds_ood_full, train_frac=train_frac_f, rng=rng)
         ood_train_pools[sid] = ds_ood_train
         eval_ood_sets[sid] = ds_ood_test
+        assert_disjoint_datasets(a=ds_ood_train, b=ds_ood_test, label=f"skill_{sid}: ood train vs ood heldout")
 
     # Include OOD examples for selected skills in training (from their OOD-train pool).
     # OOD test remains disjoint and is what we report in the printed metrics.
@@ -882,6 +885,11 @@ def main(
     if probe_ood_full is not None:
         probe_ood_train, probe_ood_test = split_dataset(probe_ood_full, train_frac=train_frac_f, rng=rng)
         eval_probe_ood = probe_ood_test
+        assert_disjoint_datasets(
+            a=probe_ood_train,
+            b=probe_ood_test,
+            label=f"probe_skill_{probe_skill}: ood train vs ood heldout",
+        )
     if eval_probe_ood is None:
         raise FileNotFoundError(f"Missing required eval set: {data_dir / f'skill_{probe_skill}' / 'ood.json'}")
 
@@ -1071,22 +1079,16 @@ def main(
         if (int(save_every) > 0) and ((step % int(save_every) == 0) or (step == int(steps) - 1)):
             save_latest_checkpoint(step=int(step))
 
-        if (step % int(eval_every) == 0) or (step == int(steps) - 1):
+        do_eval = (int(eval_every) > 0) and ((step % int(eval_every) == 0) or (step == int(steps) - 1))
+        if do_eval:
             model.eval()
             eval_ids = sorted(eval_id_sets.keys())
             acc_train = {}
             acc_id = {}
             acc_ood = {}
-            # Only render unsolved examples on the FINAL step, and write them into a single folder.
-            # This avoids creating a new folder every eval and keeps the most relevant failures easy to find.
-            is_last_step = int(step) == (int(steps) - 1)
-            unsolved_dir = out_dir / "plots" / "unsolved_examples" if is_last_step else None
+            # Save unsolved examples at every eval (files are keyed by step+idx so they won't clobber).
+            unsolved_dir = (out_dir / "plots" / "unsolved_examples") if int(plot_unsolved_n_i) > 0 else None
             if unsolved_dir is not None:
-                # Refresh the folder so it only contains the last-step results.
-                if unsolved_dir.exists():
-                    import shutil
-
-                    shutil.rmtree(unsolved_dir)
                 unsolved_dir.mkdir(parents=True, exist_ok=True)
 
             for sid in eval_ids:

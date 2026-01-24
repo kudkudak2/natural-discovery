@@ -12,6 +12,8 @@ import torch.nn as nn
 from arc_dataset_models import ARCDataset
 from arc_aug import AugmentSpec, augment_src_tgt_batch
 
+import hashlib
+
 
 SEP_TOKEN = 5  # colors are 0..4; SEP=5
 VOCAB_SIZE = 6
@@ -231,6 +233,44 @@ def _subset_dataset(ds: TensorizedDataset, idx: np.ndarray, *, split_suffix: str
         src=ds.src[idx],
         tgt=ds.tgt[idx],
     )
+
+
+def _row_digests(ds: TensorizedDataset) -> set[bytes]:
+    """
+    Return a set of per-example cryptographic digests for exact disjointness checks.
+
+    Digest is computed over the concatenation of (src row, tgt row) bytes to avoid
+    false matches when src is equal but tgt differs (or vice versa).
+    """
+    if ds.n <= 0:
+        return set()
+    st = torch.cat([ds.src, ds.tgt], dim=1).contiguous()
+    # Always hash on CPU for determinism across devices/dtypes.
+    a = st.detach().cpu().numpy()
+    out: set[bytes] = set()
+    for i in range(int(a.shape[0])):
+        out.add(hashlib.blake2b(a[i].tobytes(), digest_size=16).digest())
+    return out
+
+
+def assert_disjoint_datasets(*, a: TensorizedDataset, b: TensorizedDataset, label: str) -> None:
+    """
+    Raise if `a` and `b` share any exact example (src+tgt).
+
+    This is a guardrail against accidental train/test leakage when changing splitting,
+    pooling, augmentation, or dataset loading code.
+    """
+    if a.n == 0 or b.n == 0:
+        return
+    da = _row_digests(a)
+    db = _row_digests(b)
+    overlap = da & db
+    if len(overlap) != 0:
+        raise ValueError(
+            f"Train/test leakage detected: datasets are not disjoint ({label}). "
+            f"a=({a.skill_id},{a.split},n={a.n}) b=({b.skill_id},{b.split},n={b.n}) "
+            f"overlap={len(overlap)}"
+        )
 
 
 def split_dataset(
@@ -528,14 +568,22 @@ def plot_learning_curves(
     out_path: Path,
     title: str,
 ) -> None:
+    # Keep training usable in minimal environments: CSV saving is the source of truth,
+    # and plotting is best-effort.
     if not _has_matplotlib():
-        raise RuntimeError("Missing dependency: matplotlib. Install with `pip install matplotlib` or pass --no_plots.")
+        return
 
     import matplotlib.pyplot as plt  # type: ignore
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    plt.style.use("seaborn-v0_8-whitegrid")
+    # Matplotlib style names vary across versions; choose the best available without throwing.
+    style_candidates = ["seaborn-v0_8-whitegrid", "seaborn-whitegrid", "ggplot"]
+    avail = set(getattr(plt.style, "available", []))
+    for s in style_candidates:
+        if s in avail:
+            plt.style.use(s)
+            break
     fig = plt.figure(figsize=(12, 7), dpi=140)
     ax = fig.add_subplot(1, 1, 1)
 
@@ -619,36 +667,39 @@ def evaluate_accuracy(
         eq = (pred == yb).all(dim=1)
         correct += int(eq.sum().item())
 
+        # Save a fixed set of "latest" example images (slot00..slotN) so evals overwrite in-place
+        # instead of creating new files every time.
         if save_unsolved_dir is not None and int(save_unsolved_max) > 0 and saved < int(save_unsolved_max):
-            bad = (~eq).nonzero(as_tuple=False).reshape(-1)
-            if int(bad.numel()) > 0:
-                for bi in bad.tolist():
-                    if saved >= int(save_unsolved_max):
-                        break
-                    # Decode + save on CPU.
-                    src_i = xb[int(bi)].detach().cpu().numpy()
-                    demos, test_x = _decode_prompt_src(src_tokens=src_i, grid_size=int(dataset.grid_size), num_demos=3)
-                    g = int(dataset.grid_size)
-                    true_y = yb[int(bi)].detach().cpu().numpy().reshape(g, g)
-                    pred_y = pred[int(bi)].detach().cpu().numpy().reshape(g, g)
+            step_s = "na" if save_unsolved_step is None else f"{int(save_unsolved_step):07d}"
+            base_dir = Path(save_unsolved_dir) / f"{save_unsolved_tag}" / f"s{int(dataset.skill_id)}" / f"{dataset.split}"
+            # Prefer unsolved examples, but if there aren't enough, fill remaining slots with solved ones.
+            bad = (~eq).nonzero(as_tuple=False).reshape(-1).tolist()
+            good = (eq).nonzero(as_tuple=False).reshape(-1).tolist()
+            pick = bad + good
+            if len(pick) == 0:
+                continue
+            # If the batch doesn't have enough candidates, repeat deterministically to fill slots.
+            while saved < int(save_unsolved_max):
+                bi = int(pick[saved % len(pick)])
+                # Decode + save on CPU.
+                src_i = xb[bi].detach().cpu().numpy()
+                demos, test_x = _decode_prompt_src(src_tokens=src_i, grid_size=int(dataset.grid_size), num_demos=3)
+                g = int(dataset.grid_size)
+                true_y = yb[bi].detach().cpu().numpy().reshape(g, g)
+                pred_y = pred[bi].detach().cpu().numpy().reshape(g, g)
 
-                    step_s = "na" if save_unsolved_step is None else f"{int(save_unsolved_step):07d}"
-                    ds_idx = int(idx_np[int(off + int(bi))])
-                    out_path = (
-                        Path(save_unsolved_dir)
-                        / f"{save_unsolved_tag}"
-                        / f"s{int(dataset.skill_id)}"
-                        / f"{dataset.split}"
-                        / f"step{step_s}__idx{ds_idx}.png"
-                    )
-                    title = (
-                        f"{save_unsolved_tag} unsolved | s{int(dataset.skill_id)} | split={dataset.split} | "
-                        f"step={step_s} | idx={ds_idx}"
-                    )
-                    save_arc_prompt_prediction_png(
-                        demos=demos, test_x=test_x, pred_y=pred_y, true_y=true_y, out_path=out_path, title=title
-                    )
-                    saved += 1
+                ds_idx = int(idx_np[int(off + bi)])
+                out_path = base_dir / f"slot{int(saved):02d}.png"
+                title = (
+                    f"{save_unsolved_tag} latest | s{int(dataset.skill_id)} | split={dataset.split} | "
+                    f"step={step_s} | idx={ds_idx} | slot={int(saved):02d}"
+                )
+                save_arc_prompt_prediction_png(
+                    demos=demos, test_x=test_x, pred_y=pred_y, true_y=true_y, out_path=out_path, title=title
+                )
+                saved += 1
+                if saved >= int(save_unsolved_max):
+                    break
 
     return float(correct) / float(k)
 

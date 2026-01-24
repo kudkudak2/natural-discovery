@@ -2776,17 +2776,15 @@ class Skill22ShapePrinter(Puzzle):
 
 class Skill23ShapePrinterWithOffset(Puzzle):
     """
-    Skill23: Shape printer with offset.
+    Skill23: Translate a fixed shape by a marker-coded offset.
 
-    Per-task: sample two shapes (odd span => unambiguous center).
     Input:
-      - one green (3) pixel indicating the reference center (always green)
-      - a single 1x1 shift-direction pixel:
-          * red (2) => shift +1 horizontally (to the RIGHT)
-          * blue (1) => shift +1 vertically (DOWN)
-      - optional yellow (4) selector pixel: if present, choose shape1; otherwise choose shape0
+      - one fixed green (3) shape (same for every task)
+      - exactly one 1x1 marker pixel that encodes BOTH direction and magnitude:
+          * red  (2) at (0, k) => shift the shape RIGHT by k
+          * blue (1) at (k, 0) => shift the shape DOWN by k
 
-    Output: print the selected shape centered at (green_center + shift), and set that (shifted) center pixel to green (3).
+    Output: the same green shape translated accordingly. (The marker does not appear in the output.)
     """
 
     skill_id = 23
@@ -2803,108 +2801,120 @@ class Skill23ShapePrinterWithOffset(Puzzle):
         rng: Optional[np.random.Generator] = None,
     ) -> None:
         super().__init__(size=size, colors=colors, ood_spec=ood_spec, shrink_perturb=shrink_perturb, rng=rng)
-        size_i = int(self.size)
 
         self._BLUE = 1
         self._RED = 2
         self._GREEN = 3
-        self._YELLOW = 4
+        # Fixed shape across *all* tasks: keep it simple and constant.
+        self._shape = ("cross", 3)
+        self._offsets = _mask_offsets(_shape_mask(self._shape[0], span=int(self._shape[1])))
 
-        kinds = ["cross", "diag_main", "diag_anti", "diamond", "square"]
-        spans = [s for s in (3, 5, 7) if int(s) <= size_i and (int(s) % 2 == 1)]
-        if not spans:
-            spans = [max(1, size_i | 1)]
-
-        candidates: list[tuple[str, int]] = [(k, int(s)) for k in kinds for s in spans]
-        a_idx = int(self.rng.integers(0, len(candidates)))
-        b_idx = int(self.rng.integers(0, len(candidates) - 1))
-        if b_idx >= a_idx:
-            b_idx += 1
-        (k0, s0) = candidates[a_idx]
-        (k1, s1) = candidates[b_idx]
-
-        self._shape0 = (str(k0), int(s0))
-        self._shape1 = (str(k1), int(s1))
-        self._offsets0 = _mask_offsets(_shape_mask(self._shape0[0], span=int(self._shape0[1])))
-        self._offsets1 = _mask_offsets(_shape_mask(self._shape1[0], span=int(self._shape1[1])))
+        # Keep the shape away from the top row / left column so the marker can live on the border.
+        drs = [int(dr) for dr, _dc in self._offsets] if self._offsets else [0]
+        dcs = [int(dc) for _dr, dc in self._offsets] if self._offsets else [0]
+        self._min_dr = int(min(drs))
+        self._min_dc = int(min(dcs))
 
     @property
     def variant_id(self) -> Optional[str]:
-        k0, s0 = self._shape0
-        k1, s1 = self._shape1
-        return f"{k0}{int(s0)}_vs_{k1}{int(s1)}"
+        k, s = self._shape
+        return f"{k}{int(s)}"
 
     def variant_params(self) -> dict[str, object]:
-        k0, s0 = self._shape0
-        k1, s1 = self._shape1
-        return {"shape0": {"kind": k0, "span": int(s0)}, "shape1": {"kind": k1, "span": int(s1)}}
+        k, s = self._shape
+        return {"shape": {"kind": k, "span": int(s)}}
 
-    def _make_input_for_shape(self, which: int) -> np.ndarray:
+    def _make_input_with_axis_k(self, *, axis: str, k: int) -> np.ndarray:
         size = int(self.size)
         grid = self.blank()
 
-        which_i = 0 if int(which) == 0 else 1
-        offsets = self._offsets0 if which_i == 0 else self._offsets1
+        axis_s = "h" if str(axis) == "h" else "v"
+        k_i = int(k)
+        k_i = max(0, min(int(k_i), int(size - 1)))
 
-        # Only allow a +1 shift along a single axis.
-        axis = "h" if bool(self.rng.integers(0, 2)) == 0 else "v"
-        shift_dr = 1 if axis == "v" else 0
-        shift_dc = 1 if axis == "h" else 0
+        shift_dr = int(k_i) if axis_s == "v" else 0
+        shift_dc = int(k_i) if axis_s == "h" else 0
 
-        (r_lo, r_hi), (c_lo, c_hi) = _safe_center_range_for_offsets(
-            size=size, offsets=offsets, shift_dr=shift_dr, shift_dc=shift_dc, min_center_r=1
+        # Enforce the shape doesn't touch the top row / left column.
+        min_center_r = max(1, 1 - int(self._min_dr))
+        min_center_c = max(1, 1 - int(self._min_dc))
+
+        # Choose a center so BOTH the original and shifted shape fit.
+        (r0_lo, r0_hi), (c0_lo, c0_hi) = _safe_center_range_for_offsets(
+            size=size, offsets=self._offsets, shift_dr=0, shift_dc=0, min_center_r=int(min_center_r)
         )
+        (r1_lo, r1_hi), (c1_lo, c1_hi) = _safe_center_range_for_offsets(
+            size=size,
+            offsets=self._offsets,
+            shift_dr=int(shift_dr),
+            shift_dc=int(shift_dc),
+            min_center_r=int(min_center_r),
+        )
+        r_lo = max(int(r0_lo), int(r1_lo))
+        r_hi = min(int(r0_hi), int(r1_hi))
+        c_lo = max(int(c0_lo), int(c1_lo), int(min_center_c))
+        c_hi = min(int(c0_hi), int(c1_hi))
+
         if r_hi < r_lo or c_hi < c_lo:
-            r = int(max(1, size // 2))
-            c = int(size // 2)
+            r = int(max(int(min_center_r), size // 2))
+            c = int(max(int(min_center_c), size // 2))
         else:
             r = int(self.rng.integers(int(r_lo), int(r_hi) + 1))
             c = int(self.rng.integers(int(c_lo), int(c_hi) + 1))
 
-        grid[int(r), int(c)] = int(self._GREEN)
+        _apply_centered_shape(grid, center_r=int(r), center_c=int(c), offsets=self._offsets, color=int(self._GREEN))
 
-        # Encode shift direction with a single pixel in the top-left corner.
-        code_color = int(self._RED) if axis == "h" else int(self._BLUE)
-        grid[0, 0] = int(code_color)
-
-        if which_i == 1:
-            grid[0, size - 1] = int(self._YELLOW)
+        # Marker encodes direction + magnitude.
+        if axis_s == "h":
+            grid[0, int(k_i)] = int(self._RED)
+        else:
+            grid[int(k_i), 0] = int(self._BLUE)
 
         return grid
 
     def make_input(self, *, ood: bool) -> np.ndarray:
         _ = ood
-        which = int(self.rng.integers(0, 2))
-        return self._make_input_for_shape(which)
+        axis = "h" if bool(self.rng.integers(0, 2)) == 0 else "v"
+        size = int(self.size)
+        max_k = max(0, int(size - 1))
+        # Prefer small, legible shifts but still allow variety.
+        cap = min(3, int(max_k))
+        k = int(self.rng.integers(0, int(cap) + 1)) if cap > 0 else 0
+        # Avoid the degenerate no-op most of the time when possible.
+        if int(max_k) >= 1 and int(k) == 0:
+            k = 1
+        return self._make_input_with_axis_k(axis=str(axis), k=int(k))
 
     def apply(self, grid: np.ndarray, rule_color: Optional[int]) -> np.ndarray:
         _ = rule_color
         out = np.zeros_like(grid)
+        reds = np.argwhere(grid == int(self._RED))
+        blues = np.argwhere(grid == int(self._BLUE))
 
-        gr = np.argwhere(grid == int(self._GREEN))
-        if gr.size == 0:
-            return out
-        r0, c0 = int(gr[0, 0]), int(gr[0, 1])
-
-        # Decode shift: exactly one axis should be present.
-        has_h = bool(np.any(grid == int(self._RED)))
-        has_v = bool(np.any(grid == int(self._BLUE)))
+        has_h = int(reds.shape[0]) > 0
+        has_v = int(blues.shape[0]) > 0
         if has_h == has_v:
             return out
-        dr = 1 if has_v else 0
-        dc = 1 if has_h else 0
 
-        which = 1 if bool(np.any(grid == int(self._YELLOW))) else 0
-        offsets = self._offsets1 if which == 1 else self._offsets0
+        if has_h:
+            # red at (0,k) encodes RIGHT shift by k
+            k = int(reds[0, 1])
+            dr, dc = 0, int(k)
+        else:
+            # blue at (k,0) encodes DOWN shift by k
+            k = int(blues[0, 0])
+            dr, dc = int(k), 0
 
-        rr = int(r0) + int(dr)
-        cc = int(c0) + int(dc)
-        size = int(grid.shape[0])
-        if rr < 0 or rr >= size or cc < 0 or cc >= size:
+        rs, cs = np.nonzero(grid == int(self._GREEN))
+        if int(rs.size) == 0:
             return out
 
-        _apply_centered_shape(out, center_r=int(rr), center_c=int(cc), offsets=offsets, color=int(self._BLUE))
-        out[int(rr), int(cc)] = int(self._GREEN)
+        h, w = int(grid.shape[0]), int(grid.shape[1])
+        for r0, c0 in zip(rs.tolist(), cs.tolist()):
+            rr = int(r0) + int(dr)
+            cc = int(c0) + int(dc)
+            if 0 <= rr < h and 0 <= cc < w:
+                out[int(rr), int(cc)] = int(self._GREEN)
         return out
 
     def generate_prompt(
@@ -2913,49 +2923,35 @@ class Skill23ShapePrinterWithOffset(Puzzle):
         num_demos: int = 3,
         ood_test: bool = False,
     ) -> tuple[list[tuple[np.ndarray, np.ndarray]], tuple[np.ndarray, np.ndarray], Optional[int]]:
-        if int(num_demos) < 3:
-            raise ValueError(f"Skill23 requires num_demos>=3 to show both shift directions; got num_demos={num_demos}")
+        if int(num_demos) < 2:
+            raise ValueError(f"Skill23 requires num_demos>=2 to show both marker colors; got num_demos={num_demos}")
 
-        # Ensure demos include BOTH shift directions (red and blue) at least once.
-        # Also ensure both shapes are shown at least once (fits in 3 demos).
-        demo_shapes: list[int] = [0, 1, int(self.rng.integers(0, 2))]
-        demo_shapes = [int(c) for c in self.rng.permutation(np.asarray(demo_shapes)).tolist()]
+        size = int(self.size)
+        max_k = max(0, int(size - 1))
+        cap = min(3, int(max_k)) if int(max_k) > 0 else 0
 
-        # We control the shift direction by temporarily forcing axis via a coinflip override:
-        # demo 0: horizontal (red), demo 1: vertical (blue), demo 2: random.
-        demo_axes: list[str] = ["h", "v", "h" if bool(self.rng.integers(0, 2)) == 0 else "v"]
-        # Shuffle axes in the same order as shapes to avoid leaking a fixed schedule.
-        perm = self.rng.permutation(np.arange(3)).tolist()
-        demo_shapes = [demo_shapes[int(i)] for i in perm]
-        demo_axes = [demo_axes[int(i)] for i in perm]
+        # Ensure both directions are demonstrated; vary k when possible.
+        schedule: list[tuple[str, int]] = [("h", 1), ("v", 1), ("h", 2), ("v", 2), ("h", 3), ("v", 3)]
+        demos_spec: list[tuple[str, int]] = []
+        for axis, k in schedule:
+            if int(len(demos_spec)) >= int(num_demos):
+                break
+            kk = min(int(k), int(cap)) if int(cap) > 0 else 0
+            if int(max_k) >= 1 and int(kk) == 0:
+                kk = 1
+            demos_spec.append((str(axis), int(kk)))
+        # If still short (e.g. very large num_demos), fill randomly.
+        while int(len(demos_spec)) < int(num_demos):
+            axis = "h" if bool(self.rng.integers(0, 2)) == 0 else "v"
+            k = int(self.rng.integers(0, int(cap) + 1)) if int(cap) > 0 else 0
+            if int(max_k) >= 1 and int(k) == 0:
+                k = 1
+            demos_spec.append((str(axis), int(k)))
 
+        demos_spec = [demos_spec[int(i)] for i in self.rng.permutation(np.arange(len(demos_spec))).tolist()]
         demos: list[tuple[np.ndarray, np.ndarray]] = []
-        for which, axis in zip(demo_shapes, demo_axes):
-            # Re-implement _make_input_for_shape's axis draw deterministically for demos.
-            # (Keeps generation clean without adding new state.)
-            size = int(self.size)
-            grid = self.blank()
-            which_i = 0 if int(which) == 0 else 1
-            offsets = self._offsets0 if which_i == 0 else self._offsets1
-            shift_dr = 1 if str(axis) == "v" else 0
-            shift_dc = 1 if str(axis) == "h" else 0
-
-            (r_lo, r_hi), (c_lo, c_hi) = _safe_center_range_for_offsets(
-                size=size, offsets=offsets, shift_dr=shift_dr, shift_dc=shift_dc, min_center_r=1
-            )
-            if r_hi < r_lo or c_hi < c_lo:
-                r = int(max(1, size // 2))
-                c = int(size // 2)
-            else:
-                r = int(self.rng.integers(int(r_lo), int(r_hi) + 1))
-                c = int(self.rng.integers(int(c_lo), int(c_hi) + 1))
-
-            grid[int(r), int(c)] = int(self._GREEN)
-            grid[0, 0] = int(self._RED) if str(axis) == "h" else int(self._BLUE)
-            if which_i == 1:
-                grid[0, size - 1] = int(self._YELLOW)
-
-            x = grid
+        for axis, k in demos_spec:
+            x = self._make_input_with_axis_k(axis=str(axis), k=int(k))
             x = _maybe_shrink_and_perturb(x, rng=self.rng, spec=self.shrink_perturb)
             y = self.apply(x, rule_color=None)
             demos.append((x, y))
