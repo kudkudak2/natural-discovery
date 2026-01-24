@@ -10,6 +10,7 @@ import torch
 import torch.nn as nn
 
 from arc_dataset_models import ARCDataset
+from arc_aug import AugmentSpec, augment_src_tgt_batch
 
 
 SEP_TOKEN = 5  # colors are 0..4; SEP=5
@@ -339,6 +340,9 @@ def prepare_batch(
     train_pool: TensorizedDataset,
     device: torch.device,
     cpu_generator: torch.Generator,
+    augment: Optional[AugmentSpec] = None,
+    grid_size: Optional[int] = None,
+    num_demos: int = 3,
 ) -> Batch:
     """
     Prepare a training batch with minimal CPU overhead.
@@ -373,6 +377,16 @@ def prepare_batch(
     if pool_device != device:
         src = src.to(device, non_blocking=True)
         tgt = tgt.to(device, non_blocking=True)
+    if augment is not None and bool(augment.enabled):
+        g = int(train_pool.grid_size if grid_size is None else int(grid_size))
+        src, tgt = augment_src_tgt_batch(
+            src=src,
+            tgt=tgt,
+            grid_size=int(g),
+            num_demos=int(num_demos),
+            generator=cpu_generator if device.type == "cpu" else None,
+            spec=augment,
+        )
     return Batch(src=src, tgt=tgt)
 
 
