@@ -279,6 +279,10 @@ def split_dataset(
     """
     Deterministically split a dataset into (train_part, eval_part).
     Ensures both are non-empty when ds.n >= 2.
+
+    Important: this split is performed over *unique examples* (exact src+tgt).
+    If the dataset contains duplicates, we keep all identical rows on the same side
+    to prevent train/test leakage.
     """
     frac = float(train_frac)
     if not (0.0 <= frac <= 1.0):
@@ -290,10 +294,71 @@ def split_dataset(
     n_train = int(frac * ds.n)
     n_train = max(1, n_train)
     n_train = min(ds.n - 1, n_train)
-    perm = rng.permutation(ds.n)
-    train_idx = perm[:n_train]
-    eval_idx = perm[n_train:]
-    return _subset_dataset(ds, train_idx, split_suffix=f"train{n_train}"), _subset_dataset(ds, eval_idx, split_suffix="heldout")
+
+    # If there are duplicates, a naive row-level split can put identical examples
+    # on both sides, which will trip `assert_disjoint_datasets`. We instead split
+    # by digest-groups.
+    st = torch.cat([ds.src, ds.tgt], dim=1).contiguous()
+    a = st.detach().cpu().numpy()
+    digests: list[bytes] = [hashlib.blake2b(a[i].tobytes(), digest_size=16).digest() for i in range(int(a.shape[0]))]
+
+    groups: dict[bytes, list[int]] = {}
+    for i, d in enumerate(digests):
+        groups.setdefault(d, []).append(int(i))
+
+    # Fast path: no duplicates.
+    if len(groups) == ds.n:
+        perm = rng.permutation(ds.n)
+        train_idx = perm[:n_train]
+        eval_idx = perm[n_train:]
+        return _subset_dataset(ds, train_idx, split_suffix=f"train{n_train}"), _subset_dataset(ds, eval_idx, split_suffix="heldout")
+
+    keys = list(groups.keys())
+    order = rng.permutation(len(keys))
+
+    train_rows = 0
+    train_keys: list[bytes] = []
+    for oi, k_i in enumerate(order):
+        k = keys[int(k_i)]
+        sz = len(groups[k])
+        # Never consume all rows into train; eval must remain non-empty.
+        if train_rows + sz >= ds.n:
+            continue
+        # Greedily add groups until we reach (or slightly exceed) the target.
+        if train_rows < n_train:
+            train_keys.append(k)
+            train_rows += sz
+
+        # If we've already hit the target, we can stop early.
+        if train_rows >= n_train and oi + 1 < len(order):
+            # Still leave remaining groups for eval.
+            continue
+
+    # If the greedy pass somehow left train empty (pathological), force one group into train.
+    if len(train_keys) == 0:
+        k0 = keys[int(order[0])]
+        if len(groups[k0]) >= ds.n:
+            raise ValueError(
+                f"Cannot split into disjoint train/eval: dataset has only one unique example (n={ds.n})."
+            )
+        train_keys = [k0]
+
+    train_idx_list: list[int] = []
+    for k in train_keys:
+        train_idx_list.extend(groups[k])
+    train_idx = np.asarray(train_idx_list, dtype=np.int64)
+
+    train_mask = np.zeros(ds.n, dtype=bool)
+    train_mask[train_idx] = True
+    eval_idx = np.nonzero(~train_mask)[0].astype(np.int64)
+
+    # Final guard: ensure non-empty.
+    if int(train_idx.shape[0]) == 0 or int(eval_idx.shape[0]) == 0:
+        raise ValueError(
+            f"Grouped split failed to produce non-empty partitions: train_n={int(train_idx.shape[0])} eval_n={int(eval_idx.shape[0])}."
+        )
+
+    return _subset_dataset(ds, train_idx, split_suffix=f"train{int(train_idx.shape[0])}"), _subset_dataset(ds, eval_idx, split_suffix="heldout")
 
 
 def concat_datasets(datasets: list[TensorizedDataset], *, skill_id: int, split: str, grid_size: int) -> TensorizedDataset:

@@ -246,10 +246,35 @@ def _iter_skills(skills: Optional[Iterable[int]]) -> list[int]:
     return [int(s) for s in skills]
 
 
+def _n_tasks_for_skill(n_tasks: list[int], *, skill_index: int, n_skills: int) -> int:
+    """
+    Supports either:
+    - a single value: [400] -> 400 tasks for every skill
+    - a per-skill list aligned with --skills order: [100, 200, 300, ...]
+    """
+    if len(n_tasks) == 1:
+        return int(n_tasks[0])
+    if len(n_tasks) != int(n_skills):
+        raise ValueError(
+            f"--n_tasks expects either 1 value or {int(n_skills)} values (to match --skills), got {len(n_tasks)}."
+        )
+    return int(n_tasks[int(skill_index)])
+
+
 def main() -> None:
     p = argparse.ArgumentParser(description="Generate synthetic ARC datasets (JSON) and sample PNGs.")
     p.add_argument("--out_dir", type=str, required=True, help="Output directory")
-    p.add_argument("--n_tasks", type=int, default=400, help="Number of tasks per skill per split")
+    p.add_argument(
+        "--n_tasks",
+        type=int,
+        nargs="+",
+        default=[400],
+        help=(
+            "Number of tasks per skill per split. "
+            "Pass one value to use it for all skills (e.g. --n_tasks 400), "
+            "or pass one value per skill in --skills order (e.g. --skills 11 12 13 --n_tasks 100 200 300)."
+        ),
+    )
     p.add_argument("--grid_size", type=int, default=6, help="Grid size (NxN)")
     p.add_argument("--skills", type=int, nargs="*", default=range(11, 24), help="Skills to generate (e.g. 1 2 3)")
     p.add_argument("--seed", type=int, default=0, help="Base RNG seed")
@@ -280,12 +305,15 @@ def main() -> None:
 
     shrink_perturb: Optional[ShrinkPerturbSpec] = None
 
-    for skill_id in skills:
+    n_tasks_list = [int(x) for x in args.n_tasks]
+
+    for skill_idx, skill_id in enumerate(skills):
+        n_tasks = _n_tasks_for_skill(n_tasks_list, skill_index=skill_idx, n_skills=len(skills))
         # Two splits: train-style (easy test) and ood test
         for split, ood in (("train", False), ("ood", True)):
             ds = generate_dataset(
                 skill_id=skill_id,
-                n_tasks=int(args.n_tasks),
+                n_tasks=int(n_tasks),
                 grid_size=grid_size,
                 split=split,
                 ood=ood,

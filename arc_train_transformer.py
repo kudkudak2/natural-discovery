@@ -890,11 +890,12 @@ def main(
             b=probe_ood_test,
             label=f"probe_skill_{probe_skill}: ood train vs ood heldout",
         )
-    if eval_probe_ood is None:
-        raise FileNotFoundError(f"Missing required eval set: {data_dir / f'skill_{probe_skill}' / 'ood.json'}")
 
     # Sanity: ensure grid_size matches.
-    for ds in list(train_sets.values()) + list(eval_id_sets.values()) + list(eval_ood_sets.values()) + [eval_probe_ood]:
+    ds_to_check = list(train_sets.values()) + list(eval_id_sets.values()) + list(eval_ood_sets.values())
+    if eval_probe_ood is not None:
+        ds_to_check.append(eval_probe_ood)
+    for ds in ds_to_check:
         if ds.grid_size != grid_size:
             raise ValueError(f"Dataset grid_size={ds.grid_size} != --grid_size={grid_size}")
 
@@ -1128,18 +1129,22 @@ def main(
                     save_unsolved_tag="ood",
                 )
 
-            # Ensure the strict OOD probe is always visible.
-            acc_probe_ood = evaluate_accuracy(
-                model=model,
-                rng=rng,
-                n_tasks=int(eval_tasks),
-                device=device,
-                grid_tokens=grid_tokens,
-                dataset=eval_probe_ood,
-                eval_batch_size=int(eval_batch_size),
-            )
-            acc_probe_train = (
-                evaluate_accuracy(
+            # Optional strict OOD probe (held-out OOD test).
+            acc_probe_ood = float("nan")
+            if eval_probe_ood is not None and eval_probe_ood.n > 0:
+                acc_probe_ood = evaluate_accuracy(
+                    model=model,
+                    rng=rng,
+                    n_tasks=int(eval_tasks),
+                    device=device,
+                    grid_tokens=grid_tokens,
+                    dataset=eval_probe_ood,
+                    eval_batch_size=int(eval_batch_size),
+                )
+
+            acc_probe_train = float("nan")
+            if probe_ood_train is not None and probe_ood_train.n > 0:
+                acc_probe_train = evaluate_accuracy(
                     model=model,
                     rng=rng,
                     n_tasks=int(eval_tasks),
@@ -1148,9 +1153,6 @@ def main(
                     dataset=probe_ood_train,
                     eval_batch_size=int(eval_batch_size),
                 )
-                if probe_ood_train is not None and probe_ood_train.n > 0
-                else 0.0
-            )
 
             def fmt(acc: dict[int, float], skills: list[int]) -> str:
                 return " ".join(f"s{sid}={acc[sid]:.3f}" for sid in skills)
@@ -1158,10 +1160,10 @@ def main(
             print(f"step={step:5d} loss={loss.item():.4f}")
             print(f"  trn: {fmt(acc_train, eval_ids)}")
             print(f"  id : {fmt(acc_id, eval_ids)}")
-            print(
-                f"  ood: {fmt(acc_ood, eval_ids)}  "
-                f"(probe: s{probe_skill} train-ood={acc_probe_train:.3f} fully-heldout-ood={acc_probe_ood:.3f})"
-            )
+            ood_line = f"  ood: {fmt(acc_ood, eval_ids)}"
+            if eval_probe_ood is not None:
+                ood_line += f"  (probe: s{probe_skill} train-ood={acc_probe_train:.3f} fully-heldout-ood={acc_probe_ood:.3f})"
+            print(ood_line)
             if scheduler is not None:
                 # All param groups share the same LR schedule (we only vary weight_decay).
                 print(f"  lr : {opt.param_groups[0]['lr']:.6g}")
@@ -1211,7 +1213,8 @@ def main(
         show_one_example(model=model, dataset=eval_id_sets[2], device=device, grid_size=grid_size)
     if 3 in eval_id_sets:
         show_one_example(model=model, dataset=eval_id_sets[3], device=device, grid_size=grid_size)
-    show_one_example(model=model, dataset=eval_probe_ood, device=device, grid_size=grid_size)
+    if eval_probe_ood is not None:
+        show_one_example(model=model, dataset=eval_probe_ood, device=device, grid_size=grid_size)
 
 
 def _build_arg_parser() -> argparse.ArgumentParser:
