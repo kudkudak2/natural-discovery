@@ -711,6 +711,8 @@ def main(
     rel_pos_bias_2d: bool = True,
     demo_rel_pos_bias_2d: bool = True,
     pretrained: Optional[Path] = None,
+    gradual_unfreeze_new_layers: bool = False,
+    gradual_unfreeze_steps: int = 1000,
     train_skills: Optional[list[int]] = None,
     delay_train_skill: Optional[int] = None,
     delay_train_until_step: int = 0,
@@ -955,6 +957,11 @@ def main(
         dropout=float(dropout),
     ).to(device)
 
+    # Optional: identify params that were NOT loaded from the pretrained checkpoint (new/random-init).
+    # When enabled, we temporarily run those "new" params at lr/100 for the first K steps.
+    NEW_LAYER_LR_MULT = 0.01
+    new_param_names: set[str] = set()
+
     if pretrained is not None:
         report = load_pretrained_weights(model, pretrained)
         print(
@@ -965,6 +972,10 @@ def main(
             f" missing_after_load={report.missing_after_load}",
             flush=True,
         )
+        if bool(gradual_unfreeze_new_layers):
+            if int(gradual_unfreeze_steps) <= 0:
+                raise ValueError(f"--gradual_unfreeze_steps must be >= 1, got {gradual_unfreeze_steps}")
+            new_param_names = set(getattr(report, "missing_keys", ()))
 
     total_params, trainable_params = count_params(model)
     print(f"Model params: total={total_params:,} trainable={trainable_params:,}")
@@ -972,21 +983,56 @@ def main(
     # AdamW + fairly high weight decay. We avoid decaying biases and normalization weights.
     decay_params: list[torch.nn.Parameter] = []
     no_decay_params: list[torch.nn.Parameter] = []
+    decay_new_params: list[torch.nn.Parameter] = []
+    no_decay_new_params: list[torch.nn.Parameter] = []
     for name, p in model.named_parameters():
         if not p.requires_grad:
             continue
+        is_new = bool(new_param_names) and (name in new_param_names)
         name_l = name.lower()
-        if p.ndim == 1 or name_l.endswith(".bias") or "norm" in name_l:
-            no_decay_params.append(p)
+        is_no_decay = bool(p.ndim == 1 or name_l.endswith(".bias") or "norm" in name_l)
+        if bool(is_new):
+            if bool(is_no_decay):
+                no_decay_new_params.append(p)
+            else:
+                decay_new_params.append(p)
         else:
-            decay_params.append(p)
-    opt = optim.AdamW(
-        [
-            {"params": decay_params, "weight_decay": float(weight_decay)},
-            {"params": no_decay_params, "weight_decay": 0.0},
-        ],
-        lr=float(lr),
+            if bool(is_no_decay):
+                no_decay_params.append(p)
+            else:
+                decay_params.append(p)
+
+    use_gradual_unfreeze = bool(pretrained is not None) and bool(gradual_unfreeze_new_layers) and (
+        (len(decay_new_params) + len(no_decay_new_params)) > 0
     )
+    if use_gradual_unfreeze:
+        n_new = len(decay_new_params) + len(no_decay_new_params)
+        print(
+            f"Gradual unfreeze enabled: {n_new:,} 'new' parameters will use lr/100 for the first "
+            f"{int(gradual_unfreeze_steps)} steps.",
+            flush=True,
+        )
+        # Group order is important; we reference these indices in the training loop.
+        # 0: old/loaded decay, 1: old/loaded no_decay, 2: new decay, 3: new no_decay
+        opt = optim.AdamW(
+            [
+                {"params": decay_params, "weight_decay": float(weight_decay)},
+                {"params": no_decay_params, "weight_decay": 0.0},
+                {"params": decay_new_params, "weight_decay": float(weight_decay)},
+                {"params": no_decay_new_params, "weight_decay": 0.0},
+            ],
+            lr=float(lr),
+        )
+        old_decay_idx, old_no_decay_idx, new_decay_idx, new_no_decay_idx = 0, 1, 2, 3
+    else:
+        opt = optim.AdamW(
+            [
+                {"params": decay_params, "weight_decay": float(weight_decay)},
+                {"params": no_decay_params, "weight_decay": 0.0},
+            ],
+            lr=float(lr),
+        )
+        old_decay_idx = old_no_decay_idx = new_decay_idx = new_no_decay_idx = -1
     lr_decay = str(lr_decay).lower().strip()
     if lr_decay not in {"cosine", "none"}:
         raise ValueError(f"--lr_decay must be one of {{'cosine','none'}}, got {lr_decay!r}")
@@ -1073,6 +1119,10 @@ def main(
 
         loss = loss_fn(pred_logits.reshape(-1, VOCAB_SIZE), tgt.reshape(-1))
         loss.backward()
+        if use_gradual_unfreeze:
+            mult = float(NEW_LAYER_LR_MULT) if int(step) < int(gradual_unfreeze_steps) else 1.0
+            opt.param_groups[int(new_decay_idx)]["lr"] = float(opt.param_groups[int(old_decay_idx)]["lr"]) * float(mult)
+            opt.param_groups[int(new_no_decay_idx)]["lr"] = float(opt.param_groups[int(old_no_decay_idx)]["lr"]) * float(mult)
         opt.step()
         if scheduler is not None:
             scheduler.step()
@@ -1164,9 +1214,13 @@ def main(
             if eval_probe_ood is not None:
                 ood_line += f"  (probe: s{probe_skill} train-ood={acc_probe_train:.3f} fully-heldout-ood={acc_probe_ood:.3f})"
             print(ood_line)
-            if scheduler is not None:
-                # All param groups share the same LR schedule (we only vary weight_decay).
-                print(f"  lr : {opt.param_groups[0]['lr']:.6g}")
+            if (scheduler is not None) or use_gradual_unfreeze:
+                base_lr = float(opt.param_groups[0]["lr"])
+                if use_gradual_unfreeze:
+                    new_lr = float(opt.param_groups[2]["lr"])
+                    print(f"  lr : base={base_lr:.6g} new={new_lr:.6g}")
+                else:
+                    print(f"  lr : {base_lr:.6g}")
 
             # Track and plot learning curves
             curves.steps.append(int(step))
@@ -1232,6 +1286,21 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         default=None,
         help="Optional path to pretrained weights (.pt checkpoint with `model` or a raw state_dict). "
         "Weights are loaded permissively (matching names+shapes); new layers stay randomly initialized.",
+    )
+    p.add_argument(
+        "--gradual_unfreeze_new_layers",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "If set AND --pretrained is provided, parameters not loaded from the pretrained checkpoint "
+            "(i.e., new/random-init layers) will use lr/100 for the first --gradual_unfreeze_steps steps."
+        ),
+    )
+    p.add_argument(
+        "--gradual_unfreeze_steps",
+        type=int,
+        default=1000,
+        help="Number of initial training steps to apply lr/100 to new/random-init parameters (only if --gradual_unfreeze_new_layers).",
     )
     p.add_argument(
         "--tasks",
@@ -1563,6 +1632,8 @@ def cli_main(argv: Optional[list[str]] = None) -> None:
         rel_pos_bias_2d=bool(args.rel_pos_bias_2d),
         demo_rel_pos_bias_2d=bool(args.demo_rel_pos_bias_2d),
         pretrained=Path(args.pretrained) if args.pretrained is not None else None,
+        gradual_unfreeze_new_layers=bool(args.gradual_unfreeze_new_layers),
+        gradual_unfreeze_steps=int(args.gradual_unfreeze_steps),
         train_skills=[int(s) for s in train_skills] if train_skills is not None else None,
         delay_train_skills=[int(s) for s in args.delay_train_skills] if args.delay_train_skills is not None else None,
         delay_train_until_steps=[int(s) for s in args.delay_train_until_steps] if args.delay_train_until_steps is not None else None,

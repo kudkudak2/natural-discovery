@@ -256,6 +256,169 @@ def apply_right_gravity(grid: np.ndarray) -> np.ndarray:
     return new_grid
 
 
+def _rigid_translate_nonzero(grid: np.ndarray, *, dr: int, dc: int) -> np.ndarray:
+    """
+    Rigidly translate all non-zero cells by (dr,dc), clipping to bounds.
+
+    Intended for "single rigid object" puzzles (no collisions/overlaps).
+    """
+    h, w = int(grid.shape[0]), int(grid.shape[1])
+    out = np.zeros_like(grid)
+    rs, cs = np.nonzero(grid)
+    for r, c in zip(rs.tolist(), cs.tolist()):
+        rr = int(r) + int(dr)
+        cc = int(c) + int(dc)
+        if 0 <= rr < h and 0 <= cc < w:
+            out[int(rr), int(cc)] = int(grid[int(r), int(c)])
+    return out
+
+
+def _rigid_slide_to_wall(grid: np.ndarray, *, direction: str) -> np.ndarray:
+    """Rigidly slide a single object to the chosen wall (up/down/left/right)."""
+    h, w = int(grid.shape[0]), int(grid.shape[1])
+    rs, cs = np.nonzero(grid)
+    if int(rs.size) == 0:
+        return np.zeros_like(grid)
+    r0, r1 = int(rs.min()), int(rs.max())
+    c0, c1 = int(cs.min()), int(cs.max())
+    d = str(direction)
+    if d == "up":
+        return _rigid_translate_nonzero(grid, dr=-int(r0), dc=0)
+    if d == "down":
+        return _rigid_translate_nonzero(grid, dr=int((h - 1) - r1), dc=0)
+    if d == "left":
+        return _rigid_translate_nonzero(grid, dr=0, dc=-int(c0))
+    if d == "right":
+        return _rigid_translate_nonzero(grid, dr=0, dc=int((w - 1) - c1))
+    raise ValueError(f"Unknown direction={d!r}; expected one of up/down/left/right")
+
+
+def _rotate_offsets_clockwise(offsets: Sequence[tuple[int, int]], *, degrees: int) -> list[tuple[int, int]]:
+    """Rotate (dr,dc) offsets around the origin by degrees ∈ {0,90,180,270} clockwise."""
+    deg = int(degrees) % 360
+    if deg == 0:
+        return [(int(dr), int(dc)) for (dr, dc) in offsets]
+    if deg == 90:
+        return [(int(dc), -int(dr)) for (dr, dc) in offsets]
+    if deg == 180:
+        return [(-int(dr), -int(dc)) for (dr, dc) in offsets]
+    if deg == 270:
+        return [(-int(dc), int(dr)) for (dr, dc) in offsets]
+    raise ValueError(f"Unsupported rotation degrees={degrees}; expected 0/90/180/270")
+
+
+def _rotate_grid_one_component_clockwise(grid: np.ndarray, *, degrees: int) -> np.ndarray:
+    """
+    Rotate a single connected component (all non-zero) around its bbox-center.
+
+    Note: This assumes the component's true "design center" matches the bbox center, which is
+    guaranteed by our generators for rotation-based skills (we only use odd-span centered shapes).
+    """
+    rs, cs = np.nonzero(grid)
+    if int(rs.size) == 0:
+        return np.zeros_like(grid)
+    r0, r1 = int(rs.min()), int(rs.max())
+    c0, c1 = int(cs.min()), int(cs.max())
+    cr = (r0 + r1) // 2
+    cc = (c0 + c1) // 2
+
+    deg = int(degrees) % 360
+    out = np.zeros_like(grid)
+    h, w = int(grid.shape[0]), int(grid.shape[1])
+    for r, c in zip(rs.tolist(), cs.tolist()):
+        dr = int(r) - int(cr)
+        dc = int(c) - int(cc)
+        if deg == 0:
+            ndr, ndc = dr, dc
+        elif deg == 90:
+            ndr, ndc = dc, -dr
+        elif deg == 180:
+            ndr, ndc = -dr, -dc
+        elif deg == 270:
+            ndr, ndc = -dc, dr
+        else:
+            raise ValueError(f"Unsupported rotation degrees={degrees}; expected 0/90/180/270")
+        rr = int(cr) + int(ndr)
+        cc2 = int(cc) + int(ndc)
+        if 0 <= rr < h and 0 <= cc2 < w:
+            out[int(rr), int(cc2)] = int(grid[int(r), int(c)])
+    return out
+
+
+def _shape_signature(comp: Sequence[tuple[int, int]]) -> tuple[tuple[int, int], ...]:
+    """
+    Canonical translation-invariant signature for a component:
+    normalize coordinates so the min row/col becomes (0,0), then sort.
+    """
+    rs = [int(r) for r, _c in comp]
+    cs = [int(c) for _r, c in comp]
+    r0, c0 = int(min(rs)), int(min(cs))
+    norm = sorted((int(r) - int(r0), int(c) - int(c0)) for r, c in comp)
+    return tuple((int(r), int(c)) for r, c in norm)
+
+
+def _try_place_offsets_no_touch(
+    grid: np.ndarray,
+    *,
+    offsets: Sequence[tuple[int, int]],
+    color: int,
+    rng: np.random.Generator,
+    connectivity: int = 4,
+    buffer: int = 1,
+    max_tries: int = 400,
+) -> Optional[tuple[int, int]]:
+    """
+    Place a shape described by offsets (relative to a center) into empty cells, with a buffer
+    zone to keep components distinct.
+
+    Returns chosen (center_r, center_c) if placed, else None.
+    """
+    _ = connectivity  # buffer enforcement is Chebyshev-based; components are separated either way.
+    size = int(grid.shape[0])
+    (r_lo, r_hi), (c_lo, c_hi) = _safe_center_range_for_offsets(size=size, offsets=offsets)
+    if int(r_hi) < int(r_lo) or int(c_hi) < int(c_lo):
+        return None
+
+    b = max(0, int(buffer))
+    for _ in range(int(max_tries)):
+        r = int(rng.integers(int(r_lo), int(r_hi) + 1))
+        c = int(rng.integers(int(c_lo), int(c_hi) + 1))
+
+        # Compute all cells this shape would occupy.
+        cells: list[tuple[int, int]] = []
+        ok = True
+        for dr, dc in offsets:
+            rr = int(r) + int(dr)
+            cc = int(c) + int(dc)
+            if not (0 <= rr < size and 0 <= cc < size):
+                ok = False
+                break
+            if int(grid[rr, cc]) != 0:
+                ok = False
+                break
+            cells.append((int(rr), int(cc)))
+        if not ok or not cells:
+            continue
+
+        # Buffer check (Chebyshev): keep (b) cells away from any existing non-zero cell.
+        if b > 0:
+            for rr, cc in cells:
+                rr0 = max(0, int(rr) - b)
+                rr1 = min(size - 1, int(rr) + b)
+                cc0 = max(0, int(cc) - b)
+                cc1 = min(size - 1, int(cc) + b)
+                if bool(np.any(grid[rr0 : rr1 + 1, cc0 : cc1 + 1] != 0)):
+                    ok = False
+                    break
+        if not ok:
+            continue
+
+        for rr, cc in cells:
+            grid[int(rr), int(cc)] = int(color)
+        return (int(r), int(c))
+    return None
+
+
 class Skill1Gravity(Puzzle):
     skill_id = 1
     name = "gravity"
@@ -1912,6 +2075,212 @@ class Skill16ExplodeUniqueVariants(Puzzle):
         return out
 
 
+class Skill28ExplodeUniqueVariants(Puzzle):
+    """
+    Newer/strengthened generator version of Skill16.
+
+    Still uses Skill14-style uniqueness detection (by connected components) and Skill15-style
+    explosion kernels, but generates harder inputs (often multi-pixel unique components and
+    distractors with matched pixel counts), making component reasoning necessary.
+    """
+
+    skill_id = 28
+    name = "explode_unique_variants_v2"
+    uses_rule_color = False
+
+    def __init__(
+        self,
+        *,
+        size: int = 5,
+        colors: Sequence[int] = (1, 2, 3, 4),
+        ood_spec: OODSpec = OODSpec(),
+        shrink_perturb: Optional[ShrinkPerturbSpec] = None,
+        rng: Optional[np.random.Generator] = None,
+    ) -> None:
+        super().__init__(size=size, colors=colors, ood_spec=ood_spec, shrink_perturb=shrink_perturb, rng=rng)
+        modes = [
+            "square3",
+            "line3_h",
+            "line3_v",
+            "ray3_right",
+            "ray3_left",
+            "ray3_down",
+            "ray3_up",
+            "diag3_main",
+            "diag3_anti",
+            "cross3",
+            "square5",
+            "line5_h",
+            "line5_v",
+            "diag5_main",
+            "diag5_anti",
+            "cross5",
+            "diamond5",
+            "ring5_square",
+        ]
+        self._explosion_mode = str(self.rng.choice(np.asarray(modes)))
+        self._offsets = _explosion_offsets_extended(self._explosion_mode)
+
+    @property
+    def variant_id(self) -> Optional[str]:
+        return str(self._explosion_mode)
+
+    def variant_params(self) -> dict[str, object]:
+        return {
+            "explosion_mode": str(self._explosion_mode),
+            "offsets": [(int(dr), int(dc)) for (dr, dc) in self._offsets],
+        }
+
+    def make_input(self, *, ood: bool) -> np.ndarray:
+        size = int(self.size)
+
+        # Strengthened generator:
+        # - Unique color: exactly ONE connected component, often multi-pixel.
+        # - Each distractor color: >=2 disconnected components.
+        # - Match total pixel count per color to the unique component's pixel count,
+        #   so frequency-based shortcuts don't solve the task.
+        unique_shapes: list[list[tuple[int, int]]] = [
+            [(0, 0)],
+            [(0, -1), (0, 0), (0, 1)],
+            [(-1, 0), (0, 0), (1, 0)],
+            [(-1, -1), (-1, 0), (0, 0), (1, 0)],
+            [(-1, -1), (-1, 0), (0, 0), (1, 0), (1, 1)],
+        ]
+
+        rect_by_area: dict[int, list[tuple[int, int]]] = {}
+        for h in range(1, size + 1):
+            for w in range(1, size + 1):
+                rect_by_area.setdefault(int(h * w), []).append((int(h), int(w)))
+
+        def partition_area(total: int, k: int) -> list[int]:
+            t = int(total)
+            kk = max(1, int(k))
+            if t < kk:
+                return [int(t)]
+            parts = [1] * kk
+            remain = int(t - kk)
+            for _ in range(remain):
+                parts[int(self.rng.integers(0, kk))] += 1
+            return [int(p) for p in parts]
+
+        def explosion_safe_offsets(shape_offsets: Sequence[tuple[int, int]]) -> list[tuple[int, int]]:
+            # Offsets that must fit so explosions for every shape pixel do not clip.
+            out: set[tuple[int, int]] = set()
+            for sr, sc in shape_offsets:
+                for er, ec in self._offsets:
+                    out.add((int(sr) + int(er), int(sc) + int(ec)))
+            return sorted(out)
+
+        for _attempt in range(450):
+            grid = self.blank()
+
+            # 1) Pick the unique color and distractor colors.
+            unique_color = int(self.rng.choice(self.colors))
+            distractors = [int(c) for c in self.colors if int(c) != unique_color]
+            if not distractors:
+                distractors = [c for c in range(1, 5) if int(c) != unique_color]
+            if not distractors:
+                continue
+
+            max_d = min(len(distractors), 3 if not ood else 4)
+            n_distractor_colors = int(self.rng.integers(1, max_d + 1))
+            distractor_colors = (
+                self.rng.choice(np.asarray(distractors), size=n_distractor_colors, replace=False).tolist()
+            )
+
+            # 2) Place UNIQUE object (connected, often >1 pixel), safe for exploding every pixel.
+            p_single = 0.15 if bool(ood) else 0.25
+            if float(self.rng.random()) < float(p_single):
+                shape_offsets = unique_shapes[0]
+            else:
+                shape_offsets = unique_shapes[int(self.rng.integers(1, len(unique_shapes)))]
+            unique_area = int(len(shape_offsets))
+
+            safe = explosion_safe_offsets(shape_offsets)
+            (r_lo, r_hi), (c_lo, c_hi) = _safe_center_range_for_offsets(size=size, offsets=safe)
+            if int(r_hi) < int(r_lo) or int(c_hi) < int(c_lo):
+                continue
+            ur = int(self.rng.integers(int(r_lo), int(r_hi) + 1))
+            uc = int(self.rng.integers(int(c_lo), int(c_hi) + 1))
+            ok_unique = True
+            for dr, dc in shape_offsets:
+                rr = int(ur) + int(dr)
+                cc = int(uc) + int(dc)
+                if int(grid[rr, cc]) != 0:
+                    ok_unique = False
+                    break
+                grid[rr, cc] = int(unique_color)
+            if not ok_unique:
+                continue
+
+            # 3) Place distractor colors as rectangles:
+            # each distractor color has >=2 components and total area == unique_area.
+            for d_color in distractor_colors:
+                n_comp = 2
+                if bool(ood) and int(unique_area) >= 3 and bool(self.rng.integers(0, 2)):
+                    n_comp = 3
+                parts = partition_area(int(unique_area), int(n_comp))
+                ok_d = True
+                for a in parts:
+                    choices = rect_by_area.get(int(a), [])
+                    if not choices:
+                        ok_d = False
+                        break
+                    h, w = choices[int(self.rng.integers(0, len(choices)))]
+                    placed = _try_place_solid_rect_no_touch(
+                        grid,
+                        color=int(d_color),
+                        h=int(h),
+                        w=int(w),
+                        connectivity=4,
+                        rng=self.rng,
+                        max_tries=700,
+                    )
+                    if placed is None:
+                        ok_d = False
+                        break
+                if not ok_d:
+                    break
+
+            # Validate uniqueness-by-components.
+            counts = _component_counts_by_color(grid)
+            if int(counts.get(unique_color, 0)) != 1:
+                continue
+            if any(int(counts.get(int(dc), 0)) < 2 for dc in distractor_colors):
+                continue
+            singles = [c for c, k in counts.items() if int(k) == 1]
+            if len(singles) != 1:
+                continue
+            return grid
+
+        # Fallback: still valid uniqueness-by-components (rectangles), even if not pixel-count-colliding.
+        grid, _unique_color = _make_unique_rects_grid(
+            size=size,
+            colors=self.colors,
+            rng=self.rng,
+            ood=bool(ood),
+            rect_sizes=[(1, 1), (1, 2), (2, 1), (2, 2), (1, 3), (3, 1)],
+            unique_components=1,
+            connectivity=4,
+        )
+        return grid
+
+    def apply(self, grid: np.ndarray, rule_color: Optional[int]) -> np.ndarray:
+        _ = rule_color
+        counts = _component_counts_by_color(grid)
+        unique_colors = [c for c, k in counts.items() if int(k) == 1]
+        if not unique_colors:
+            return np.zeros_like(grid)
+        unique_c = int(sorted(unique_colors)[0])
+        mask = grid == unique_c
+
+        out = np.zeros_like(grid)
+        rs, cs = np.nonzero(mask)
+        for r, c in zip(rs.tolist(), cs.tolist()):
+            _apply_explosion(out=out, row=int(r), col=int(c), color=unique_c, offsets=self._offsets)
+        return out
+
+
 class Skill17ComponentLabeling(Puzzle):
     """
     Component labeling skill (simplified): recolor each blob by its CENTER pixel color.
@@ -2960,6 +3329,395 @@ class Skill23ShapePrinterWithOffset(Puzzle):
         return demos, test_pair, None
 
 
+class Skill24GravityOneObjectRigid(Puzzle):
+    """
+    Skill24: "gravity 1 object" (rigid).
+
+    Input: exactly one 4-connected object (a centered shape mask) on blank background.
+    Output: rigidly translate the object in the chosen direction until it hits the wall.
+    Per-task variant chooses BOTH the shape (kind+span) and the direction.
+    """
+
+    skill_id = 24
+    name = "gravity_1_object_rigid"
+    uses_rule_color = False
+
+    def __init__(
+        self,
+        *,
+        size: int = 5,
+        colors: Sequence[int] = (1, 2, 3, 4),
+        ood_spec: OODSpec = OODSpec(),
+        shrink_perturb: Optional[ShrinkPerturbSpec] = None,
+        rng: Optional[np.random.Generator] = None,
+    ) -> None:
+        super().__init__(size=size, colors=colors, ood_spec=ood_spec, shrink_perturb=shrink_perturb, rng=rng)
+        self._direction = str(self.rng.choice(np.asarray(["up", "down", "left", "right"])))
+        # Use only 4-connected shape families.
+        self._shape_kind = str(self.rng.choice(np.asarray(["square", "cross", "diamond", "box"])))
+        max_span = min(5, int(self.size))
+        span_choices = [s for s in (2, 3, 4, 5) if int(s) <= int(max_span)]
+        if not span_choices:
+            span_choices = [min(2, int(max_span))]
+        self._span = int(self.rng.choice(np.asarray(span_choices)))
+        self._color = int(self.rng.choice(np.asarray(self.colors))) if len(self.colors) > 0 else 1
+
+        self._offsets = _mask_offsets(_shape_mask(self._shape_kind, span=int(self._span)))
+
+    @property
+    def variant_id(self) -> Optional[str]:
+        return f"{self._direction}_{self._shape_kind}{int(self._span)}"
+
+    def variant_params(self) -> dict[str, object]:
+        return {"direction": str(self._direction), "shape": {"kind": str(self._shape_kind), "span": int(self._span)}}
+
+    def make_input(self, *, ood: bool) -> np.ndarray:
+        _ = ood
+        size = int(self.size)
+        grid = self.blank()
+
+        # Choose a center so the shape fits AND is not already touching the target wall.
+        (r_lo, r_hi), (c_lo, c_hi) = _safe_center_range_for_offsets(size=size, offsets=self._offsets)
+        for _ in range(600):
+            if int(r_hi) < int(r_lo) or int(c_hi) < int(c_lo):
+                break
+            r = int(self.rng.integers(int(r_lo), int(r_hi) + 1))
+            c = int(self.rng.integers(int(c_lo), int(c_hi) + 1))
+            _apply_centered_shape(grid, center_r=int(r), center_c=int(c), offsets=self._offsets, color=int(self._color))
+            slid = _rigid_slide_to_wall(grid, direction=str(self._direction))
+            # Reject degenerate no-move cases.
+            if bool(np.array_equal(slid, grid)):
+                grid[:, :] = 0
+                continue
+            return grid
+
+        # Fallback: center placement (may be degenerate but still valid).
+        grid = self.blank()
+        (r_lo, r_hi), (c_lo, c_hi) = _safe_center_range_for_offsets(size=size, offsets=self._offsets)
+        r = int((r_lo + r_hi) // 2) if int(r_hi) >= int(r_lo) else int(size // 2)
+        c = int((c_lo + c_hi) // 2) if int(c_hi) >= int(c_lo) else int(size // 2)
+        _apply_centered_shape(grid, center_r=int(r), center_c=int(c), offsets=self._offsets, color=int(self._color))
+        return grid
+
+    def apply(self, grid: np.ndarray, rule_color: Optional[int]) -> np.ndarray:
+        _ = rule_color
+        return _rigid_slide_to_wall(grid, direction=str(self._direction))
+
+
+class Skill25RotateOneObject(Puzzle):
+    """
+    Skill25: rotate one object.
+
+    Input: exactly one centered, odd-span shape.
+    Output: the same object rotated clockwise by 90/180/270 degrees (per-task variant).
+    """
+
+    skill_id = 25
+    name = "rotate_one_object"
+    uses_rule_color = False
+
+    def __init__(
+        self,
+        *,
+        size: int = 5,
+        colors: Sequence[int] = (1, 2, 3, 4),
+        ood_spec: OODSpec = OODSpec(),
+        shrink_perturb: Optional[ShrinkPerturbSpec] = None,
+        rng: Optional[np.random.Generator] = None,
+    ) -> None:
+        super().__init__(size=size, colors=colors, ood_spec=ood_spec, shrink_perturb=shrink_perturb, rng=rng)
+        self._degrees = int(self.rng.choice(np.asarray([90, 180, 270])))
+        self._shape_kind = str(self.rng.choice(np.asarray(["square", "cross", "diamond", "box"])))
+        max_span = min(5, int(self.size))
+        span_choices = [s for s in (3, 5) if int(s) <= int(max_span)]
+        if not span_choices:
+            span_choices = [3] if int(max_span) >= 3 else [1]
+        self._span = int(self.rng.choice(np.asarray(span_choices)))
+        self._color = int(self.rng.choice(np.asarray(self.colors))) if len(self.colors) > 0 else 1
+
+        self._offsets = _mask_offsets(_shape_mask(self._shape_kind, span=int(self._span)))
+        self._rot_offsets = _rotate_offsets_clockwise(self._offsets, degrees=int(self._degrees))
+
+    @property
+    def variant_id(self) -> Optional[str]:
+        return f"{int(self._degrees)}_{self._shape_kind}{int(self._span)}"
+
+    def variant_params(self) -> dict[str, object]:
+        return {
+            "degrees_clockwise": int(self._degrees),
+            "shape": {"kind": str(self._shape_kind), "span": int(self._span)},
+        }
+
+    def make_input(self, *, ood: bool) -> np.ndarray:
+        _ = ood
+        size = int(self.size)
+        grid = self.blank()
+
+        (r0_lo, r0_hi), (c0_lo, c0_hi) = _safe_center_range_for_offsets(size=size, offsets=self._offsets)
+        (r1_lo, r1_hi), (c1_lo, c1_hi) = _safe_center_range_for_offsets(size=size, offsets=self._rot_offsets)
+        r_lo = max(int(r0_lo), int(r1_lo))
+        r_hi = min(int(r0_hi), int(r1_hi))
+        c_lo = max(int(c0_lo), int(c1_lo))
+        c_hi = min(int(c0_hi), int(c1_hi))
+        if int(r_hi) < int(r_lo) or int(c_hi) < int(c_lo):
+            r = int(size // 2)
+            c = int(size // 2)
+        else:
+            r = int(self.rng.integers(int(r_lo), int(r_hi) + 1))
+            c = int(self.rng.integers(int(c_lo), int(c_hi) + 1))
+        _apply_centered_shape(grid, center_r=int(r), center_c=int(c), offsets=self._offsets, color=int(self._color))
+
+        # Break rotational symmetry with a deterministic internal marker pixel.
+        # We use the top-leftmost pixel of the object bbox and recolor it.
+        rs, cs = np.nonzero(grid)
+        if int(rs.size) > 0:
+            pts = list(zip(rs.tolist(), cs.tolist()))
+            mr, mc = min(pts)
+            grid[int(mr), int(mc)] = int(_ray_color_from_source(int(self._color)))
+        return grid
+
+    def apply(self, grid: np.ndarray, rule_color: Optional[int]) -> np.ndarray:
+        _ = rule_color
+        return _rotate_grid_one_component_clockwise(grid, degrees=int(self._degrees))
+
+
+class Skill26RotateThenRigidGravity(Puzzle):
+    """
+    Skill26: rotate & follow gravity (rigid).
+
+    Input: one centered, odd-span shape.
+    Output: rotate clockwise by 90/180/270 degrees, then rigidly slide to the chosen wall.
+    """
+
+    skill_id = 26
+    name = "rotate_then_rigid_gravity"
+    uses_rule_color = False
+
+    def __init__(
+        self,
+        *,
+        size: int = 5,
+        colors: Sequence[int] = (1, 2, 3, 4),
+        ood_spec: OODSpec = OODSpec(),
+        shrink_perturb: Optional[ShrinkPerturbSpec] = None,
+        rng: Optional[np.random.Generator] = None,
+    ) -> None:
+        super().__init__(size=size, colors=colors, ood_spec=ood_spec, shrink_perturb=shrink_perturb, rng=rng)
+        self._degrees = int(self.rng.choice(np.asarray([90, 180, 270])))
+        self._direction = str(self.rng.choice(np.asarray(["up", "down", "left", "right"])))
+        self._shape_kind = str(self.rng.choice(np.asarray(["square", "cross", "diamond", "box"])))
+        max_span = min(5, int(self.size))
+        span_choices = [s for s in (3, 5) if int(s) <= int(max_span)]
+        if not span_choices:
+            span_choices = [3] if int(max_span) >= 3 else [1]
+        self._span = int(self.rng.choice(np.asarray(span_choices)))
+        self._color = int(self.rng.choice(np.asarray(self.colors))) if len(self.colors) > 0 else 1
+
+        self._offsets = _mask_offsets(_shape_mask(self._shape_kind, span=int(self._span)))
+        self._rot_offsets = _rotate_offsets_clockwise(self._offsets, degrees=int(self._degrees))
+
+    @property
+    def variant_id(self) -> Optional[str]:
+        return f"{self._direction}_{int(self._degrees)}_{self._shape_kind}{int(self._span)}"
+
+    def variant_params(self) -> dict[str, object]:
+        return {
+            "direction": str(self._direction),
+            "degrees_clockwise": int(self._degrees),
+            "shape": {"kind": str(self._shape_kind), "span": int(self._span)},
+        }
+
+    def make_input(self, *, ood: bool) -> np.ndarray:
+        _ = ood
+        size = int(self.size)
+        for _ in range(600):
+            grid = self.blank()
+            (r_lo, r_hi), (c_lo, c_hi) = _safe_center_range_for_offsets(size=size, offsets=self._rot_offsets)
+            if int(r_hi) < int(r_lo) or int(c_hi) < int(c_lo):
+                r = int(size // 2)
+                c = int(size // 2)
+            else:
+                r = int(self.rng.integers(int(r_lo), int(r_hi) + 1))
+                c = int(self.rng.integers(int(c_lo), int(c_hi) + 1))
+            _apply_centered_shape(grid, center_r=int(r), center_c=int(c), offsets=self._offsets, color=int(self._color))
+
+            # Same marker trick as Skill25 (ensures rotation changes the grid).
+            rs, cs = np.nonzero(grid)
+            if int(rs.size) > 0:
+                pts = list(zip(rs.tolist(), cs.tolist()))
+                mr, mc = min(pts)
+                grid[int(mr), int(mc)] = int(_ray_color_from_source(int(self._color)))
+
+            # Ensure that AFTER rotation, sliding actually changes something.
+            rotated = _rotate_grid_one_component_clockwise(grid, degrees=int(self._degrees))
+            slid = _rigid_slide_to_wall(rotated, direction=str(self._direction))
+            if bool(np.array_equal(slid, rotated)):
+                continue
+            return grid
+
+        # Fallback: accept any placement.
+        grid = self.blank()
+        (r_lo, r_hi), (c_lo, c_hi) = _safe_center_range_for_offsets(size=size, offsets=self._offsets)
+        r = int((r_lo + r_hi) // 2) if int(r_hi) >= int(r_lo) else int(size // 2)
+        c = int((c_lo + c_hi) // 2) if int(c_hi) >= int(c_lo) else int(size // 2)
+        _apply_centered_shape(grid, center_r=int(r), center_c=int(c), offsets=self._offsets, color=int(self._color))
+        return grid
+
+    def apply(self, grid: np.ndarray, rule_color: Optional[int]) -> np.ndarray:
+        _ = rule_color
+        rotated = _rotate_grid_one_component_clockwise(grid, degrees=int(self._degrees))
+        return _rigid_slide_to_wall(rotated, direction=str(self._direction))
+
+
+class Skill27UniqueShapeRotateFall(Puzzle):
+    """
+    Skill27 (hard): unique shape selection + rotate + fall.
+
+    Strengthened composition target:
+
+    Input: multiple 4-connected objects. Exactly one COLOR appears in exactly one connected component;
+           all other present colors appear in >=2 disconnected components each.
+    Output:
+      1) keep ONLY the unique-color component
+      2) apply a per-task "shape change" kernel (like Skill16's explosion kernel) to that component
+      3) rigidly slide the result DOWN until it hits the bottom wall
+    """
+
+    skill_id = 27
+    name = "unique_shape_rotate_fall"
+    uses_rule_color = False
+
+    def __init__(
+        self,
+        *,
+        size: int = 5,
+        colors: Sequence[int] = (1, 2, 3, 4),
+        ood_spec: OODSpec = OODSpec(),
+        shrink_perturb: Optional[ShrinkPerturbSpec] = None,
+        rng: Optional[np.random.Generator] = None,
+    ) -> None:
+        super().__init__(size=size, colors=colors, ood_spec=ood_spec, shrink_perturb=shrink_perturb, rng=rng)
+        # For small grids (and especially 6x6), 5-sized kernels are visually confusing.
+        # Restrict to "size 1" (identity) and "size 3" kernels only.
+        modes = [
+            "point1",
+            "square3",
+            "line3_h",
+            "line3_v",
+            "ray3_right",
+            "ray3_left",
+            "ray3_down",
+            "ray3_up",
+            "diag3_main",
+            "diag3_anti",
+            "cross3",
+        ]
+        self._explosion_mode = str(self.rng.choice(np.asarray(modes)))
+        if self._explosion_mode == "point1":
+            self._kernel_offsets = [(0, 0)]
+        else:
+            self._kernel_offsets = _explosion_offsets_extended(self._explosion_mode)
+
+        # Keep shapes small + placeable on 5x5.
+        self._rect_sizes: list[tuple[int, int]] = [(1, 3), (3, 1), (1, 2), (2, 1), (2, 2)]
+        self._rect_sizes = [
+            (int(h), int(w))
+            for (h, w) in self._rect_sizes
+            if int(h) <= int(self.size) and int(w) <= int(self.size)
+        ]
+        if not self._rect_sizes:
+            self._rect_sizes = [(1, 1)]
+
+    @property
+    def variant_id(self) -> Optional[str]:
+        return f"{self._explosion_mode}_down"
+
+    def variant_params(self) -> dict[str, object]:
+        return {
+            "shape_change_kernel": str(self._explosion_mode),
+            "kernel_offsets": [(int(dr), int(dc)) for (dr, dc) in self._kernel_offsets],
+            "fall_direction": "down",
+        }
+
+    def _kernel_fits_bbox(self, *, r0: int, r1: int, c0: int, c1: int) -> bool:
+        """Return True if applying the kernel to any pixel in bbox won't clip."""
+        size = int(self.size)
+        drs = [int(dr) for dr, _dc in self._kernel_offsets] if self._kernel_offsets else [0]
+        dcs = [int(dc) for _dr, dc in self._kernel_offsets] if self._kernel_offsets else [0]
+        min_dr, max_dr = int(min(drs)), int(max(drs))
+        min_dc, max_dc = int(min(dcs)), int(max(dcs))
+        return (
+            int(r0) + int(min_dr) >= 0
+            and int(r1) + int(max_dr) < int(size)
+            and int(c0) + int(min_dc) >= 0
+            and int(c1) + int(max_dc) < int(size)
+        )
+
+    def make_input(self, *, ood: bool) -> np.ndarray:
+        size = int(self.size)
+        for _attempt in range(800):
+            grid, unique_color = _make_unique_rects_grid(
+                size=size,
+                colors=self.colors,
+                rng=self.rng,
+                ood=bool(ood),
+                rect_sizes=self._rect_sizes,
+                unique_components=1,
+                connectivity=4,
+            )
+
+            uniq_mask = grid == int(unique_color)
+            if not bool(np.any(uniq_mask)):
+                continue
+
+            rs, cs = np.nonzero(uniq_mask)
+            r0, r1 = int(rs.min()), int(rs.max())
+            c0, c1 = int(cs.min()), int(cs.max())
+            if not self._kernel_fits_bbox(r0=int(r0), r1=int(r1), c0=int(c0), c1=int(c1)):
+                continue
+
+            # Reject degenerate cases where (kernel -> fall) doesn't change the unique component.
+            uniq = np.zeros_like(grid)
+            uniq[uniq_mask] = int(unique_color)
+            changed = np.zeros_like(grid)
+            for r, c in zip(rs.tolist(), cs.tolist()):
+                _apply_explosion(out=changed, row=int(r), col=int(c), color=int(unique_color), offsets=self._kernel_offsets)
+            fallen = _rigid_slide_to_wall(changed, direction="down")
+            if bool(np.array_equal(fallen, uniq)):
+                continue
+            return grid
+
+        # Last resort: still return a valid uniqueness-by-components grid.
+        grid, _unique_color = _make_unique_rects_grid(
+            size=size,
+            colors=self.colors,
+            rng=self.rng,
+            ood=bool(ood),
+            rect_sizes=self._rect_sizes,
+            unique_components=1,
+            connectivity=4,
+        )
+        return grid
+
+    def apply(self, grid: np.ndarray, rule_color: Optional[int]) -> np.ndarray:
+        _ = rule_color
+        counts = _component_counts_by_color(grid, connectivity=4)
+        unique_colors = [c for c, k in counts.items() if int(k) == 1]
+        if int(len(unique_colors)) != 1:
+            return np.zeros_like(grid)
+        unique_c = int(unique_colors[0])
+
+        mask = grid == unique_c
+        rs, cs = np.nonzero(mask)
+        if int(rs.size) == 0:
+            return np.zeros_like(grid)
+
+        changed = np.zeros_like(grid)
+        for r, c in zip(rs.tolist(), cs.tolist()):
+            _apply_explosion(out=changed, row=int(r), col=int(c), color=int(unique_c), offsets=self._kernel_offsets)
+        return _rigid_slide_to_wall(changed, direction="down")
+
+
 # --- Update the Factory ---
 
 def build_puzzle(
@@ -3002,6 +3760,8 @@ def build_puzzle(
         return Skill15PixelExplosionVariants(size=size, shrink_perturb=shrink_perturb, rng=rng)
     if skill_id == 16:
         return Skill16ExplodeUniqueVariants(size=size, shrink_perturb=shrink_perturb, rng=rng)
+    if skill_id == 28:
+        return Skill28ExplodeUniqueVariants(size=size, shrink_perturb=shrink_perturb, rng=rng)
     if skill_id == 17:
         return Skill17ComponentLabeling(size=size, shrink_perturb=shrink_perturb, rng=rng)
     if skill_id == 18:
@@ -3016,6 +3776,14 @@ def build_puzzle(
         return Skill22ShapePrinter(size=size, shrink_perturb=shrink_perturb, rng=rng)
     if skill_id == 23:
         return Skill23ShapePrinterWithOffset(size=size, shrink_perturb=shrink_perturb, rng=rng)
+    if skill_id == 24:
+        return Skill24GravityOneObjectRigid(size=size, shrink_perturb=shrink_perturb, rng=rng)
+    if skill_id == 25:
+        return Skill25RotateOneObject(size=size, shrink_perturb=shrink_perturb, rng=rng)
+    if skill_id == 26:
+        return Skill26RotateThenRigidGravity(size=size, shrink_perturb=shrink_perturb, rng=rng)
+    if skill_id == 27:
+        return Skill27UniqueShapeRotateFall(size=size, shrink_perturb=shrink_perturb, rng=rng)
         
     raise ValueError(f"Unknown skill_id={skill_id}")
 

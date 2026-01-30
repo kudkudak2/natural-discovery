@@ -14,6 +14,10 @@ class PretrainedLoadReport:
     skipped_unexpected: int
     skipped_shape_mismatch: int
     missing_after_load: int
+    # Optional details (names), for tasks like per-parameter LR control.
+    skipped_unexpected_keys: tuple[str, ...] = ()
+    skipped_shape_mismatch_keys: tuple[str, ...] = ()
+    missing_keys: tuple[str, ...] = ()
 
 
 def _extract_state_dict(obj: Any) -> Mapping[str, torch.Tensor]:
@@ -69,20 +73,28 @@ def load_pretrained_weights(
     filtered: dict[str, torch.Tensor] = {}
     skipped_unexpected = 0
     skipped_shape_mismatch = 0
+    skipped_unexpected_keys: list[str] = []
+    skipped_shape_mismatch_keys: list[str] = []
     for k, v in sd.items():
         if k not in model_sd:
             skipped_unexpected += 1
+            skipped_unexpected_keys.append(str(k))
             continue
         if tuple(model_sd[k].shape) != tuple(v.shape):
             skipped_shape_mismatch += 1
+            skipped_shape_mismatch_keys.append(str(k))
             continue
         filtered[k] = v
 
     incompatible = model.load_state_dict(filtered, strict=False)
-    missing_after_load = len(list(getattr(incompatible, "missing_keys", [])))
+    missing_keys = tuple(str(k) for k in list(getattr(incompatible, "missing_keys", [])))
+    missing_after_load = len(missing_keys)
     return PretrainedLoadReport(
         loaded=len(filtered),
         skipped_unexpected=int(skipped_unexpected),
         skipped_shape_mismatch=int(skipped_shape_mismatch),
         missing_after_load=int(missing_after_load),
+        skipped_unexpected_keys=tuple(skipped_unexpected_keys),
+        skipped_shape_mismatch_keys=tuple(skipped_shape_mismatch_keys),
+        missing_keys=tuple(missing_keys),
     )
