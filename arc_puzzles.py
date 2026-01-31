@@ -4300,6 +4300,199 @@ class Skill27UniqueShapeRotateFall(Puzzle):
         return _rigid_slide_to_wall(rotated, direction=str(self._direction))
 
 
+class Skill29TranslateManyShapes(Puzzle):
+    """
+    Skill29: translate many shapes.
+
+    Input: multiple randomly-placed shapes (from the full shape library) with random colors.
+    Output: translate ALL non-zero cells by a fixed per-task shift (dr, dc), clipping to the grid.
+
+    Notes:
+    - Shapes are placed fully inside the input grid, but the translation may move parts of shapes
+      out-of-bounds (clipped), as requested.
+    - The shift (direction + magnitude) is consistent across all demonstrations and the test
+      for a given task.
+    - IID vs OOD differs ONLY in which direction set is used (see generate_prompt()).
+    """
+
+    skill_id = 29
+    name = "translate_many_shapes"
+    uses_rule_color = False
+
+    def __init__(
+        self,
+        *,
+        size: int = 5,
+        colors: Sequence[int] = (1, 2, 3, 4),
+        ood_spec: OODSpec = OODSpec(),
+        shrink_perturb: Optional[ShrinkPerturbSpec] = None,
+        rng: Optional[np.random.Generator] = None,
+    ) -> None:
+        super().__init__(size=size, colors=colors, ood_spec=ood_spec, shrink_perturb=shrink_perturb, rng=rng)
+        # Defaults; overwritten at prompt-generation time to enforce IID vs OOD direction sets.
+        self._dr = 0
+        self._dc = 1
+        self._k = 1
+        self._direction_tag = "right"
+
+        # Use *all* supported shape kinds for both IID and OOD.
+        self._all_shape_kinds: list[str] = [
+            "square",
+            "cross",
+            "line_h",
+            "line_v",
+            "el",
+            "el_ur",
+            "el_ul",
+            "el_dl",
+            "tee",
+            "tee_up",
+            "tee_left",
+            "tee_right",
+            "diag_main",
+            "diag_anti",
+            "diamond",
+            "box",
+        ]
+
+    @property
+    def variant_id(self) -> Optional[str]:
+        return f"{self._direction_tag}_{int(self._k)}"
+
+    def variant_params(self) -> dict[str, object]:
+        return {"dr": int(self._dr), "dc": int(self._dc), "k": int(self._k), "direction": str(self._direction_tag)}
+
+    def _set_task_shift(self, *, ood_task: bool) -> None:
+        """
+        Choose (dr,dc) and k for this task.
+
+        IMPORTANT: This must be called once per task before generating demos/test so they share the same shift.
+        """
+        size_i = int(self.size)
+        _ = size_i
+        k = int(self.rng.choice(np.asarray([1, 2])))
+
+        # IID: cardinal only. OOD: diagonals only. (Disjoint direction sets.)
+        if not bool(ood_task):
+            dirs = [
+                ("up", -int(k), 0),
+                ("down", int(k), 0),
+                ("left", 0, -int(k)),
+                ("right", 0, int(k)),
+            ]
+        else:
+            dirs = [
+                ("up_left", -int(k), -int(k)),
+                ("up_right", -int(k), int(k)),
+                ("down_left", int(k), -int(k)),
+                ("down_right", int(k), int(k)),
+            ]
+
+        tag, dr, dc = dirs[int(self.rng.integers(0, len(dirs)))]
+        self._k = int(k)
+        self._direction_tag = str(tag)
+        self._dr = int(dr)
+        self._dc = int(dc)
+
+    def generate_prompt(
+        self,
+        *,
+        num_demos: int = 3,
+        ood_test: bool = False,
+    ) -> tuple[list[tuple[np.ndarray, np.ndarray]], tuple[np.ndarray, np.ndarray], Optional[int]]:
+        # Treat "OOD split" as a per-task regime selector so demos + test stay consistent.
+        self._set_task_shift(ood_task=bool(ood_test))
+        return super().generate_prompt(num_demos=int(num_demos), ood_test=bool(ood_test))
+
+    def make_input(self, *, ood: bool) -> np.ndarray:
+        size = int(self.size)
+        grid = self.blank()
+
+        # Scene complexity: OOD can have more shapes, but shapes/kinds are shared.
+        n_shapes = int(self.rng.integers(3, 7)) if bool(ood) else int(self.rng.integers(2, 5))
+
+        span_choices = [3]
+        if int(size) >= 7:
+            span_choices = [3, 5]
+
+        # Bias placement toward the wall in the direction of motion, so clipping happens sometimes.
+        def sample_center(lo: int, hi: int, *, toward_hi: bool) -> int:
+            if int(hi) < int(lo):
+                return int(lo)
+            if int(hi) == int(lo):
+                return int(lo)
+            if bool(self.rng.integers(0, 10) < 7):
+                # 70%: bias toward the edge in the motion direction (up/down/left/right).
+                if bool(toward_hi):
+                    return int(self.rng.integers(max(int(lo), int(hi) - 1), int(hi) + 1))
+                return int(self.rng.integers(int(lo), min(int(hi), int(lo) + 1) + 1))
+            return int(self.rng.integers(int(lo), int(hi) + 1))
+
+        for _attempt in range(700):
+            grid[:, :] = 0
+            placed = 0
+            tries = 0
+            while int(placed) < int(n_shapes) and int(tries) < 2500:
+                tries += 1
+                kind = str(self.rng.choice(np.asarray(self._all_shape_kinds)))
+                span = int(self.rng.choice(np.asarray(span_choices)))
+                span = min(int(span), int(size))
+                if int(span) % 2 == 0:
+                    span = max(1, int(span) - 1)
+                offsets = _mask_offsets(_shape_mask(str(kind), span=int(span)))
+
+                (r_lo, r_hi), (c_lo, c_hi) = _safe_center_range_for_offsets(size=size, offsets=offsets)
+                if int(r_hi) < int(r_lo) or int(c_hi) < int(c_lo):
+                    continue
+
+                # Bias toward clipping after shift.
+                toward_bottom = int(self._dr) > 0
+                toward_right = int(self._dc) > 0
+                r0 = sample_center(int(r_lo), int(r_hi), toward_hi=bool(toward_bottom))
+                c0 = sample_center(int(c_lo), int(c_hi), toward_hi=bool(toward_right))
+
+                # Ensure no overlap so shapes stay visible/distinct.
+                cells: list[tuple[int, int]] = []
+                ok = True
+                for dr, dc in offsets:
+                    rr = int(r0) + int(dr)
+                    cc = int(c0) + int(dc)
+                    if int(grid[rr, cc]) != 0:
+                        ok = False
+                        break
+                    cells.append((int(rr), int(cc)))
+                if not ok or not cells:
+                    continue
+
+                color = int(self.rng.choice(np.asarray(self.colors))) if len(self.colors) > 0 else 1
+                for rr, cc in cells:
+                    grid[int(rr), int(cc)] = int(color)
+                placed += 1
+
+            if int(placed) < 1:
+                continue
+
+            # Reject degenerate cases where the translation clips everything away.
+            out = _rigid_translate_nonzero(grid, dr=int(self._dr), dc=int(self._dc))
+            if not bool(np.any(out != 0)):
+                continue
+            return grid
+
+        # Fallback: one small shape in the center.
+        grid = self.blank()
+        offsets = _mask_offsets(_shape_mask("cross", span=3 if int(size) >= 3 else 1))
+        (r_lo, r_hi), (c_lo, c_hi) = _safe_center_range_for_offsets(size=size, offsets=offsets)
+        r0 = int((r_lo + r_hi) // 2) if int(r_hi) >= int(r_lo) else int(size // 2)
+        c0 = int((c_lo + c_hi) // 2) if int(c_hi) >= int(c_lo) else int(size // 2)
+        color = int(self.colors[0]) if len(self.colors) > 0 else 1
+        _apply_centered_shape(grid, center_r=int(r0), center_c=int(c0), offsets=offsets, color=int(color))
+        return grid
+
+    def apply(self, grid: np.ndarray, rule_color: Optional[int]) -> np.ndarray:
+        _ = rule_color
+        return _rigid_translate_nonzero(grid, dr=int(self._dr), dc=int(self._dc))
+
+
 # --- Update the Factory ---
 
 def build_puzzle(
@@ -4366,6 +4559,8 @@ def build_puzzle(
         return Skill26RotateThenRigidGravity(size=size, shrink_perturb=shrink_perturb, rng=rng)
     if skill_id == 27:
         return Skill27UniqueShapeRotateFall(size=size, shrink_perturb=shrink_perturb, rng=rng)
+    if skill_id == 29:
+        return Skill29TranslateManyShapes(size=size, shrink_perturb=shrink_perturb, rng=rng)
         
     raise ValueError(f"Unknown skill_id={skill_id}")
 
