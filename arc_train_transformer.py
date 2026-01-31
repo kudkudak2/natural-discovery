@@ -1445,7 +1445,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--ood_train_frac",
         type=float,
-        default=0.5,
+        default=0.0,
         help=(
             "Fraction of the OOD-train portion to include in training when that skill is in --train_with_ood_skills "
             "(the remainder of OOD-train is unused; OOD-test remains held out via --test_frac)."

@@ -32,6 +32,21 @@ def _grid_to_list(grid: np.ndarray) -> list[list[int]]:
     return [[int(x) for x in row] for row in grid.tolist()]
 
 
+def _is_all_zero(grid: np.ndarray) -> bool:
+    return not bool(np.any(grid != 0))
+
+
+def _has_any_zero_outputs(
+    demos: list[tuple[np.ndarray, np.ndarray]],
+    test_pair: tuple[np.ndarray, np.ndarray],
+) -> bool:
+    for _x, y in demos:
+        if _is_all_zero(y):
+            return True
+    _tx, ty = test_pair
+    return _is_all_zero(ty)
+
+
 def _task_from_seed(
     *,
     skill_id: int,
@@ -42,26 +57,49 @@ def _task_from_seed(
     task_index: int,
     task_seed: int,
     shrink_perturb: Optional[ShrinkPerturbSpec],
-) -> ARCTask:
-    rng = np.random.default_rng(seed=int(task_seed))
-    puzzle = build_puzzle(int(skill_id), size=int(grid_size), rng=rng, shrink_perturb=shrink_perturb)
-    demos, (t_in, t_out), rule_color = puzzle.generate_prompt(num_demos=3, ood_test=bool(ood))
+    max_retries: int = 2000,
+) -> tuple[ARCTask, int]:
+    """
+    Generate one task deterministically from `task_seed`, rejecting samples where any output `y`
+    (demos or test) is all-zeros. Returns (task, n_rejected_due_to_zero_y).
+    """
+    base_rng = np.random.default_rng(seed=int(task_seed))
+    rejected = 0
+    for _attempt in range(int(max_retries)):
+        sub_seed = int(base_rng.integers(0, 2**32 - 1, dtype=np.uint32))
+        rng = np.random.default_rng(seed=int(sub_seed))
+        puzzle = build_puzzle(int(skill_id), size=int(grid_size), rng=rng, shrink_perturb=shrink_perturb)
+        demos, test_pair, rule_color = puzzle.generate_prompt(num_demos=3, ood_test=bool(ood))
+        if _has_any_zero_outputs(demos, test_pair):
+            rejected += 1
+            continue
 
-    task_id = _stable_id(dataset_id, str(int(task_index)))
-    return ARCTask(
-        task_id=task_id,
-        skill_id=int(skill_id),
-        skill_name=puzzle.name,
-        puzzle_variant=puzzle.variant_id,
-        puzzle_params=puzzle.variant_params(),
-        grid_size=int(grid_size),
-        rule_color=rule_color,
-        demos=[ARCExamplePair(x=_grid_to_list(x), y=_grid_to_list(y)) for (x, y) in demos],
-        test=ARCTestCase(x=_grid_to_list(t_in), y=_grid_to_list(t_out)),
+        t_in, t_out = test_pair
+        task_id = _stable_id(dataset_id, str(int(task_index)))
+        return (
+            ARCTask(
+                task_id=task_id,
+                skill_id=int(skill_id),
+                skill_name=puzzle.name,
+                puzzle_variant=puzzle.variant_id,
+                puzzle_params=puzzle.variant_params(),
+                grid_size=int(grid_size),
+                rule_color=rule_color,
+                demos=[ARCExamplePair(x=_grid_to_list(x), y=_grid_to_list(y)) for (x, y) in demos],
+                test=ARCTestCase(x=_grid_to_list(t_in), y=_grid_to_list(t_out)),
+            ),
+            int(rejected),
+        )
+
+    raise RuntimeError(
+        f"Failed to generate a non-degenerate task after {int(max_retries)} retries "
+        f"(skill_id={int(skill_id)}, split={split!r}, ood={bool(ood)}, task_index={int(task_index)})"
     )
 
 
-def _task_from_seed_packed(args: tuple[int, int, str, str, bool, int, int, Optional[ShrinkPerturbSpec]]) -> ARCTask:
+def _task_from_seed_packed(
+    args: tuple[int, int, str, str, bool, int, int, Optional[ShrinkPerturbSpec]]
+) -> tuple[ARCTask, int]:
     skill_id, grid_size, dataset_id, split, ood, task_index, task_seed, shrink_perturb = args
     return _task_from_seed(
         skill_id=skill_id,
@@ -107,6 +145,7 @@ def generate_dataset(
 
     dataset_id = _stable_id("arc_synth", f"skill={skill_id}", f"split={split}", f"ood={ood}", f"seed={seed}")
     tasks: list[ARCTask] = []
+    rejected_due_to_zero_y = 0
 
     n_jobs = int(n_jobs)
     if n_jobs <= 1:
@@ -118,23 +157,19 @@ def generate_dataset(
             # Important: instantiate a fresh puzzle per task so any per-task latent parameters
             # (e.g., explosion kernel variants) are resampled across tasks while remaining
             # reproducible under the single top-level RNG seed.
-            puzzle = build_puzzle(skill_id, size=grid_size, rng=rng, shrink_perturb=shrink_perturb)
-            demos, (t_in, t_out), rule_color = puzzle.generate_prompt(num_demos=3, ood_test=ood)
-
-            task_id = _stable_id(dataset_id, str(i))
-            tasks.append(
-                ARCTask(
-                    task_id=task_id,
-                    skill_id=int(skill_id),
-                    skill_name=puzzle.name,
-                    puzzle_variant=puzzle.variant_id,
-                    puzzle_params=puzzle.variant_params(),
-                    grid_size=int(grid_size),
-                    rule_color=rule_color,
-                    demos=[ARCExamplePair(x=_grid_to_list(x), y=_grid_to_list(y)) for (x, y) in demos],
-                    test=ARCTestCase(x=_grid_to_list(t_in), y=_grid_to_list(t_out)),
-                )
+            task_seed = int(rng.integers(0, 2**32 - 1, dtype=np.uint32))
+            task, rejected = _task_from_seed(
+                skill_id=int(skill_id),
+                grid_size=int(grid_size),
+                dataset_id=str(dataset_id),
+                split=str(split),
+                ood=bool(ood),
+                task_index=int(i),
+                task_seed=int(task_seed),
+                shrink_perturb=shrink_perturb,
             )
+            tasks.append(task)
+            rejected_due_to_zero_y += int(rejected)
     else:
         # Pre-sample per-task seeds deterministically from the base RNG.
         # Note: this makes multi-process generation deterministic, but results will differ
@@ -158,8 +193,12 @@ def generate_dataset(
             it = ex.map(_task_from_seed_packed, items, chunksize=chunksize)
             if show_progress:
                 it = _progress(it, total=int(n_tasks), desc=f"skill {skill_id} {split}: tasks")
-            tasks = list(it)
+            pairs = list(it)
+            tasks = [t for (t, _rej) in pairs]
+            rejected_due_to_zero_y = int(sum(int(_rej) for (_t, _rej) in pairs))
 
+    denom = int(len(tasks)) + int(rejected_due_to_zero_y)
+    reject_rate_pct = (100.0 * float(rejected_due_to_zero_y) / float(denom)) if denom > 0 else 0.0
     return ARCDataset(
         dataset_id=dataset_id,
         created_at=ARCDataset.now_iso(),
@@ -171,6 +210,8 @@ def generate_dataset(
         extra={
             "generator": "my_research.natural_discovery.arc_dataset_generator",
             "note": "Each task contains 3 demos (x,y) and one test (x) with ground-truth y included in JSON.",
+            "rejected_due_to_zero_y": int(rejected_due_to_zero_y),
+            "reject_rate_due_to_zero_y_pct": float(reject_rate_pct),
         },
     )
 
@@ -307,6 +348,9 @@ def main() -> None:
 
     n_tasks_list = [int(x) for x in args.n_tasks]
 
+    total_rejected_due_to_zero_y = 0
+    total_attempted_due_to_zero_y = 0
+
     for skill_idx, skill_id in enumerate(skills):
         n_tasks = _n_tasks_for_skill(n_tasks_list, skill_index=skill_idx, n_skills=len(skills))
         # Two splits: train-style (easy test) and ood test
@@ -345,8 +389,14 @@ def main() -> None:
                 "png_dir": str(out_dir / f"skill_{skill_id}" / "png" / split),
                 "n_tasks": len(ds.tasks),
                 "n_png": k,
+                "rejected_due_to_zero_y": int(ds.extra.get("rejected_due_to_zero_y", 0)) if ds.extra else 0,
+                "reject_rate_due_to_zero_y_pct": float(ds.extra.get("reject_rate_due_to_zero_y_pct", 0.0)) if ds.extra else 0.0,
             }
             meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+
+            rej = int(ds.extra.get("rejected_due_to_zero_y", 0)) if ds.extra else 0
+            total_rejected_due_to_zero_y += int(rej)
+            total_attempted_due_to_zero_y += int(rej) + int(len(ds.tasks))
 
     if not bool(args.no_zip):
         # Creates: <out_dir>.zip alongside the folder.
@@ -354,6 +404,15 @@ def main() -> None:
         root_dir = str(out_dir.parent)
         base_dir = out_dir.name
         shutil.make_archive(base_name=base_name, format="zip", root_dir=root_dir, base_dir=base_dir)
+
+    if int(total_attempted_due_to_zero_y) > 0:
+        pct = 100.0 * float(total_rejected_due_to_zero_y) / float(total_attempted_due_to_zero_y)
+    else:
+        pct = 0.0
+    print(
+        f"[zero-y rejection] rejected {int(total_rejected_due_to_zero_y)}/{int(total_attempted_due_to_zero_y)} "
+        f"tasks ({pct:.2f}%) because at least one output grid was all zeros."
+    )
 
 
 if __name__ == "__main__":

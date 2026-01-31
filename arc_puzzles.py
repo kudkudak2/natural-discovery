@@ -1728,6 +1728,12 @@ class Skill14FilterUniqueVariants(Puzzle):
            Exactly one color appears in exactly one connected component (per task connectivity);
            all other present colors appear in >=2 disconnected components.
     Output: keep the entire unique-color object; remove everything else.
+
+    IID vs OOD (in this repo):
+    - IID (`ood=False`): "in-distribution" generator settings used for typical training examples.
+    - OOD (`ood=True`): "out-of-distribution" generator settings that shift the *input distribution*
+      (e.g. more/harder placements or variety) while keeping the *same transformation rule*.
+      The `apply()` logic is identical for IID and OOD.
     """
 
     skill_id = 14
@@ -1781,11 +1787,180 @@ class Skill14FilterUniqueVariants(Puzzle):
         }
 
     def make_input(self, *, ood: bool) -> np.ndarray:
+        size = int(self.size)
+        conn = int(self._connectivity)
+
+        # Shape pool (not just rectangles).
+        #
+        # IMPORTANT: keep IID vs OOD shapes DISJOINT to avoid leakage.
+        # OOD shapes must never appear in IID (neither as unique nor distractors).
+        iid_kinds = ["square", "cross", "diamond", "box"]
+        ood_only_kinds = [
+            "line_h",
+            "line_v",
+            "el",
+            "el_ur",
+            "el_ul",
+            "el_dl",
+            "tee",
+            "tee_up",
+            "tee_left",
+            "tee_right",
+        ]
+        kinds = list(ood_only_kinds) if bool(ood) else list(iid_kinds)
+
+        span_choices = [3] if int(size) < 7 else [3, 5]
+
+        def sample_offsets() -> list[tuple[int, int]]:
+            kind = str(self.rng.choice(np.asarray(kinds)))
+            span = int(self.rng.choice(np.asarray(span_choices)))
+            span = min(int(span), int(size))
+            if int(span) % 2 == 0:
+                span = max(1, int(span) - 1)
+            return _mask_offsets(_shape_mask(str(kind), span=int(span)))
+
+        u_k = int(self._unique_components)
+        if int(u_k) < 1:
+            u_k = 1
+
+        def try_place_component_same_color_separated(
+            grid: np.ndarray,
+            *,
+            offsets: Sequence[tuple[int, int]],
+            color: int,
+            max_tries: int,
+        ) -> bool:
+            """
+            Place `offsets` as a component of `color`:
+            - no overlap with any existing non-zero cells
+            - no adjacency (per `conn`) to existing cells of the SAME color, so components stay disconnected
+            """
+            (r_lo, r_hi), (c_lo, c_hi) = _safe_center_range_for_offsets(size=size, offsets=offsets)
+            if int(r_hi) < int(r_lo) or int(c_hi) < int(c_lo):
+                return False
+
+            if int(conn) == 4:
+                neigh = [(-1, 0), (1, 0), (0, -1), (0, 1)]
+            else:
+                neigh = [
+                    (-1, -1),
+                    (-1, 0),
+                    (-1, 1),
+                    (0, -1),
+                    (0, 1),
+                    (1, -1),
+                    (1, 0),
+                    (1, 1),
+                ]
+
+            color_i = int(color)
+            for _ in range(int(max_tries)):
+                r = int(self.rng.integers(int(r_lo), int(r_hi) + 1))
+                c = int(self.rng.integers(int(c_lo), int(c_hi) + 1))
+
+                cells: list[tuple[int, int]] = []
+                ok = True
+                for dr, dc in offsets:
+                    rr = int(r) + int(dr)
+                    cc = int(c) + int(dc)
+                    if int(grid[rr, cc]) != 0:
+                        ok = False
+                        break
+                    cells.append((int(rr), int(cc)))
+                if not ok or not cells:
+                    continue
+
+                # Enforce separation from SAME color only (different colors may touch).
+                for rr, cc in cells:
+                    for dr, dc in neigh:
+                        nr = int(rr) + int(dr)
+                        nc = int(cc) + int(dc)
+                        if 0 <= nr < int(size) and 0 <= nc < int(size) and int(grid[nr, nc]) == int(color_i):
+                            ok = False
+                            break
+                    if not ok:
+                        break
+                if not ok:
+                    continue
+
+                for rr, cc in cells:
+                    grid[int(rr), int(cc)] = int(color_i)
+                return True
+
+            return False
+
+        for _attempt in range(140):
+            grid = self.blank()
+
+            unique_color = int(self.rng.choice(np.asarray(self.colors))) if len(self.colors) > 0 else 1
+            available_distractors = [int(c) for c in self.colors if int(c) != int(unique_color)]
+            if not available_distractors:
+                continue
+
+            # Place the UNIQUE color as exactly u_k disconnected components.
+            ok_unique = True
+            for _ in range(int(u_k)):
+                offs = sample_offsets()
+                if not bool(
+                    try_place_component_same_color_separated(
+                        grid, offsets=offs, color=int(unique_color), max_tries=250
+                    )
+                ):
+                    ok_unique = False
+                    break
+            if not ok_unique:
+                continue
+
+            # ID: fewer distractor colors/components; OOD: more.
+            max_colors = 3 if int(size) <= 6 else (4 if bool(ood) else 3)
+            max_colors = min(int(max_colors), int(len(available_distractors)))
+            n_distractor_colors = int(self.rng.integers(1, int(max_colors) + 1))
+            distractor_colors = self.rng.choice(np.asarray(available_distractors), size=n_distractor_colors, replace=False).tolist()
+
+            ok = True
+            for d_color in distractor_colors:
+                # Choose number of components for this distractor, ensuring it differs from u_k.
+                if not bool(ood):
+                    choices = [2, 3]
+                else:
+                    choices = [2, 3]
+                choices = [k for k in choices if int(k) != int(u_k)]
+                if not choices:
+                    choices = [max(2, int(u_k) + 1)]
+                n_objs = int(self.rng.choice(np.asarray(choices)))
+                placed = 0
+                for _ in range(int(n_objs)):
+                    offs = sample_offsets()
+                    if not bool(
+                        try_place_component_same_color_separated(grid, offsets=offs, color=int(d_color), max_tries=250)
+                    ):
+                        ok = False
+                        break
+                    placed += 1
+                if not ok or int(placed) < 2:
+                    ok = False
+                    break
+
+            if not ok:
+                continue
+
+            # Validate uniqueness-by-components.
+            counts = _component_counts_by_color(grid, connectivity=int(conn))
+            if int(counts.get(int(unique_color), 0)) != int(u_k):
+                continue
+            if any(int(counts.get(int(dc), 0)) < 2 for dc in distractor_colors):
+                continue
+            targets = [c for c, k in counts.items() if int(k) == int(u_k)]
+            if int(len(targets)) != 1:
+                continue
+            return grid
+
+        # Fallback to the original rectangle generator.
         grid, _unique_color = _make_unique_rects_grid(
-            size=self.size,
+            size=int(self.size),
             colors=self.colors,
             rng=self.rng,
-            ood=ood,
+            ood=bool(ood),
             rect_sizes=self._rect_sizes,
             unique_components=int(self._unique_components),
             connectivity=int(self._connectivity),
@@ -1813,6 +1988,10 @@ class Skill15PixelExplosionVariants(Puzzle):
     - 3-long directional "ray" from the pixel (up/down/left/right)
     - 3-long diagonals
     - 5-cell cross (center + 4-neighbors)
+
+    IID vs OOD (in this repo):
+    - IID (`ood=False`): fewer input pixels (sparser scenes).
+    - OOD (`ood=True`): more input pixels (denser scenes), but the explosion rule is unchanged.
     """
 
     skill_id = 15
@@ -1829,7 +2008,11 @@ class Skill15PixelExplosionVariants(Puzzle):
         rng: Optional[np.random.Generator] = None,
     ) -> None:
         super().__init__(size=size, colors=colors, ood_spec=ood_spec, shrink_perturb=shrink_perturb, rng=rng)
-        modes = [
+        # Reserve one kernel as OOD-only (used when make_input(ood=True)).
+        # This deliberately creates a held-out kernel variant for OOD test cases.
+        self._ood_explosion_mode = "ring5_square"
+
+        iid_modes = [
             "square3",
             "line3_h",
             "line3_v",
@@ -1848,9 +2031,8 @@ class Skill15PixelExplosionVariants(Puzzle):
             "diag5_anti",
             "cross5",
             "diamond5",
-            "ring5_square",
         ]
-        self._explosion_mode = str(self.rng.choice(np.asarray(modes)))
+        self._explosion_mode = str(self.rng.choice(np.asarray(iid_modes)))
         self._offsets = _explosion_offsets_extended(self._explosion_mode)
 
     @property
@@ -1864,6 +2046,11 @@ class Skill15PixelExplosionVariants(Puzzle):
         }
 
     def make_input(self, *, ood: bool) -> np.ndarray:
+        # OOD-only kernel variant.
+        if bool(ood) and str(self._explosion_mode) != str(self._ood_explosion_mode):
+            self._explosion_mode = str(self._ood_explosion_mode)
+            self._offsets = _explosion_offsets_extended(self._explosion_mode)
+
         grid = self.blank()
 
         # ID: 1-2 pixels. OOD: 2-4 pixels.
@@ -1901,6 +2088,10 @@ class Skill16ExplodeUniqueVariants(Puzzle):
     Input: scattered pixels where exactly one color forms exactly one 4-connected component,
            and all other present colors form >=2 disconnected components each.
     Output: explode every pixel of the unique-color component using the per-task kernel.
+
+    IID vs OOD (in this repo):
+    - IID (`ood=False`): fewer distractor colors/pixels (easier uniqueness).
+    - OOD (`ood=True`): more distractor colors/pixels (harder uniqueness), but the output rule is identical.
     """
 
     skill_id = 16
@@ -1917,7 +2108,10 @@ class Skill16ExplodeUniqueVariants(Puzzle):
         rng: Optional[np.random.Generator] = None,
     ) -> None:
         super().__init__(size=size, colors=colors, ood_spec=ood_spec, shrink_perturb=shrink_perturb, rng=rng)
-        modes = [
+        # Reserve one kernel as OOD-only (used when make_input(ood=True)).
+        self._ood_explosion_mode = "ring5_square"
+
+        iid_modes = [
             "square3",
             "line3_h",
             "line3_v",
@@ -1935,9 +2129,8 @@ class Skill16ExplodeUniqueVariants(Puzzle):
             "diag5_anti",
             "cross5",
             "diamond5",
-            "ring5_square",
         ]
-        self._explosion_mode = str(self.rng.choice(np.asarray(modes)))
+        self._explosion_mode = str(self.rng.choice(np.asarray(iid_modes)))
         self._offsets = _explosion_offsets_extended(self._explosion_mode)
 
     @property
@@ -1951,9 +2144,84 @@ class Skill16ExplodeUniqueVariants(Puzzle):
         }
 
     def make_input(self, *, ood: bool) -> np.ndarray:
+        # OOD-only kernel variant.
+        if bool(ood) and str(self._explosion_mode) != str(self._ood_explosion_mode):
+            self._explosion_mode = str(self._ood_explosion_mode)
+            self._offsets = _explosion_offsets_extended(self._explosion_mode)
+
         size = int(self.size)
 
-        for _attempt in range(200):
+        # Shape pool (not just single pixels). IID uses core kinds; OOD adds held-out kinds.
+        iid_kinds = ["square", "cross", "diamond", "box"]
+        ood_only_kinds = ["line_h", "line_v", "el", "tee"]
+        kinds = list(iid_kinds) + (list(ood_only_kinds) if bool(ood) else [])
+        span_choices = [3] if int(size) < 7 else [3, 5]
+
+        def sample_shape_offsets() -> list[tuple[int, int]]:
+            kind = str(self.rng.choice(np.asarray(kinds)))
+            span = int(self.rng.choice(np.asarray(span_choices)))
+            span = min(int(span), int(size))
+            if int(span) % 2 == 0:
+                span = max(1, int(span) - 1)
+            return _mask_offsets(_shape_mask(str(kind), span=int(span)))
+
+        def explosion_safe_offsets(shape_offsets: Sequence[tuple[int, int]]) -> list[tuple[int, int]]:
+            out: set[tuple[int, int]] = set()
+            for sr, sc in shape_offsets:
+                for er, ec in self._offsets:
+                    out.add((int(sr) + int(er), int(sc) + int(ec)))
+            return sorted(out)
+
+        def try_place_component_same_color_separated(
+            grid: np.ndarray,
+            *,
+            offsets: Sequence[tuple[int, int]],
+            color: int,
+            max_tries: int,
+        ) -> bool:
+            """
+            Place `offsets` as a component of `color`:
+            - no overlap with any existing non-zero cells
+            - no 4-adjacency to existing cells of the SAME color (so components stay disconnected)
+            """
+            (r_lo, r_hi), (c_lo, c_hi) = _safe_center_range_for_offsets(size=size, offsets=offsets)
+            if int(r_hi) < int(r_lo) or int(c_hi) < int(c_lo):
+                return False
+            color_i = int(color)
+            neigh4 = [(-1, 0), (1, 0), (0, -1), (0, 1)]
+            for _ in range(int(max_tries)):
+                r = int(self.rng.integers(int(r_lo), int(r_hi) + 1))
+                c = int(self.rng.integers(int(c_lo), int(c_hi) + 1))
+                cells: list[tuple[int, int]] = []
+                ok = True
+                for dr, dc in offsets:
+                    rr = int(r) + int(dr)
+                    cc = int(c) + int(dc)
+                    if int(grid[rr, cc]) != 0:
+                        ok = False
+                        break
+                    cells.append((int(rr), int(cc)))
+                if not ok or not cells:
+                    continue
+
+                for rr, cc in cells:
+                    for dr, dc in neigh4:
+                        nr = int(rr) + int(dr)
+                        nc = int(cc) + int(dc)
+                        if 0 <= nr < int(size) and 0 <= nc < int(size) and int(grid[nr, nc]) == int(color_i):
+                            ok = False
+                            break
+                    if not ok:
+                        break
+                if not ok:
+                    continue
+
+                for rr, cc in cells:
+                    grid[int(rr), int(cc)] = int(color_i)
+                return True
+            return False
+
+        for _attempt in range(140):
             grid = self.blank()
 
             # 1) Pick the unique color and distractor colors.
@@ -1970,46 +2238,42 @@ class Skill16ExplodeUniqueVariants(Puzzle):
                 self.rng.choice(np.asarray(distractors), size=n_distractor_colors, replace=False).tolist()
             )
 
-            # 2) Place UNIQUE object (strictly 1x1) in a safe spot for the explosion.
-            mask = _get_safe_placement_mask(size, self._offsets, [], separation_buffer=1)
-            valid = np.argwhere(mask)
-            if valid.size == 0:
+            # 2) Place UNIQUE object (connected, shape mask), safe for exploding every pixel.
+            shape_offsets = sample_shape_offsets()
+            safe = explosion_safe_offsets(shape_offsets)
+            (r_lo, r_hi), (c_lo, c_hi) = _safe_center_range_for_offsets(size=size, offsets=safe)
+            if int(r_hi) < int(r_lo) or int(c_hi) < int(c_lo):
                 continue
-            idx = int(self.rng.choice(len(valid)))
-            ur, uc = valid[idx]
-            ur_i, uc_i = int(ur), int(uc)
-            grid[ur_i, uc_i] = unique_color
+            ur = int(self.rng.integers(int(r_lo), int(r_hi) + 1))
+            uc = int(self.rng.integers(int(c_lo), int(c_hi) + 1))
+            ok_unique = True
+            for dr, dc in shape_offsets:
+                rr = int(ur) + int(dr)
+                cc = int(uc) + int(dc)
+                if int(grid[rr, cc]) != 0:
+                    ok_unique = False
+                    break
+                grid[rr, cc] = int(unique_color)
+            if not ok_unique:
+                continue
 
             # 3) Place DISTRACTORS such that each distractor color has >=2 disconnected components.
-            # We do this by placing isolated (4-disconnected) pixels for each distractor color.
+            # We do this by placing multiple disconnected shape instances for each distractor color.
             for d_color in distractor_colors:
-                if ood:
-                    n_pix = int(self.rng.integers(3, 7))
+                if bool(ood):
+                    n_comp = int(self.rng.integers(2, 4))
                 else:
-                    n_pix = int(self.rng.integers(2, 5))
+                    n_comp = 2
 
                 placed = 0
-                tries = 0
-                while placed < n_pix and tries < 400:
-                    tries += 1
-                    r = int(self.rng.integers(0, size))
-                    c = int(self.rng.integers(0, size))
-                    if grid[r, c] != 0:
-                        continue
-                    # Ensure this pixel is not 4-adjacent to an existing pixel of the same color,
-                    # so components stay separated.
-                    if r > 0 and int(grid[r - 1, c]) == int(d_color):
-                        continue
-                    if r + 1 < size and int(grid[r + 1, c]) == int(d_color):
-                        continue
-                    if c > 0 and int(grid[r, c - 1]) == int(d_color):
-                        continue
-                    if c + 1 < size and int(grid[r, c + 1]) == int(d_color):
-                        continue
-                    grid[r, c] = int(d_color)
+                for _ in range(int(n_comp)):
+                    offs = sample_shape_offsets()
+                    if not bool(
+                        try_place_component_same_color_separated(grid, offsets=offs, color=int(d_color), max_tries=250)
+                    ):
+                        break
                     placed += 1
-
-                if placed < 2:
+                if int(placed) < 2:
                     break
 
             # Validate uniqueness-by-components (same contract as Skill14/16 expect).
@@ -2024,39 +2288,36 @@ class Skill16ExplodeUniqueVariants(Puzzle):
 
             return grid
 
-        # Fallback: minimal, valid construction (still enforces unique 1x1).
+        # Fallback: minimal, valid construction.
         grid = self.blank()
         unique_color = int(self.colors[0]) if len(self.colors) > 0 else 1
-        mask = _get_safe_placement_mask(size, self._offsets, [], separation_buffer=1)
-        valid = np.argwhere(mask)
-        if valid.size == 0:
-            ur_i, uc_i = size // 2, size // 2
-        else:
-            r, c = valid[int(self.rng.choice(len(valid)))]
-            ur_i, uc_i = int(r), int(c)
-        grid[ur_i, uc_i] = unique_color
+        shape_offsets = [(0, 0)]
+        safe = explosion_safe_offsets(shape_offsets)
+        (r_lo, r_hi), (c_lo, c_hi) = _safe_center_range_for_offsets(size=size, offsets=safe)
+        ur_i = int((r_lo + r_hi) // 2) if int(r_hi) >= int(r_lo) else int(size // 2)
+        uc_i = int((c_lo + c_hi) // 2) if int(c_hi) >= int(c_lo) else int(size // 2)
+        grid[int(ur_i), int(uc_i)] = int(unique_color)
 
         distractor_color = int(self.colors[1]) if len(self.colors) > 1 else 2
-        # Place two isolated pixels of the distractor color.
-        placed = 0
-        for r in range(size):
-            for c in range(size):
-                if placed >= 2:
-                    break
-                if grid[r, c] != 0:
-                    continue
-                if r > 0 and int(grid[r - 1, c]) == distractor_color:
-                    continue
-                if r + 1 < size and int(grid[r + 1, c]) == distractor_color:
-                    continue
-                if c > 0 and int(grid[r, c - 1]) == distractor_color:
-                    continue
-                if c + 1 < size and int(grid[r, c + 1]) == distractor_color:
-                    continue
-                grid[r, c] = distractor_color
-                placed += 1
-            if placed >= 2:
-                break
+        # Place two 1x1 components of the distractor color.
+        _ = _try_place_offsets_no_touch(
+            grid,
+            offsets=[(0, 0)],
+            color=int(distractor_color),
+            rng=self.rng,
+            connectivity=4,
+            buffer=1,
+            max_tries=500,
+        )
+        _ = _try_place_offsets_no_touch(
+            grid,
+            offsets=[(0, 0)],
+            color=int(distractor_color),
+            rng=self.rng,
+            connectivity=4,
+            buffer=1,
+            max_tries=500,
+        )
         return grid
 
     def apply(self, grid: np.ndarray, rule_color: Optional[int]) -> np.ndarray:
@@ -2790,6 +3051,16 @@ def _shape_mask(kind: str, *, span: int) -> np.ndarray:
     Kinds:
     - square: filled square
     - cross: plus-shaped cross (row+col through center)
+    - line_h: horizontal line through center
+    - line_v: vertical line through center
+    - el: L-shape anchored at center (down+right arms)
+    - tee: T-shape anchored at center (down stem + full center row)
+    - el_ur: L-shape (up+right arms)
+    - el_ul: L-shape (up+left arms)
+    - el_dl: L-shape (down+left arms)
+    - tee_up: T-shape with stem up
+    - tee_left: T-shape with stem left
+    - tee_right: T-shape with stem right
     - diag_main: main diagonal
     - diag_anti: anti-diagonal
     - diamond: manhattan ball (|dr|+|dc| <= radius)
@@ -2808,6 +3079,76 @@ def _shape_mask(kind: str, *, span: int) -> np.ndarray:
         c = n // 2
         m[c, :] = True
         m[:, c] = True
+        return m
+
+    if k == "line_h":
+        m = np.zeros((n, n), dtype=bool)
+        c = n // 2
+        m[c, :] = True
+        return m
+
+    if k == "line_v":
+        m = np.zeros((n, n), dtype=bool)
+        c = n // 2
+        m[:, c] = True
+        return m
+
+    if k == "el":
+        # 4-connected L: from center to bottom and center to right.
+        m = np.zeros((n, n), dtype=bool)
+        c = n // 2
+        m[c:, c] = True
+        m[c, c:] = True
+        return m
+
+    if k == "el_ur":
+        m = np.zeros((n, n), dtype=bool)
+        c = n // 2
+        m[: c + 1, c] = True
+        m[c, c:] = True
+        return m
+
+    if k == "el_ul":
+        m = np.zeros((n, n), dtype=bool)
+        c = n // 2
+        m[: c + 1, c] = True
+        m[c, : c + 1] = True
+        return m
+
+    if k == "el_dl":
+        m = np.zeros((n, n), dtype=bool)
+        c = n // 2
+        m[c:, c] = True
+        m[c, : c + 1] = True
+        return m
+
+    if k == "tee":
+        # 4-connected T: full center row + stem down from center.
+        m = np.zeros((n, n), dtype=bool)
+        c = n // 2
+        m[c, :] = True
+        m[c:, c] = True
+        return m
+
+    if k == "tee_up":
+        m = np.zeros((n, n), dtype=bool)
+        c = n // 2
+        m[c, :] = True
+        m[: c + 1, c] = True
+        return m
+
+    if k == "tee_left":
+        m = np.zeros((n, n), dtype=bool)
+        c = n // 2
+        m[:, c] = True
+        m[c, : c + 1] = True
+        return m
+
+    if k == "tee_right":
+        m = np.zeros((n, n), dtype=bool)
+        c = n // 2
+        m[:, c] = True
+        m[c, c:] = True
         return m
 
     if k == "diag_main":
@@ -3336,6 +3677,10 @@ class Skill24GravityOneObjectRigid(Puzzle):
     Input: exactly one 4-connected object (a centered shape mask) on blank background.
     Output: rigidly translate the object in the chosen direction until it hits the wall.
     Per-task variant chooses BOTH the shape (kind+span) and the direction.
+
+    IID vs OOD (in this repo):
+    - IID (`ood=False`) vs OOD (`ood=True`) refers to which generator regime is used.
+    - For this particular skill, `ood` is currently ignored (IID and OOD generate the same style of examples).
     """
 
     skill_id = 24
@@ -3352,9 +3697,13 @@ class Skill24GravityOneObjectRigid(Puzzle):
         rng: Optional[np.random.Generator] = None,
     ) -> None:
         super().__init__(size=size, colors=colors, ood_spec=ood_spec, shrink_perturb=shrink_perturb, rng=rng)
-        self._direction = str(self.rng.choice(np.asarray(["up", "down", "left", "right"])))
+        # Reserve one direction as OOD-only (used when make_input(ood=True)).
+        self._ood_direction = "left"
+        self._direction = str(self.rng.choice(np.asarray(["up", "down", "right"])))
         # Use only 4-connected shape families.
-        self._shape_kind = str(self.rng.choice(np.asarray(["square", "cross", "diamond", "box"])))
+        self._iid_shape_kinds = ["square", "cross", "diamond", "box"]
+        self._ood_only_shape_kinds = ["line_h", "line_v", "el", "tee"]
+        self._shape_kind = str(self.rng.choice(np.asarray(self._iid_shape_kinds)))
         max_span = min(5, int(self.size))
         span_choices = [s for s in (2, 3, 4, 5) if int(s) <= int(max_span)]
         if not span_choices:
@@ -3372,18 +3721,29 @@ class Skill24GravityOneObjectRigid(Puzzle):
         return {"direction": str(self._direction), "shape": {"kind": str(self._shape_kind), "span": int(self._span)}}
 
     def make_input(self, *, ood: bool) -> np.ndarray:
-        _ = ood
         size = int(self.size)
         grid = self.blank()
 
+        if bool(ood):
+            self._direction = str(self._ood_direction)
+            # OOD-only shapes use odd spans for cleaner masks.
+            kind = str(self.rng.choice(np.asarray(self._ood_only_shape_kinds)))
+            span = 3 if int(size) < 7 else int(self.rng.choice(np.asarray([3, 5])))
+            span = min(int(span), int(size))
+            if int(span) % 2 == 0:
+                span = max(1, int(span) - 1)
+            offsets = _mask_offsets(_shape_mask(str(kind), span=int(span)))
+        else:
+            offsets = self._offsets
+
         # Choose a center so the shape fits AND is not already touching the target wall.
-        (r_lo, r_hi), (c_lo, c_hi) = _safe_center_range_for_offsets(size=size, offsets=self._offsets)
+        (r_lo, r_hi), (c_lo, c_hi) = _safe_center_range_for_offsets(size=size, offsets=offsets)
         for _ in range(600):
             if int(r_hi) < int(r_lo) or int(c_hi) < int(c_lo):
                 break
             r = int(self.rng.integers(int(r_lo), int(r_hi) + 1))
             c = int(self.rng.integers(int(c_lo), int(c_hi) + 1))
-            _apply_centered_shape(grid, center_r=int(r), center_c=int(c), offsets=self._offsets, color=int(self._color))
+            _apply_centered_shape(grid, center_r=int(r), center_c=int(c), offsets=offsets, color=int(self._color))
             slid = _rigid_slide_to_wall(grid, direction=str(self._direction))
             # Reject degenerate no-move cases.
             if bool(np.array_equal(slid, grid)):
@@ -3410,6 +3770,10 @@ class Skill25RotateOneObject(Puzzle):
 
     Input: exactly one centered, odd-span shape.
     Output: the same object rotated clockwise by 90/180/270 degrees (per-task variant).
+
+    IID vs OOD (in this repo):
+    - IID (`ood=False`) vs OOD (`ood=True`) refers to which generator regime is used.
+    - For this particular skill, `ood` is currently ignored (IID and OOD generate the same style of examples).
     """
 
     skill_id = 25
@@ -3426,8 +3790,12 @@ class Skill25RotateOneObject(Puzzle):
         rng: Optional[np.random.Generator] = None,
     ) -> None:
         super().__init__(size=size, colors=colors, ood_spec=ood_spec, shrink_perturb=shrink_perturb, rng=rng)
-        self._degrees = int(self.rng.choice(np.asarray([90, 180, 270])))
-        self._shape_kind = str(self.rng.choice(np.asarray(["square", "cross", "diamond", "box"])))
+        # Reserve one rotation amount as OOD-only (used when make_input(ood=True)).
+        self._ood_degrees = 180
+        self._degrees = int(self.rng.choice(np.asarray([90, 270])))
+        self._iid_shape_kinds = ["square", "cross", "diamond", "box"]
+        self._ood_only_shape_kinds = ["line_h", "line_v", "el", "tee"]
+        self._shape_kind = str(self.rng.choice(np.asarray(self._iid_shape_kinds)))
         max_span = min(5, int(self.size))
         span_choices = [s for s in (3, 5) if int(s) <= int(max_span)]
         if not span_choices:
@@ -3449,9 +3817,19 @@ class Skill25RotateOneObject(Puzzle):
         }
 
     def make_input(self, *, ood: bool) -> np.ndarray:
-        _ = ood
         size = int(self.size)
         grid = self.blank()
+
+        if bool(ood):
+            self._degrees = int(self._ood_degrees)
+            self._shape_kind = str(self.rng.choice(np.asarray(self._ood_only_shape_kinds)))
+            span = 3 if int(size) < 7 else int(self.rng.choice(np.asarray([3, 5])))
+            span = min(int(span), int(size))
+            if int(span) % 2 == 0:
+                span = max(1, int(span) - 1)
+            self._span = int(span)
+            self._offsets = _mask_offsets(_shape_mask(self._shape_kind, span=int(self._span)))
+            self._rot_offsets = _rotate_offsets_clockwise(self._offsets, degrees=int(self._degrees))
 
         (r0_lo, r0_hi), (c0_lo, c0_hi) = _safe_center_range_for_offsets(size=size, offsets=self._offsets)
         (r1_lo, r1_hi), (c1_lo, c1_hi) = _safe_center_range_for_offsets(size=size, offsets=self._rot_offsets)
@@ -3487,6 +3865,10 @@ class Skill26RotateThenRigidGravity(Puzzle):
 
     Input: one centered, odd-span shape.
     Output: rotate clockwise by 90/180/270 degrees, then rigidly slide to the chosen wall.
+
+    IID vs OOD (in this repo):
+    - IID (`ood=False`) vs OOD (`ood=True`) refers to which generator regime is used.
+    - For this particular skill, `ood` is currently ignored (IID and OOD generate the same style of examples).
     """
 
     skill_id = 26
@@ -3503,9 +3885,16 @@ class Skill26RotateThenRigidGravity(Puzzle):
         rng: Optional[np.random.Generator] = None,
     ) -> None:
         super().__init__(size=size, colors=colors, ood_spec=ood_spec, shrink_perturb=shrink_perturb, rng=rng)
-        self._degrees = int(self.rng.choice(np.asarray([90, 180, 270])))
-        self._direction = str(self.rng.choice(np.asarray(["up", "down", "left", "right"])))
-        self._shape_kind = str(self.rng.choice(np.asarray(["square", "cross", "diamond", "box"])))
+        # Reserve one rotation + one direction as OOD-only (used when make_input(ood=True)).
+        self._ood_degrees = 180
+        self._ood_direction = "left"
+
+        self._degrees = int(self.rng.choice(np.asarray([90, 270])))
+        self._direction = str(self.rng.choice(np.asarray(["up", "down", "right"])))
+
+        self._iid_shape_kinds = ["square", "cross", "diamond", "box"]
+        self._ood_only_shape_kinds = ["line_h", "line_v", "el", "tee"]
+        self._shape_kind = str(self.rng.choice(np.asarray(self._iid_shape_kinds)))
         max_span = min(5, int(self.size))
         span_choices = [s for s in (3, 5) if int(s) <= int(max_span)]
         if not span_choices:
@@ -3528,8 +3917,19 @@ class Skill26RotateThenRigidGravity(Puzzle):
         }
 
     def make_input(self, *, ood: bool) -> np.ndarray:
-        _ = ood
         size = int(self.size)
+        if bool(ood):
+            self._degrees = int(self._ood_degrees)
+            self._direction = str(self._ood_direction)
+            self._shape_kind = str(self.rng.choice(np.asarray(self._ood_only_shape_kinds)))
+            span = 3 if int(size) < 7 else int(self.rng.choice(np.asarray([3, 5])))
+            span = min(int(span), int(size))
+            if int(span) % 2 == 0:
+                span = max(1, int(span) - 1)
+            self._span = int(span)
+            self._offsets = _mask_offsets(_shape_mask(self._shape_kind, span=int(self._span)))
+            self._rot_offsets = _rotate_offsets_clockwise(self._offsets, degrees=int(self._degrees))
+
         for _ in range(600):
             grid = self.blank()
             (r_lo, r_hi), (c_lo, c_hi) = _safe_center_range_for_offsets(size=size, offsets=self._rot_offsets)
@@ -3571,16 +3971,20 @@ class Skill26RotateThenRigidGravity(Puzzle):
 
 class Skill27UniqueShapeRotateFall(Puzzle):
     """
-    Skill27 (hard): unique shape selection + rotate + fall.
+    Skill27 (hard): unique SHAPE selection + rotate + rigid gravity.
 
-    Strengthened composition target:
+    This is "Skill26 in clutter":
+    - We place centered, odd-span shapes (with the same marker trick as Skill26).
+    - Exactly one SHAPE TYPE appears once; the other shape type appears twice.
+    - The duplicated shape instances do not touch each other (4-disconnected).
+    - Different shape types may overlap; the unique shape is drawn last (foreground).
 
-    Input: multiple 4-connected objects. Exactly one COLOR appears in exactly one connected component;
-           all other present colors appear in >=2 disconnected components each.
-    Output:
-      1) keep ONLY the unique-color component
-      2) apply a per-task "shape change" kernel (like Skill16's explosion kernel) to that component
-      3) rigidly slide the result DOWN until it hits the bottom wall
+    Output: keep only the uniquely-occurring shape type, rotate it (per-task), then rigidly slide
+    it to the chosen wall (per-task), exactly as in Skill26.
+
+    IID vs OOD (in this repo):
+    - IID (`ood=False`) vs OOD (`ood=True`) refers to which generator regime is used.
+    - For this particular skill, `ood` is currently ignored (IID and OOD generate the same style of examples).
     """
 
     skill_id = 27
@@ -3597,125 +4001,303 @@ class Skill27UniqueShapeRotateFall(Puzzle):
         rng: Optional[np.random.Generator] = None,
     ) -> None:
         super().__init__(size=size, colors=colors, ood_spec=ood_spec, shrink_perturb=shrink_perturb, rng=rng)
-        # For small grids (and especially 6x6), 5-sized kernels are visually confusing.
-        # Restrict to "size 1" (identity) and "size 3" kernels only.
-        modes = [
-            "point1",
-            "square3",
-            "line3_h",
-            "line3_v",
-            "ray3_right",
-            "ray3_left",
-            "ray3_down",
-            "ray3_up",
-            "diag3_main",
-            "diag3_anti",
-            "cross3",
-        ]
-        self._explosion_mode = str(self.rng.choice(np.asarray(modes)))
-        if self._explosion_mode == "point1":
-            self._kernel_offsets = [(0, 0)]
-        else:
-            self._kernel_offsets = _explosion_offsets_extended(self._explosion_mode)
-
-        # Keep shapes small + placeable on 5x5.
-        self._rect_sizes: list[tuple[int, int]] = [(1, 3), (3, 1), (1, 2), (2, 1), (2, 2)]
-        self._rect_sizes = [
-            (int(h), int(w))
-            for (h, w) in self._rect_sizes
-            if int(h) <= int(self.size) and int(w) <= int(self.size)
-        ]
-        if not self._rect_sizes:
-            self._rect_sizes = [(1, 1)]
+        self._degrees = int(self.rng.choice(np.asarray([90, 180, 270])))
+        self._direction = str(self.rng.choice(np.asarray(["up", "down", "left", "right"])))
 
     @property
     def variant_id(self) -> Optional[str]:
-        return f"{self._explosion_mode}_down"
+        return f"{self._direction}_{int(self._degrees)}"
 
     def variant_params(self) -> dict[str, object]:
-        return {
-            "shape_change_kernel": str(self._explosion_mode),
-            "kernel_offsets": [(int(dr), int(dc)) for (dr, dc) in self._kernel_offsets],
-            "fall_direction": "down",
-        }
-
-    def _kernel_fits_bbox(self, *, r0: int, r1: int, c0: int, c1: int) -> bool:
-        """Return True if applying the kernel to any pixel in bbox won't clip."""
-        size = int(self.size)
-        drs = [int(dr) for dr, _dc in self._kernel_offsets] if self._kernel_offsets else [0]
-        dcs = [int(dc) for _dr, dc in self._kernel_offsets] if self._kernel_offsets else [0]
-        min_dr, max_dr = int(min(drs)), int(max(drs))
-        min_dc, max_dc = int(min(dcs)), int(max(dcs))
-        return (
-            int(r0) + int(min_dr) >= 0
-            and int(r1) + int(max_dr) < int(size)
-            and int(c0) + int(min_dc) >= 0
-            and int(c1) + int(max_dc) < int(size)
-        )
+        return {"direction": str(self._direction), "degrees_clockwise": int(self._degrees)}
 
     def make_input(self, *, ood: bool) -> np.ndarray:
+        if bool(ood):
+            # OOD-only direction + rotation.
+            self._degrees = 180
+            self._direction = "left"
+
         size = int(self.size)
-        for _attempt in range(800):
-            grid, unique_color = _make_unique_rects_grid(
-                size=size,
-                colors=self.colors,
-                rng=self.rng,
-                ood=bool(ood),
-                rect_sizes=self._rect_sizes,
-                unique_components=1,
-                connectivity=4,
-            )
 
-            uniq_mask = grid == int(unique_color)
-            if not bool(np.any(uniq_mask)):
+        # Keep this reliably placeable on 5x5: span=3 only.
+        # Allow span=5 on larger grids.
+        span_choices = [3] if int(size) < 7 else [3, 5]
+
+        # OOD-only shapes: restrict to a held-out pool.
+        if bool(ood):
+            kinds = ["line_h", "line_v", "el", "tee"]
+        else:
+            kinds = ["square", "cross", "diamond", "box"]
+        unique_kind = str(self.rng.choice(np.asarray(kinds)))
+        other_kinds = [k for k in kinds if str(k) != str(unique_kind)]
+        dup_kind = str(self.rng.choice(np.asarray(other_kinds))) if other_kinds else str(unique_kind)
+
+        unique_span = int(self.rng.choice(np.asarray(span_choices)))
+        dup_span = int(self.rng.choice(np.asarray(span_choices)))
+
+        uniq_offsets = _mask_offsets(_shape_mask(str(unique_kind), span=int(unique_span)))
+        dup_offsets = _mask_offsets(_shape_mask(str(dup_kind), span=int(dup_span)))
+        rot_uniq_offsets = _rotate_offsets_clockwise(uniq_offsets, degrees=int(self._degrees))
+
+        def pick_two_base_colors() -> tuple[int, int]:
+            palette = [int(c) for c in self.colors] if len(self.colors) > 0 else [1, 2, 3, 4]
+            # Prefer pairs where marker colors don't collide with base colors.
+            for a in palette:
+                for b in palette:
+                    if int(a) == int(b):
+                        continue
+                    ma = int(_ray_color_from_source(int(a)))
+                    mb = int(_ray_color_from_source(int(b)))
+                    if int(ma) in (int(a), int(b)):
+                        continue
+                    if int(mb) in (int(a), int(b)):
+                        continue
+                    if int(ma) == int(mb):
+                        continue
+                    return int(a), int(b)
+            # Fallback: just pick two distinct.
+            a = int(palette[0]) if palette else 1
+            b = int(palette[1]) if int(len(palette)) > 1 else (2 if int(a) != 2 else 3)
+            if int(a) == int(b):
+                b = 1 + (int(a) % 4)
+            return int(a), int(b)
+
+        unique_base, dup_base = pick_two_base_colors()
+        unique_marker = int(_ray_color_from_source(int(unique_base)))
+        dup_marker = int(_ray_color_from_source(int(dup_base)))
+
+        def place_dup_instance(grid: np.ndarray, *, offsets: Sequence[tuple[int, int]]) -> bool:
+            """
+            Place one duplicated (background) instance.
+
+            Constraints:
+            - no overlap with existing non-zero cells
+            - does not 4-touch existing pixels of the SAME duplicated type (dup_base/dup_marker)
+            """
+            (r_lo, r_hi), (c_lo, c_hi) = _safe_center_range_for_offsets(size=size, offsets=offsets)
+            if int(r_hi) < int(r_lo) or int(c_hi) < int(c_lo):
+                return False
+
+            neigh4 = [(-1, 0), (1, 0), (0, -1), (0, 1)]
+            same_mask = (grid == int(dup_base)) | (grid == int(dup_marker))
+
+            for _ in range(700):
+                r = int(self.rng.integers(int(r_lo), int(r_hi) + 1))
+                c = int(self.rng.integers(int(c_lo), int(c_hi) + 1))
+                cells: list[tuple[int, int]] = []
+                ok = True
+                for dr, dc in offsets:
+                    rr = int(r) + int(dr)
+                    cc = int(c) + int(dc)
+                    if int(grid[rr, cc]) != 0:
+                        ok = False
+                        break
+                    cells.append((int(rr), int(cc)))
+                if not ok or not cells:
+                    continue
+
+                # Ensure we don't touch the other duplicated instance.
+                for rr, cc in cells:
+                    for dr, dc in neigh4:
+                        nr = int(rr) + int(dr)
+                        nc = int(cc) + int(dc)
+                        if 0 <= nr < int(size) and 0 <= nc < int(size) and bool(same_mask[nr, nc]):
+                            ok = False
+                            break
+                    if not ok:
+                        break
+                if not ok:
+                    continue
+
+                # Draw base pixels.
+                for rr, cc in cells:
+                    grid[int(rr), int(cc)] = int(dup_base)
+
+                # Marker: choose an "interior-ish" cell (closest to center) to reduce accidental isolation.
+                def mkey(pt: tuple[int, int]) -> tuple[int, int, int]:
+                    rr, cc = pt
+                    return (abs(int(rr) - int(r)) + abs(int(cc) - int(c)), int(rr), int(cc))
+
+                mr, mc = min(cells, key=mkey)
+                grid[int(mr), int(mc)] = int(dup_marker)
+                return True
+
+            return False
+
+        def can_place_unique_foreground(grid: np.ndarray, *, center_r: int, center_c: int) -> bool:
+            # Ensure the unique shape fits; allow overlap except we avoid overwriting background markers.
+            for dr, dc in uniq_offsets:
+                rr = int(center_r) + int(dr)
+                cc = int(center_c) + int(dc)
+                if not (0 <= rr < int(size) and 0 <= cc < int(size)):
+                    return False
+                if int(grid[rr, cc]) == int(dup_marker):
+                    return False
+            return True
+
+        for _attempt in range(220):
+            grid = self.blank()
+
+            # Place the duplicated background shape twice, non-touching.
+            if not place_dup_instance(grid, offsets=dup_offsets):
+                continue
+            if not place_dup_instance(grid, offsets=dup_offsets):
                 continue
 
-            rs, cs = np.nonzero(uniq_mask)
-            r0, r1 = int(rs.min()), int(rs.max())
-            c0, c1 = int(cs.min()), int(cs.max())
-            if not self._kernel_fits_bbox(r0=int(r0), r1=int(r1), c0=int(c0), c1=int(c1)):
+            # Pick a center where BOTH the original unique shape and its rotated version fit.
+            (r0_lo, r0_hi), (c0_lo, c0_hi) = _safe_center_range_for_offsets(size=size, offsets=uniq_offsets)
+            (r1_lo, r1_hi), (c1_lo, c1_hi) = _safe_center_range_for_offsets(size=size, offsets=rot_uniq_offsets)
+            r_lo = max(int(r0_lo), int(r1_lo))
+            r_hi = min(int(r0_hi), int(r1_hi))
+            c_lo = max(int(c0_lo), int(c1_lo))
+            c_hi = min(int(c0_hi), int(c1_hi))
+            if int(r_hi) < int(r_lo) or int(c_hi) < int(c_lo):
                 continue
 
-            # Reject degenerate cases where (kernel -> fall) doesn't change the unique component.
-            uniq = np.zeros_like(grid)
-            uniq[uniq_mask] = int(unique_color)
-            changed = np.zeros_like(grid)
-            for r, c in zip(rs.tolist(), cs.tolist()):
-                _apply_explosion(out=changed, row=int(r), col=int(c), color=int(unique_color), offsets=self._kernel_offsets)
-            fallen = _rigid_slide_to_wall(changed, direction="down")
-            if bool(np.array_equal(fallen, uniq)):
+            centers = [
+                (int(r), int(c)) for r in range(int(r_lo), int(r_hi) + 1) for c in range(int(c_lo), int(c_hi) + 1)
+            ]
+            centers = [centers[int(i)] for i in self.rng.permutation(np.arange(len(centers))).tolist()]
+
+            placed_unique = False
+            for r, c in centers:
+                if not can_place_unique_foreground(grid, center_r=int(r), center_c=int(c)):
+                    continue
+
+                cand = grid.copy()
+                # Draw unique in the foreground (may overwrite background base pixels).
+                _apply_centered_shape(
+                    cand, center_r=int(r), center_c=int(c), offsets=uniq_offsets, color=int(unique_base)
+                )
+                # Mark unique (same trick as Skill26).
+                rs, cs = np.nonzero(cand == int(unique_base))
+                pts = list(zip(rs.tolist(), cs.tolist()))
+                if not pts:
+                    continue
+                mr, mc = min(pts)
+                cand[int(mr), int(mc)] = int(unique_marker)
+
+                # Validate: base-color component counts are stable (unique once, dup twice).
+                uniq_mask = (cand == int(unique_base)) | (cand == int(unique_marker))
+                dup_mask = (cand == int(dup_base)) | (cand == int(dup_marker))
+                uniq_comps = _components_sorted(uniq_mask, connectivity=4)
+                dup_comps = _components_sorted(dup_mask, connectivity=4)
+                if int(len(uniq_comps)) != 1 or int(len(dup_comps)) != 2:
+                    continue
+
+                # Ensure markers are not isolated: each component must contain >=1 base pixel and exactly 1 marker.
+                def comp_ok(comp: list[tuple[int, int]], *, base: int, marker: int) -> bool:
+                    b_ct = 0
+                    m_ct = 0
+                    for rr, cc2 in comp:
+                        v = int(cand[int(rr), int(cc2)])
+                        if int(v) == int(base):
+                            b_ct += 1
+                        if int(v) == int(marker):
+                            m_ct += 1
+                    return int(b_ct) >= 1 and int(m_ct) == 1
+
+                if not bool(comp_ok(uniq_comps[0], base=int(unique_base), marker=int(unique_marker))):
+                    continue
+                if not all(bool(comp_ok(comp, base=int(dup_base), marker=int(dup_marker))) for comp in dup_comps):
+                    continue
+
+                # Validate: Skill26-style "rotate then slide" changes something for the unique object.
+                only = np.zeros_like(cand)
+                only[(cand == int(unique_base)) | (cand == int(unique_marker))] = cand[
+                    (cand == int(unique_base)) | (cand == int(unique_marker))
+                ]
+                rotated = _rotate_grid_one_component_clockwise(only, degrees=int(self._degrees))
+                slid = _rigid_slide_to_wall(rotated, direction=str(self._direction))
+                if bool(np.array_equal(slid, rotated)):
+                    continue
+
+                grid = cand
+                placed_unique = True
+                break
+
+            if not placed_unique:
+                continue
+
+            # Final sanity: the marker colors must still be present for both types.
+            if not bool(np.any(grid == int(unique_marker))):
+                continue
+            if not bool(np.any(grid == int(dup_marker))):
                 continue
             return grid
 
-        # Last resort: still return a valid uniqueness-by-components grid.
-        grid, _unique_color = _make_unique_rects_grid(
-            size=size,
-            colors=self.colors,
+        # Fallback (should be rare): return a simple, non-overlapping instance set.
+        grid = self.blank()
+        _ = place_dup_instance(grid, offsets=dup_offsets)
+        _ = place_dup_instance(grid, offsets=dup_offsets)
+        # In fallback, avoid overlap to keep it always valid.
+        _ = _try_place_offsets_no_touch(
+            grid,
+            offsets=uniq_offsets,
+            color=int(unique_base),
             rng=self.rng,
-            ood=bool(ood),
-            rect_sizes=self._rect_sizes,
-            unique_components=1,
             connectivity=4,
+            buffer=0,
+            max_tries=800,
         )
         return grid
 
     def apply(self, grid: np.ndarray, rule_color: Optional[int]) -> np.ndarray:
         _ = rule_color
-        counts = _component_counts_by_color(grid, connectivity=4)
-        unique_colors = [c for c, k in counts.items() if int(k) == 1]
-        if int(len(unique_colors)) != 1:
-            return np.zeros_like(grid)
-        unique_c = int(unique_colors[0])
+        # Robustly identify the (base, marker) pair for each object type.
+        #
+        # For a candidate base color `b`, we define its marker color as f(b)=_ray_color_from_source(b).
+        # Then we look at connected components in the mask (grid==b OR grid==f(b)).
+        #
+        # A valid object type must satisfy:
+        # - number of components is 1 or 2
+        # - each component contains exactly one marker pixel
+        # - each component contains at least one base pixel (marker can't be isolated)
+        candidates: dict[int, int] = {}  # base -> n_components
+        for b in (1, 2, 3, 4):
+            base = int(b)
+            marker = int(_ray_color_from_source(int(base)))
+            mask = (grid == int(base)) | (grid == int(marker))
+            if not bool(np.any(mask)):
+                continue
+            if not bool(np.any(grid == int(marker))):
+                continue
 
-        mask = grid == unique_c
-        rs, cs = np.nonzero(mask)
-        if int(rs.size) == 0:
+            comps = _components_sorted(mask, connectivity=4)
+            if int(len(comps)) not in (1, 2):
+                continue
+
+            ok = True
+            for comp in comps:
+                m_ct = 0
+                b_ct = 0
+                for r, c in comp:
+                    v = int(grid[int(r), int(c)])
+                    if int(v) == int(marker):
+                        m_ct += 1
+                    if int(v) == int(base):
+                        b_ct += 1
+                if int(m_ct) != 1 or int(b_ct) < 1:
+                    ok = False
+                    break
+            if not ok:
+                continue
+
+            candidates[int(base)] = int(len(comps))
+
+        uniques = [b for b, k in candidates.items() if int(k) == 1]
+        dups = [b for b, k in candidates.items() if int(k) == 2]
+        if int(len(uniques)) != 1 or int(len(dups)) < 1:
             return np.zeros_like(grid)
 
-        changed = np.zeros_like(grid)
-        for r, c in zip(rs.tolist(), cs.tolist()):
-            _apply_explosion(out=changed, row=int(r), col=int(c), color=int(unique_c), offsets=self._kernel_offsets)
-        return _rigid_slide_to_wall(changed, direction="down")
+        unique_base = int(uniques[0])
+        unique_marker = int(_ray_color_from_source(int(unique_base)))
+
+        only = np.zeros_like(grid)
+        sel = (grid == int(unique_base)) | (grid == int(unique_marker))
+        only[sel] = grid[sel]
+        rotated = _rotate_grid_one_component_clockwise(only, degrees=int(self._degrees))
+        return _rigid_slide_to_wall(rotated, direction=str(self._direction))
 
 
 # --- Update the Factory ---
