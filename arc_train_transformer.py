@@ -1820,13 +1820,13 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--plot_solved_n",
         type=int,
-        default=0,
+        default=3,
         help="Per-skill number of solved test examples to render as PNG during eval (0 disables).",
     )
     p.add_argument(
         "--plot_augmented_n",
         type=int,
-        default=0,
+        default=3,
         help=(
             "Per-skill number of eval examples to render as PNG after applying the *train-time* augmentation pipeline "
             "(0 disables). Saved under plots/augmented_examples/."
