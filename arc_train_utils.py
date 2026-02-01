@@ -1243,6 +1243,19 @@ def _pad_batch_variable(
     return src, tgt, key_padding_mask, torch.tensor([int(s.shape[0]) for s in src_tensors], device=device, dtype=torch.long)
 
 
+_SORTED_BY_LEN_CACHE: dict[int, np.ndarray] = {}
+
+
+def _indices_sorted_by_src_len(pool: TensorizedDataset) -> np.ndarray:
+    """Return indices into pool sorted by source sequence length (cached per pool)."""
+    key = id(pool)
+    if key not in _SORTED_BY_LEN_CACHE:
+        n = pool.n
+        lengths = np.array([int(pool.src_list[i].shape[0]) for i in range(n)], dtype=np.int64)
+        _SORTED_BY_LEN_CACHE[key] = np.argsort(lengths)
+    return _SORTED_BY_LEN_CACHE[key]
+
+
 def prepare_batch(
     *,
     batch_size: int,
@@ -1254,16 +1267,26 @@ def prepare_batch(
     num_demos: Optional[int] = None,
     T_max: Optional[int] = None,
     G_max: Optional[int] = None,
+    group_by_length: bool = True,
 ) -> Batch:
     """
     Sample a batch and pad to T_max/G_max when provided (so model sees fixed layout), else to batch max.
+    When group_by_length is True, samples a contiguous segment from indices sorted by sequence length
+    so that batches have similar lengths and less padding (faster training).
     """
     bsz = int(batch_size)
-    pool_device = train_pool.src_list[0].device if train_pool.n > 0 else torch.device("cpu")
-    if pool_device.type == "cpu":
+    n = int(train_pool.n)
+    pool_device = train_pool.src_list[0].device if n > 0 else torch.device("cpu")
+
+    if group_by_length and n >= bsz:
+        sorted_idx = _indices_sorted_by_src_len(train_pool)
+        start = int(torch.randint(0, n - bsz + 1, (1,), generator=cpu_generator, device=torch.device("cpu")).item())
+        batch_idx = sorted_idx[start : start + bsz]
+        idx = torch.from_numpy(batch_idx).to(device=pool_device, dtype=torch.long)
+    elif pool_device.type == "cpu":
         idx = torch.randint(
             low=0,
-            high=int(train_pool.n),
+            high=n,
             size=(bsz,),
             device=torch.device("cpu"),
             generator=cpu_generator,
@@ -1272,7 +1295,7 @@ def prepare_batch(
     else:
         idx = torch.randint(
             low=0,
-            high=int(train_pool.n),
+            high=n,
             size=(bsz,),
             device=pool_device,
             dtype=torch.long,
