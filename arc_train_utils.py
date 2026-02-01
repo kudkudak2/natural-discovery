@@ -139,7 +139,15 @@ def progress(iterable, *, total: int, desc: str, enabled: bool):
     if _has_tqdm():
         from tqdm import tqdm  # type: ignore
 
-        return tqdm(iterable, total=total, desc=desc)
+        return tqdm(
+            iterable,
+            total=total,
+            desc=desc,
+            unit="it",
+            unit_scale=False,
+            smoothing=0.1,
+            bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]",
+        )
     return iterable
 
 
@@ -1580,7 +1588,11 @@ def evaluate_accuracy(
     print_solved_max: int = 0,
     print_solved_step: Optional[int] = None,
     print_solved_tag: str = "test",
+    show_progress: bool = False,
 ) -> float:
+    """
+    Evaluate accuracy on a random subset of the dataset (at most n_tasks examples).
+    """
     model.eval()
     k = min(int(n_tasks), dataset.n)
     if k <= 0:
@@ -1592,12 +1604,26 @@ def evaluate_accuracy(
     grid_each = dataset.grid_size_each.index_select(0, idx_full).to(device)
 
     bs = max(1, int(eval_batch_size))
+    num_batches = (k + bs - 1) // bs
+    batch_offsets = range(0, k, bs)
+    if show_progress and _has_tqdm():
+        from tqdm import tqdm  # type: ignore
+
+        batch_offsets = tqdm(
+            batch_offsets,
+            total=num_batches,
+            desc="eval",
+            unit="it",
+            unit_scale=False,
+            smoothing=0.1,
+            bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]",
+        )
     correct = 0
     saved_unsolved = 0
     saved_solved = 0
     saved_augmented = 0
     printed = 0
-    for off in range(0, k, bs):
+    for off in batch_offsets:
         batch_idx = idx_full[off : off + bs]
         xb, yb, key_padding_mask, _ = _pad_batch_variable(
             dataset.src_list,

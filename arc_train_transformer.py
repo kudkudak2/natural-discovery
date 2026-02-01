@@ -1417,6 +1417,7 @@ def main(
                     eval_batch_size=int(eval_batch_size),
                     vote_augs=int(eval_vote_augs),
                     vote_spec=vote_spec,
+                    show_progress=bool(progress),
                 )
                 acc_id[sid] = evaluate_accuracy(
                     model=model,
@@ -1444,6 +1445,7 @@ def main(
                     print_solved_max=int(print_solved_n_i) if int(sid) == int(first_sid) else 0,
                     print_solved_step=int(step),
                     print_solved_tag="id",
+                    show_progress=bool(progress),
                 )
                 if sid in eval_ood_sets:
                     acc_ood[sid] = evaluate_accuracy(
@@ -1469,6 +1471,7 @@ def main(
                         save_augmented_step=int(step),
                         save_augmented_tag="ood",
                         save_augmented_spec=aug_spec if bool(aug_spec.enabled) else None,
+                        show_progress=bool(progress),
                     )
 
             # Optional strict OOD probe (held-out OOD test).
@@ -1484,6 +1487,7 @@ def main(
                     eval_batch_size=int(eval_batch_size),
                     vote_augs=int(eval_vote_augs),
                     vote_spec=vote_spec,
+                    show_progress=bool(progress),
                 )
 
             acc_probe_train = float("nan")
@@ -1498,6 +1502,7 @@ def main(
                     eval_batch_size=int(eval_batch_size),
                     vote_augs=int(eval_vote_augs),
                     vote_spec=vote_spec,
+                    show_progress=bool(progress),
                 )
 
             def fmt(acc: dict[int, float], skills: list[int]) -> str:
