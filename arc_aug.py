@@ -205,11 +205,18 @@ def sample_geom_code_np(*, rng: np.random.Generator) -> int:
     return int(rng.integers(0, 8))
 
 
-def _prompt_expected_seq_len(*, grid_size: int, num_demos: int) -> int:
-    g = int(grid_size)
+def _prompt_expected_seq_len(
+    *,
+    grid_size: int,
+    num_demos: int,
+    output_grid_size: Optional[int] = None,
+) -> int:
+    g_in = int(grid_size)
+    g_out = int(output_grid_size if output_grid_size is not None else grid_size)
     nd = int(num_demos)
-    grid_tokens = g * g
-    return nd * (2 * grid_tokens + 2) + (grid_tokens + 1)
+    in_tokens = g_in * g_in
+    out_tokens = g_out * g_out
+    return nd * (in_tokens + 1 + out_tokens + 1) + (in_tokens + 1)
 
 
 def augment_prompt_np(
@@ -543,16 +550,11 @@ def augment_src_tgt_batch(
     num_demos: int,
     generator: Optional[torch.Generator],
     spec: AugmentSpec,
+    output_grid_size: Optional[int] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
-    Token-level augmentation for the Transformer training pipeline.
-
-    `src` format must match arc_train_utils._flatten_prompt:
-      (x SEP y SEP) repeated `num_demos` times, then (test_x SEP)
-
-    Args:
-      src: (B, T) long tokens in [0..PAD_TOKEN]
-      tgt: (B, grid_tokens) long tokens in [0..9]
+    Token-level augmentation. Supports different input (grid_size) and output (output_grid_size) grid sizes.
+    When output_grid_size is None, it equals grid_size (same-size layout).
     """
     if not bool(spec.enabled):
         return src, tgt
@@ -565,22 +567,24 @@ def augment_src_tgt_batch(
     if src.ndim != 2:
         raise ValueError(f"Expected src shape (B,T), got {tuple(src.shape)}")
     b, t = int(src.shape[0]), int(src.shape[1])
-    g = int(grid_size)
+    g_in = int(grid_size)
+    g_out = int(output_grid_size if output_grid_size is not None else grid_size)
     nd = int(num_demos)
-    if g <= 0:
-        raise ValueError(f"grid_size must be >= 1, got {g}")
+    if g_in <= 0 or g_out <= 0:
+        raise ValueError(f"grid_size and output_grid_size must be >= 1, got {g_in}, {g_out}")
     if nd <= 0:
         raise ValueError(f"num_demos must be >= 1, got {nd}")
-    grid_tokens = int(g * g)
-    expected_t = _prompt_expected_seq_len(grid_size=g, num_demos=nd)
+    in_tokens = g_in * g_in
+    out_tokens = g_out * g_out
+    expected_t = _prompt_expected_seq_len(grid_size=g_in, num_demos=nd, output_grid_size=g_out)
     if int(t) != int(expected_t):
-        raise ValueError(f"Unexpected src length={t} (expected {expected_t}) for grid_size={g}, num_demos={nd}")
-    if tgt.ndim != 2 or int(tgt.shape[0]) != b or int(tgt.shape[1]) != grid_tokens:
-        raise ValueError(f"Expected tgt shape (B,{grid_tokens}), got {tuple(tgt.shape)}")
+        raise ValueError(f"Unexpected src length={t} (expected {expected_t}) for grid_size={g_in}, output_grid_size={g_out}, num_demos={nd}")
+    if tgt.ndim != 2 or int(tgt.shape[0]) != b or int(tgt.shape[1]) != out_tokens:
+        raise ValueError(f"Expected tgt shape (B,{out_tokens}), got {tuple(tgt.shape)}")
 
     device = src.device
-    # --- sample which transforms to apply ---
-    # geom: per-sample code in [0..7], or 0 for identity when not applied
+    g_max = max(g_in, g_out)
+
     p_geom = float(spec.geom_prob)
     if p_geom <= 0.0:
         geom_codes = torch.zeros((b,), device=device, dtype=torch.long)
@@ -589,7 +593,6 @@ def augment_src_tgt_batch(
         codes = torch.randint(0, 8, (b,), device=device, generator=generator, dtype=torch.long)
         geom_codes = torch.where(apply_geom, codes, torch.zeros_like(codes))
 
-    # color: per-sample map, or identity map when not applied
     p_col = float(spec.color_prob)
     if p_col <= 0.0:
         color_maps = torch.arange(int(VOCAB_SIZE), device=device, dtype=torch.long).unsqueeze(0).repeat(b, 1)
@@ -604,39 +607,38 @@ def augment_src_tgt_batch(
         ident = torch.arange(int(VOCAB_SIZE), device=device, dtype=torch.long).unsqueeze(0).repeat(b, 1)
         color_maps = torch.where(apply_col.unsqueeze(1), rand_maps, ident)
 
-    # translate: per-sample (dy,dx), or (0,0) when not applied
     p_tr = float(spec.translate_prob)
     if p_tr <= 0.0:
         dy = torch.zeros((b,), device=device, dtype=torch.long)
         dx = torch.zeros((b,), device=device, dtype=torch.long)
     else:
         apply_tr = torch.rand((b,), device=device, generator=generator) < float(p_tr)
-        # shift bounds are computed from the union bbox across src grids + (masked) tgt.
-        # For targets, treat invalid cells (-100) as background 0 when computing bbox.
-        # We will restore the invalid mask after transformations.
-        # (We'll compute dy/dx after parsing grids below.)
         dy = torch.zeros((b,), device=device, dtype=torch.long)
         dx = torch.zeros((b,), device=device, dtype=torch.long)
 
-    # --- parse src into grids (nd*(x,y) + test_x), apply transforms, then stitch back ---
-    # Gather grids into (B, 7, g, g)
+    # Parse with in_tokens / out_tokens; pad to g_max for transform stack
+    def pad_to_gmax(grid: torch.Tensor, h: int, w: int) -> torch.Tensor:
+        out = torch.zeros((b, g_max, g_max), device=device, dtype=grid.dtype)
+        out[:, :h, :w] = grid
+        return out
+
     grids: list[torch.Tensor] = []
     off = 0
     for _ in range(nd):
-        x = src[:, off : off + grid_tokens].reshape(b, g, g)
-        off += grid_tokens + 1  # + SEP
-        y = src[:, off : off + grid_tokens].reshape(b, g, g)
-        off += grid_tokens + 1  # + SEP
-        grids.append(x)
-        grids.append(y)
-    test_x = src[:, off : off + grid_tokens].reshape(b, g, g)
-    grids.append(test_x)
+        x = src[:, off : off + in_tokens].reshape(b, g_in, g_in)
+        off += in_tokens + 1
+        y = src[:, off : off + out_tokens].reshape(b, g_out, g_out)
+        off += out_tokens + 1
+        grids.append(pad_to_gmax(x, g_in, g_in))
+        grids.append(pad_to_gmax(y, g_out, g_out))
+    test_x = src[:, off : off + in_tokens].reshape(b, g_in, g_in)
+    grids.append(pad_to_gmax(test_x, g_in, g_in))
 
-    grids_stacked = torch.stack(grids, dim=1).to(torch.long)  # (B, 2*nd+1, g, g)
-    tgt_valid = (tgt != -100).reshape(b, g, g)  # (B,g,g) bool
-    tgt_filled = torch.where(tgt_valid, tgt.reshape(b, g, g), torch.zeros((b, g, g), device=device, dtype=torch.long))
-    tgt_grid = tgt_filled.unsqueeze(1).to(torch.long)  # (B, 1, g, g)
-    all_grids = torch.cat([grids_stacked, tgt_grid], dim=1)  # (B, 2*nd+2, g, g)
+    grids_stacked = torch.stack(grids, dim=1).to(torch.long)  # (B, 2*nd+1, g_max, g_max)
+    tgt_valid = (tgt != -100).reshape(b, g_out, g_out)
+    tgt_filled = torch.where(tgt_valid, tgt.reshape(b, g_out, g_out), torch.zeros((b, g_out, g_out), device=device, dtype=torch.long))
+    tgt_padded = pad_to_gmax(tgt_filled, g_out, g_out).unsqueeze(1)  # (B, 1, g_max, g_max)
+    all_grids = torch.cat([grids_stacked, tgt_padded], dim=1)  # (B, 2*nd+2, g_max, g_max)
 
     all_grids = _apply_geom_torch(all_grids, codes=geom_codes)
 
@@ -648,34 +650,28 @@ def augment_src_tgt_batch(
 
     all_grids = _apply_color_maps_torch(all_grids, maps=color_maps)
 
-    # Split back
     grids_stacked = all_grids[:, : (2 * nd + 1)]
-    tgt_grid = all_grids[:, (2 * nd + 1) :, :, :].squeeze(1)  # (B,g,g)
+    tgt_grid = all_grids[:, (2 * nd + 1) :, :, :].squeeze(1)[:, :g_out, :g_out]  # (B, g_out, g_out)
 
-    # Restore target ignore mask after transforms by transforming the mask itself.
-    tgt_valid_t = tgt_valid.unsqueeze(1).to(torch.long)  # (B,1,g,g)
-    tgt_valid_t = _apply_geom_torch(tgt_valid_t, codes=geom_codes)
+    tgt_valid_t = tgt_valid.unsqueeze(1).to(torch.long)
+    tgt_valid_pad = pad_to_gmax(tgt_valid_t.squeeze(1).to(torch.long), g_out, g_out).unsqueeze(1)
+    tgt_valid_t = _apply_geom_torch(tgt_valid_pad, codes=geom_codes)
     if p_tr > 0.0:
         tgt_valid_t = _apply_shifts_torch(tgt_valid_t, dy=dy, dx=dx)
-    tgt_valid_t = tgt_valid_t.squeeze(1).to(torch.bool)
-    out_tgt = torch.where(tgt_valid_t.reshape(b, grid_tokens), tgt_grid.reshape(b, grid_tokens), torch.full((b, grid_tokens), -100, device=device, dtype=torch.long))
+    tgt_valid_t = tgt_valid_t.squeeze(1)[:, :g_out, :g_out].to(torch.bool)
+    out_tgt = torch.where(tgt_valid_t.reshape(b, out_tokens), tgt_grid.reshape(b, out_tokens), torch.full((b, out_tokens), -100, device=device, dtype=torch.long))
 
-    # Stitch src back, preserving SEP tokens in place.
     out_src = src.clone()
     off = 0
     gi = 0
     for _ in range(nd):
-        out_src[:, off : off + grid_tokens] = grids_stacked[:, gi].reshape(b, grid_tokens)
+        out_src[:, off : off + in_tokens] = grids_stacked[:, gi, :g_in, :g_in].reshape(b, in_tokens)
         gi += 1
-        off += grid_tokens
-        off += 1  # SEP
-        out_src[:, off : off + grid_tokens] = grids_stacked[:, gi].reshape(b, grid_tokens)
+        off += in_tokens + 1
+        out_src[:, off : off + out_tokens] = grids_stacked[:, gi, :g_out, :g_out].reshape(b, out_tokens)
         gi += 1
-        off += grid_tokens
-        off += 1  # SEP
-    out_src[:, off : off + grid_tokens] = grids_stacked[:, gi].reshape(b, grid_tokens)
-    # Note: SEPs/PADs are untouched, but if the original src had bad values outside [0..PAD_TOKEN],
-    # earlier checks would have caught it.
+        off += out_tokens + 1
+    out_src[:, off : off + in_tokens] = grids_stacked[:, gi, :g_in, :g_in].reshape(b, in_tokens)
     return out_src, out_tgt
 
 
@@ -687,24 +683,37 @@ def augment_src_tgt_batch_with_params(
     num_demos: int,
     generator: Optional[torch.Generator],
     spec: AugmentSpec,
+    output_grid_size: Optional[int] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, AugmentParams]:
     """
     Same as `augment_src_tgt_batch`, but also returns the sampled per-sample transform params.
-    Intended for test-time augmentation / voting.
+    Supports different input (grid_size) and output (output_grid_size) grid sizes.
     """
     if not bool(spec.enabled):
         zeros = torch.zeros((int(src.shape[0]),), device=src.device, dtype=torch.long)
         ident = torch.arange(int(VOCAB_SIZE), device=src.device, dtype=torch.long).unsqueeze(0).repeat(int(src.shape[0]), 1)
         return src, tgt, AugmentParams(geom_codes=zeros, color_maps=ident, dy=zeros, dx=zeros)
 
-    # Reuse the exact logic by inlining the sampling portions from augment_src_tgt_batch.
     if src.ndim != 2:
         raise ValueError(f"Expected src shape (B,T), got {tuple(src.shape)}")
     b = int(src.shape[0])
     device = src.device
-    g = int(grid_size)
+    g_in = int(grid_size)
+    g_out = int(output_grid_size if output_grid_size is not None else grid_size)
     nd = int(num_demos)
-    grid_tokens = int(g * g)
+    in_tokens = g_in * g_in
+    out_tokens = g_out * g_out
+    g_max = max(g_in, g_out)
+    if g_in <= 0 or g_out <= 0:
+        raise ValueError(f"grid_size and output_grid_size must be >= 1, got {g_in}, {g_out}")
+    expected_t = _prompt_expected_seq_len(grid_size=g_in, num_demos=nd, output_grid_size=g_out)
+    if int(src.shape[1]) != expected_t:
+        raise ValueError(
+            f"Unexpected src length={src.shape[1]} (expected {expected_t}) for grid_size={g_in}, "
+            f"output_grid_size={g_out}, num_demos={nd}"
+        )
+    if int(tgt.shape[1]) != out_tokens:
+        raise ValueError(f"Expected tgt shape (B,{out_tokens}), got {tuple(tgt.shape)}")
 
     # --- sample which transforms to apply ---
     p_geom = float(spec.geom_prob)
@@ -736,24 +745,30 @@ def augment_src_tgt_batch_with_params(
     dy = torch.zeros((b,), device=device, dtype=torch.long)
     dx = torch.zeros((b,), device=device, dtype=torch.long)
 
-    # --- parse src into grids + tgt (mask-aware) ---
+    def pad_to_gmax(grid: torch.Tensor, h: int, w: int) -> torch.Tensor:
+        out = torch.zeros((b, g_max, g_max), device=device, dtype=grid.dtype)
+        out[:, :h, :w] = grid
+        return out
+
     grids: list[torch.Tensor] = []
     off = 0
     for _ in range(nd):
-        x = src[:, off : off + grid_tokens].reshape(b, g, g)
-        off += grid_tokens + 1
-        y = src[:, off : off + grid_tokens].reshape(b, g, g)
-        off += grid_tokens + 1
-        grids.append(x)
-        grids.append(y)
-    test_x = src[:, off : off + grid_tokens].reshape(b, g, g)
-    grids.append(test_x)
+        x = src[:, off : off + in_tokens].reshape(b, g_in, g_in)
+        off += in_tokens + 1
+        y = src[:, off : off + out_tokens].reshape(b, g_out, g_out)
+        off += out_tokens + 1
+        grids.append(pad_to_gmax(x, g_in, g_in))
+        grids.append(pad_to_gmax(y, g_out, g_out))
+    test_x = src[:, off : off + in_tokens].reshape(b, g_in, g_in)
+    grids.append(pad_to_gmax(test_x, g_in, g_in))
 
-    grids_stacked = torch.stack(grids, dim=1).to(torch.long)  # (B, 2*nd+1, g, g)
-    tgt_valid = (tgt != -100).reshape(b, g, g)
-    tgt_filled = torch.where(tgt_valid, tgt.reshape(b, g, g), torch.zeros((b, g, g), device=device, dtype=torch.long))
-    tgt_grid = tgt_filled.unsqueeze(1).to(torch.long)
-    all_grids = torch.cat([grids_stacked, tgt_grid], dim=1)  # (B, 2*nd+2, g, g)
+    grids_stacked = torch.stack(grids, dim=1).to(torch.long)  # (B, 2*nd+1, g_max, g_max)
+    tgt_valid = (tgt != -100).reshape(b, g_out, g_out)
+    tgt_filled = torch.where(
+        tgt_valid, tgt.reshape(b, g_out, g_out), torch.zeros((b, g_out, g_out), device=device, dtype=torch.long)
+    )
+    tgt_padded = pad_to_gmax(tgt_filled, g_out, g_out).unsqueeze(1)
+    all_grids = torch.cat([grids_stacked, tgt_padded], dim=1)  # (B, 2*nd+2, g_max, g_max)
 
     all_grids = _apply_geom_torch(all_grids, codes=geom_codes)
     if p_tr > 0.0:
@@ -764,30 +779,31 @@ def augment_src_tgt_batch_with_params(
     all_grids = _apply_color_maps_torch(all_grids, maps=color_maps)
 
     grids_stacked = all_grids[:, : (2 * nd + 1)]
-    tgt_grid = all_grids[:, (2 * nd + 1) :, :, :].squeeze(1)
+    tgt_grid = all_grids[:, (2 * nd + 1) :, :, :].squeeze(1)[:, :g_out, :g_out]
 
     tgt_valid_t = tgt_valid.unsqueeze(1).to(torch.long)
-    tgt_valid_t = _apply_geom_torch(tgt_valid_t, codes=geom_codes)
+    tgt_valid_pad = pad_to_gmax(tgt_valid_t.squeeze(1).to(torch.long), g_out, g_out).unsqueeze(1)
+    tgt_valid_t = _apply_geom_torch(tgt_valid_pad, codes=geom_codes)
     if p_tr > 0.0:
         tgt_valid_t = _apply_shifts_torch(tgt_valid_t, dy=dy, dx=dx)
-    tgt_valid_t = tgt_valid_t.squeeze(1).to(torch.bool)
+    tgt_valid_t = tgt_valid_t.squeeze(1)[:, :g_out, :g_out].to(torch.bool)
     out_tgt = torch.where(
-        tgt_valid_t.reshape(b, grid_tokens),
-        tgt_grid.reshape(b, grid_tokens),
-        torch.full((b, grid_tokens), -100, device=device, dtype=torch.long),
+        tgt_valid_t.reshape(b, out_tokens),
+        tgt_grid.reshape(b, out_tokens),
+        torch.full((b, out_tokens), -100, device=device, dtype=torch.long),
     )
 
     out_src = src.clone()
     off = 0
     gi = 0
     for _ in range(nd):
-        out_src[:, off : off + grid_tokens] = grids_stacked[:, gi].reshape(b, grid_tokens)
+        out_src[:, off : off + in_tokens] = grids_stacked[:, gi, :g_in, :g_in].reshape(b, in_tokens)
         gi += 1
-        off += grid_tokens + 1
-        out_src[:, off : off + grid_tokens] = grids_stacked[:, gi].reshape(b, grid_tokens)
+        off += in_tokens + 1
+        out_src[:, off : off + out_tokens] = grids_stacked[:, gi, :g_out, :g_out].reshape(b, out_tokens)
         gi += 1
-        off += grid_tokens + 1
-    out_src[:, off : off + grid_tokens] = grids_stacked[:, gi].reshape(b, grid_tokens)
+        off += out_tokens + 1
+    out_src[:, off : off + in_tokens] = grids_stacked[:, gi, :g_in, :g_in].reshape(b, in_tokens)
 
     params = AugmentParams(geom_codes=geom_codes, color_maps=color_maps, dy=dy, dx=dx)
     return out_src, out_tgt, params

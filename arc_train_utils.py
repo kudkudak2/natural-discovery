@@ -17,8 +17,6 @@ from arc_aug import AugmentSpec, augment_src_tgt_batch, augment_src_tgt_batch_wi
 
 import hashlib
 
-
-# --- Unit test runner (used by training scripts) ---
 def run_unit_tests(*, test_paths: list[Path]) -> None:
     """
     Run pytest on the given paths. Raises on failure.
@@ -60,14 +58,51 @@ ARC_COLORS = [
 ]
 
 
-def prompt_seq_len(*, grid_size: int, num_demos: int = 3) -> int:
+def prompt_seq_len(
+    *,
+    grid_size: int,
+    num_demos: int = 3,
+    output_grid_size: Optional[int] = None,
+) -> int:
     """
     Prompt layout (fixed):
       (x SEP y SEP) repeated `num_demos` times, then (test_x SEP)
-    where x/y/test_x are grid_size*grid_size tokens.
+    where x/test_x are input grid_size*grid_size tokens and y is output_grid_size*output_grid_size.
+    When output_grid_size is None, it equals grid_size (input and output same size).
     """
-    g = int(grid_size) * int(grid_size)
-    return int(num_demos) * (g + 1 + g + 1) + (g + 1)
+    g_in = int(grid_size) * int(grid_size)
+    out_g = int(output_grid_size if output_grid_size is not None else grid_size)
+    g_out = out_g * out_g
+    return int(num_demos) * (g_in + 1 + g_out + 1) + (g_in + 1)
+
+
+def infer_input_grid_size(
+    seq_len: int,
+    num_demos: int,
+    output_grid_size: int,
+) -> Optional[int]:
+    """
+    Infer input grid side from prompt sequence length when layout is (g_in, g_out, num_demos).
+    Returns g_in if seq_len == prompt_seq_len(g_in, num_demos, output_grid_size) for some g_in, else None.
+    """
+    nd = int(num_demos)
+    g_out = int(output_grid_size)
+    if nd <= 0 or g_out <= 0:
+        return None
+    out_sq = g_out * g_out
+    remainder = int(seq_len) - nd * (2 + out_sq) - 1
+    if remainder <= 0:
+        return None
+    denom = nd + 1
+    if remainder % denom != 0:
+        return None
+    g_in_sq = remainder // denom
+    g_in = int(round(math.sqrt(g_in_sq)))
+    if g_in * g_in != g_in_sq or g_in <= 0:
+        return None
+    if prompt_seq_len(grid_size=g_in, num_demos=nd, output_grid_size=g_out) != int(seq_len):
+        return None
+    return g_in
 
 
 def _max_grid_size_for_seq_len(*, max_seq_len: int, num_demos: int) -> int:
@@ -119,42 +154,51 @@ def _decode_prompt_src(
     src_tokens: np.ndarray,
     grid_size: int,
     num_demos: int = 3,
+    output_grid_size: Optional[int] = None,
 ) -> tuple[list[tuple[np.ndarray, np.ndarray]], np.ndarray]:
     """
     Inverse of `_flatten_prompt` for visualization/debug.
     Layout: (x SEP y SEP) repeated `num_demos` times, then (test_x SEP).
+    x/test_x use grid_size (input); y uses output_grid_size (default grid_size).
     """
     if src_tokens.ndim != 1:
         raise ValueError(f"Expected 1D src_tokens, got shape={src_tokens.shape}")
-    g = int(grid_size)
-    if g <= 0:
-        raise ValueError(f"grid_size must be >= 1, got {g}")
-    grid_tokens = g * g
-    expected = prompt_seq_len(grid_size=g, num_demos=int(num_demos))
+    g_in = int(grid_size)
+    g_out = int(output_grid_size if output_grid_size is not None else grid_size)
+    if g_in <= 0:
+        raise ValueError(f"grid_size must be >= 1, got {g_in}")
+    if g_out <= 0:
+        raise ValueError(f"output_grid_size must be >= 1, got {g_out}")
+    in_tokens = g_in * g_in
+    out_tokens = g_out * g_out
+    expected = prompt_seq_len(grid_size=g_in, num_demos=int(num_demos), output_grid_size=g_out)
     if int(src_tokens.shape[0]) != int(expected):
         raise ValueError(f"Unexpected src length={int(src_tokens.shape[0])} (expected {expected})")
 
-    def unflatten(block: np.ndarray) -> np.ndarray:
-        return np.asarray(block, dtype=np.int64).reshape(g, g)
+    def unflatten_in(block: np.ndarray) -> np.ndarray:
+        return np.asarray(block, dtype=np.int64).reshape(g_in, g_in)
+
+    def unflatten_out(block: np.ndarray) -> np.ndarray:
+        return np.asarray(block, dtype=np.int64).reshape(g_out, g_out)
 
     demos: list[tuple[np.ndarray, np.ndarray]] = []
     off = 0
     for _ in range(int(num_demos)):
-        x = unflatten(src_tokens[off : off + grid_tokens])
-        off += grid_tokens
+        x = unflatten_in(src_tokens[off : off + in_tokens])
+        off += in_tokens
         if int(src_tokens[off]) != int(SEP_TOKEN):
             raise ValueError(f"Expected SEP after demo x at off={off}, got {int(src_tokens[off])}")
         off += 1
 
-        y = unflatten(src_tokens[off : off + grid_tokens])
-        off += grid_tokens
+        y = unflatten_out(src_tokens[off : off + out_tokens])
+        off += out_tokens
         if int(src_tokens[off]) != int(SEP_TOKEN):
             raise ValueError(f"Expected SEP after demo y at off={off}, got {int(src_tokens[off])}")
         off += 1
         demos.append((x, y))
 
-    test_x = unflatten(src_tokens[off : off + grid_tokens])
-    off += grid_tokens
+    test_x = unflatten_in(src_tokens[off : off + in_tokens])
+    off += in_tokens
     if int(src_tokens[off]) != int(SEP_TOKEN):
         raise ValueError(f"Expected trailing SEP after test_x at off={off}, got {int(src_tokens[off])}")
     return demos, test_x
@@ -165,9 +209,15 @@ def decode_prompt_src(
     src_tokens: np.ndarray,
     grid_size: int,
     num_demos: int = 3,
+    output_grid_size: Optional[int] = None,
 ) -> tuple[list[tuple[np.ndarray, np.ndarray]], np.ndarray]:
     """Public wrapper for `_decode_prompt_src` (used by other scripts for plotting/debug)."""
-    return _decode_prompt_src(src_tokens=src_tokens, grid_size=grid_size, num_demos=num_demos)
+    return _decode_prompt_src(
+        src_tokens=src_tokens,
+        grid_size=grid_size,
+        num_demos=num_demos,
+        output_grid_size=output_grid_size,
+    )
 
 
 def _save_arc_failure_png(
@@ -448,30 +498,37 @@ def _build_external_arcdataset(
 ) -> ARCDataset:
     g = int(grid_size)
     nd = int(num_demos)
-    if g <= 0:
-        raise ValueError(f"grid_size must be >= 1, got {g}")
-    if nd <= 0:
-        raise ValueError(f"num_demos must be >= 1, got {nd}")
+    # g <= 0: per-task padding (each task padded to its own max dimension). Variable grid size per task.
+    # g > 0: fixed grid; skip tasks with any grid > g, pad all to g.
+    use_per_task_padding = g <= 0
+    # nd <= 0 means "use all available demos per task".
 
     tasks: list[ARCTask] = []
     skipped_too_few_demos = 0
     skipped_too_large = 0
     for demo_xs, demo_ys, test_x, test_y, tid_suf in raw_tasks:
-        if int(len(demo_xs)) < nd or int(len(demo_ys)) < nd:
+        if int(len(demo_xs)) <= 0 or int(len(demo_ys)) <= 0:
+            skipped_too_few_demos += 1
+            continue
+        use_nd = int(nd) if int(nd) > 0 else min(int(len(demo_xs)), int(len(demo_ys)))
+        if int(use_nd) <= 0:
             skipped_too_few_demos += 1
             continue
         mx = 0
-        for gg in demo_xs[:nd] + demo_ys[:nd] + [test_x, test_y]:
+        for gg in demo_xs[:use_nd] + demo_ys[:use_nd] + [test_x, test_y]:
             h, w = _grid_dims(gg)
             mx = max(int(mx), int(h), int(w))
-        if int(mx) > int(g):
+        if not use_per_task_padding and int(mx) > int(g):
             skipped_too_large += 1
             continue
+        pad_size = int(mx) if use_per_task_padding else int(g)
 
-        demos: list[ARCExamplePair] = []
-        for i in range(nd):
-            demos.append(ARCExamplePair(x=_pad_to_square(demo_xs[i], size=g), y=_pad_to_square(demo_ys[i], size=g)))
-        test = ARCTestCase(x=_pad_to_square(test_x, size=g), y=_pad_to_square(test_y, size=g))
+        demos = []
+        for i in range(int(use_nd)):
+            demos.append(
+                ARCExamplePair(x=_pad_to_square(demo_xs[i], size=pad_size), y=_pad_to_square(demo_ys[i], size=pad_size))
+            )
+        test = ARCTestCase(x=_pad_to_square(test_x, size=pad_size), y=_pad_to_square(test_y, size=pad_size))
 
         task_id = _stable_id(dataset_id, str(split), tid_suf)
         tasks.append(
@@ -479,21 +536,23 @@ def _build_external_arcdataset(
                 task_id=str(task_id),
                 skill_id=0,
                 skill_name="external_arc",
-                grid_size=int(g),
+                grid_size=int(pad_size),
                 demos=demos,
                 test=test,
             )
         )
 
     if len(tasks) == 0:
-        raise ValueError(f"External dataset split {split!r} produced no usable tasks (nd={nd}).")
+        raise ValueError(f"External dataset split {split!r} produced no usable tasks (num_demos={nd}).")
+    # When per-task padding, dataset-level grid_size is max over tasks (for downstream compat).
+    ds_grid_size = max(int(t.grid_size) for t in tasks) if use_per_task_padding else int(g)
     return ARCDataset(
         dataset_id=str(dataset_id),
         created_at=ARCDataset.now_iso(),
         split=str(split),
         ood=False,
         skills=[0],
-        grid_size=int(g),
+        grid_size=int(ds_grid_size),
         tasks=tasks,
         extra={"skipped_too_few_demos": int(skipped_too_few_demos), "skipped_too_large": int(skipped_too_large)},
     )
@@ -556,19 +615,23 @@ def maybe_load_external_arc_splits(
         for v in m.values():
             raw_for_infer.extend(v)
 
-    if int(num_demos) > 0:
-        nd = int(num_demos)
-    else:
-        nd = min(int(len(dx)) for (dx, _dy, _tx, _ty, _tid) in raw_for_infer)
-        nd = max(1, int(nd))
+    # For external datasets, `num_demos` is treated as:
+    # - >0: cap each task to the first N demos
+    # - <=0: use all available demos per task (variable demo count supported downstream)
+    nd = int(num_demos)
+    nd_cap = max(int(len(dx)) for (dx, _dy, _tx, _ty, _tid) in raw_for_infer)
+    nd_cap = max(1, int(nd_cap))
 
     g_infer = int(grid_size) if int(grid_size) > 0 else _infer_external_grid_size(raw_for_infer)
-    if max_seq_len is not None and int(max_seq_len) > 0:
+    if max_seq_len is not None and int(max_seq_len) > 0 and int(nd) > 0:
+        # Use the worst-case demo count for the cap; tasks with fewer demos will be shorter.
+        # This keeps the resulting fixed token budget within max_seq_len without silently reducing demos.
         g_cap = _max_grid_size_for_seq_len(max_seq_len=int(max_seq_len), num_demos=int(nd))
         if int(g_cap) <= 0:
             raise ValueError(
                 f"max_seq_len={int(max_seq_len)} is too small for num_demos={int(nd)} "
-                f"(minimum is prompt_seq_len(grid_size=1,num_demos={int(nd)})={int(prompt_seq_len(grid_size=1, num_demos=int(nd)))})."
+                f"(minimum is prompt_seq_len(grid_size=1,num_demos={int(nd)})="
+                f"{int(prompt_seq_len(grid_size=1, num_demos=int(nd)))})."
             )
         if int(grid_size) > 0 and int(g_infer) > int(g_cap):
             raise ValueError(
@@ -591,17 +654,19 @@ def maybe_load_external_arc_splits(
                     f"Detected ARC-AGI layout for {root} but one split is empty. "
                     "Ensure both <root>/training and <root>/evaluation contain .json files."
                 )
-            ds_train = _build_external_arcdataset(raw_tasks=raw_tr, split="train", grid_size=g, num_demos=nd, dataset_id=dataset_id)
+            ds_train = _build_external_arcdataset(raw_tasks=raw_tr, split="train", grid_size=int(grid_size), num_demos=nd, dataset_id=dataset_id)
             ds_eval = _build_external_arcdataset(
-                raw_tasks=raw_ev, split="evaluation", grid_size=g, num_demos=nd, dataset_id=dataset_id
+                raw_tasks=raw_ev, split="evaluation", grid_size=int(grid_size), num_demos=nd, dataset_id=dataset_id
             )
             if max_seq_len is not None and int(max_seq_len) > 0:
                 tr_sk = int(getattr(ds_train, "extra", {}).get("skipped_too_large", 0))
                 ev_sk = int(getattr(ds_eval, "extra", {}).get("skipped_too_large", 0))
                 if tr_sk > 0 or ev_sk > 0:
+                    # For nd<=0 ("use all demos"), this is only informational.
+                    demos_for_cap = int(nd) if int(nd) > 0 else int(nd_cap)
                     print(
                         f"[max_seq_len={int(max_seq_len)}] external_arc[{name}] skipped_too_large: "
-                        f"train={tr_sk} evaluation={ev_sk} (grid_size_cap={int(g)}, num_demos={int(nd)})",
+                        f"train={tr_sk} evaluation={ev_sk} (grid_size_cap={int(g)}, num_demos={int(demos_for_cap)})",
                         flush=True,
                     )
             t_train = _tensorize_dataset(ds_train, max_seq_len=max_seq_len)
@@ -617,36 +682,42 @@ def maybe_load_external_arc_splits(
             continue
 
         raw_all = splits.get("all", [])
-        ds_all = _build_external_arcdataset(raw_tasks=raw_all, split="all", grid_size=g, num_demos=nd, dataset_id=dataset_id)
+        ds_all = _build_external_arcdataset(raw_tasks=raw_all, split="all", grid_size=int(grid_size), num_demos=nd, dataset_id=dataset_id)
         if max_seq_len is not None and int(max_seq_len) > 0:
             sk = int(getattr(ds_all, "extra", {}).get("skipped_too_large", 0))
             if sk > 0:
+                # For nd<=0 ("use all demos"), this is only informational.
+                demos_for_cap = int(nd) if int(nd) > 0 else int(nd_cap)
                 print(
                     f"[max_seq_len={int(max_seq_len)}] external_arc[{name}] skipped_too_large: "
-                    f"all={sk} (grid_size_cap={int(g)}, num_demos={int(nd)})",
+                    f"all={sk} (grid_size_cap={int(g)}, num_demos={int(demos_for_cap)})",
                     flush=True,
                 )
         t_all = _tensorize_dataset(ds_all, max_seq_len=max_seq_len)
         tr, ev = split_dataset(t_all, train_frac=float(train_frac_for_unsplit), rng=rng)
+        out_g_tr = tr.effective_output_grid_size()
+        out_g_ev = ev.effective_output_grid_size()
         tr = TensorizedDataset(
             skill_id=0,
             split="train",
             grid_size=tr.grid_size,
             num_demos=tr.num_demos,
-            src=tr.src,
-            tgt=tr.tgt,
+            src_list=tr.src_list,
+            tgt_list=tr.tgt_list,
             grid_size_each=tr.grid_size_each,
             num_demos_each=tr.num_demos_each,
+            output_grid_size=out_g_tr,
         )
         ev = TensorizedDataset(
             skill_id=0,
             split="evaluation",
             grid_size=ev.grid_size,
             num_demos=ev.num_demos,
-            src=ev.src,
-            tgt=ev.tgt,
+            src_list=ev.src_list,
+            tgt_list=ev.tgt_list,
             grid_size_each=ev.grid_size_each,
             num_demos_each=ev.num_demos_each,
+            output_grid_size=out_g_ev,
         )
         assert_disjoint_datasets(a=tr, b=ev, label=f"external_generic[{name}]: train vs evaluation")
         out.append((name, tr, ev))
@@ -656,62 +727,67 @@ def maybe_load_external_arc_splits(
 
 @dataclass(frozen=True)
 class TensorizedDataset:
+    """
+    Variable-length storage: each example has its own seq length and target size.
+    Padding to batch max is done in prepare_batch (and eval batching).
+    """
     skill_id: int
     split: str
-    grid_size: int  # max grid size in this dataset tensorization
-    num_demos: int  # max num_demos in this dataset tensorization
-    src: torch.Tensor  # (N, T) padded with PAD_TOKEN
-    tgt: torch.Tensor  # (N, Gmax) padded with ignore_index (-100)
-    grid_size_each: torch.Tensor  # (N,) long
+    grid_size: int  # max input grid size (demos x, test x)
+    num_demos: int  # max num_demos_each in this dataset
+    src_list: list[torch.Tensor]  # length N; each (T_i,) source sequence
+    tgt_list: list[torch.Tensor]  # length N; each (G_i,) target grid flattened; G_i = output_side_i^2
+    grid_size_each: torch.Tensor  # (N,) long — output grid side we predict
     num_demos_each: torch.Tensor  # (N,) long
+    output_grid_size: int = 0  # max output grid size (demos y, target); 0 means same as grid_size
 
     @property
     def n(self) -> int:
-        return int(self.src.shape[0])
+        return len(self.src_list)
+
+    def effective_output_grid_size(self) -> int:
+        """Output grid size (same as grid_size when output_grid_size is 0)."""
+        return int(self.output_grid_size) if int(self.output_grid_size) > 0 else int(self.grid_size)
 
 
 def _subset_dataset(ds: TensorizedDataset, idx: np.ndarray, *, split_suffix: str) -> TensorizedDataset:
+    idx_list = idx.tolist()
+    out_g = int(ds.output_grid_size) if int(ds.output_grid_size) > 0 else int(ds.grid_size)
     return TensorizedDataset(
         skill_id=ds.skill_id,
         split=f"{ds.split}_{split_suffix}",
-        grid_size=ds.grid_size,
-        num_demos=ds.num_demos,
-        src=ds.src[idx],
-        tgt=ds.tgt[idx],
+        grid_size=int(ds.grid_size_each[idx].max().item()) if len(idx_list) > 0 else ds.grid_size,
+        num_demos=int(ds.num_demos_each[idx].max().item()) if len(idx_list) > 0 else ds.num_demos,
+        src_list=[ds.src_list[i] for i in idx_list],
+        tgt_list=[ds.tgt_list[i] for i in idx_list],
         grid_size_each=ds.grid_size_each[idx],
         num_demos_each=ds.num_demos_each[idx],
+        output_grid_size=out_g,
     )
 
 
 def _row_digests(ds: TensorizedDataset) -> set[bytes]:
-    """
-    Return a set of per-example cryptographic digests for exact disjointness checks.
-
-    Digest is computed over the concatenation of (src row, tgt row) bytes to avoid
-    false matches when src is equal but tgt differs (or vice versa).
-    """
+    """Per-example digests for disjointness checks (variable-length rows)."""
     if ds.n <= 0:
         return set()
-    st = torch.cat([ds.src, ds.tgt], dim=1).contiguous()
-    # Always hash on CPU for determinism across devices/dtypes.
-    a = st.detach().cpu().numpy()
     out: set[bytes] = set()
-    for i in range(int(a.shape[0])):
-        out.add(hashlib.blake2b(a[i].tobytes(), digest_size=16).digest())
+    for i in range(ds.n):
+        s = ds.src_list[i].detach().cpu().numpy().tobytes() + ds.tgt_list[i].detach().cpu().numpy().tobytes()
+        out.add(hashlib.blake2b(s, digest_size=16).digest())
     return out
 
 
 def _row_digest_list(ds: TensorizedDataset) -> list[bytes]:
-    """
-    Per-row digests aligned with dataset row indices.
-
-    Used for deduplication and overlap reporting. Digest definition matches `_row_digests`.
-    """
+    """Per-row digests aligned with dataset row indices."""
     if ds.n <= 0:
         return []
-    st = torch.cat([ds.src, ds.tgt], dim=1).contiguous()
-    a = st.detach().cpu().numpy()
-    return [hashlib.blake2b(a[i].tobytes(), digest_size=16).digest() for i in range(int(a.shape[0]))]
+    return [
+        hashlib.blake2b(
+            ds.src_list[i].detach().cpu().numpy().tobytes() + ds.tgt_list[i].detach().cpu().numpy().tobytes(),
+            digest_size=16,
+        ).digest()
+        for i in range(ds.n)
+    ]
 
 
 def _dedupe_against(*, keep: TensorizedDataset, drop: TensorizedDataset, label: str, split_suffix: str) -> TensorizedDataset:
@@ -779,9 +855,7 @@ def split_dataset(
     # If there are duplicates, a naive row-level split can put identical examples
     # on both sides, which will trip `assert_disjoint_datasets`. We instead split
     # by digest-groups.
-    st = torch.cat([ds.src, ds.tgt], dim=1).contiguous()
-    a = st.detach().cpu().numpy()
-    digests: list[bytes] = [hashlib.blake2b(a[i].tobytes(), digest_size=16).digest() for i in range(int(a.shape[0]))]
+    digests: list[bytes] = _row_digest_list(ds)
 
     groups: dict[bytes, list[int]] = {}
     for i, d in enumerate(digests):
@@ -846,30 +920,24 @@ def concat_datasets(datasets: list[TensorizedDataset], *, skill_id: int, split: 
     non_empty = [ds for ds in datasets if ds.n > 0]
     if len(non_empty) == 0:
         raise ValueError("No datasets to concatenate (all empty).")
-    nd0 = int(non_empty[0].num_demos)
-    g0 = int(non_empty[0].grid_size)
-    t0 = int(non_empty[0].src.shape[1])
-    gmax0 = int(non_empty[0].tgt.shape[1])
-    for ds in non_empty[1:]:
-        if int(ds.num_demos) != int(nd0):
-            raise ValueError(f"Cannot concat datasets with different num_demos: {nd0} vs {int(ds.num_demos)}")
-        if int(ds.grid_size) != int(g0):
-            raise ValueError(f"Cannot concat datasets with different grid_size: {g0} vs {int(ds.grid_size)}")
-        if int(ds.src.shape[1]) != int(t0) or int(ds.tgt.shape[1]) != int(gmax0):
-            raise ValueError("Cannot concat datasets with different padding shapes.")
-    src = torch.cat([ds.src for ds in non_empty], dim=0)
-    tgt = torch.cat([ds.tgt for ds in non_empty], dim=0)
+    src_list: list[torch.Tensor] = []
+    tgt_list: list[torch.Tensor] = []
+    for ds in non_empty:
+        src_list.extend(ds.src_list)
+        tgt_list.extend(ds.tgt_list)
     grid_each = torch.cat([ds.grid_size_each for ds in non_empty], dim=0)
     demos_each = torch.cat([ds.num_demos_each for ds in non_empty], dim=0)
+    out_g = max(int(d.output_grid_size) if int(d.output_grid_size) > 0 else int(d.grid_size) for d in non_empty)
     return TensorizedDataset(
         skill_id=skill_id,
         split=split,
-        grid_size=int(g0),
-        num_demos=int(nd0),
-        src=src,
-        tgt=tgt,
+        grid_size=int(grid_size),
+        num_demos=int(max(int(d.num_demos) for d in non_empty)),
+        src_list=src_list,
+        tgt_list=tgt_list,
         grid_size_each=grid_each,
         num_demos_each=demos_each,
+        output_grid_size=out_g,
     )
 
 
@@ -882,15 +950,18 @@ def cap_dataset(ds: TensorizedDataset, *, cap: Optional[int], rng: np.random.Gen
     if ds.n <= cap_i:
         return ds
     idx = rng.permutation(ds.n)[:cap_i]
+    idx_list = idx.tolist()
+    out_g = int(ds.output_grid_size) if int(ds.output_grid_size) > 0 else int(ds.grid_size)
     return TensorizedDataset(
         skill_id=ds.skill_id,
         split=f"{ds.split}_cap{cap_i}",
-        grid_size=ds.grid_size,
-        num_demos=ds.num_demos,
-        src=ds.src[idx],
-        tgt=ds.tgt[idx],
+        grid_size=int(ds.grid_size_each[idx].max().item()),
+        num_demos=int(ds.num_demos_each[idx].max().item()),
+        src_list=[ds.src_list[i] for i in idx_list],
+        tgt_list=[ds.tgt_list[i] for i in idx_list],
         grid_size_each=ds.grid_size_each[idx],
         num_demos_each=ds.num_demos_each[idx],
+        output_grid_size=out_g,
     )
 
 
@@ -901,7 +972,8 @@ def _tensorize_dataset(ds: ARCDataset, *, max_seq_len: Optional[int] = None) -> 
     if len(tasks) == 0:
         raise ValueError("Dataset has no tasks.")
 
-    parsed: list[tuple[int, int, list[tuple[np.ndarray, np.ndarray]], np.ndarray, np.ndarray]] = []
+    parsed: list[tuple[int, int, int, list[tuple[np.ndarray, np.ndarray]], np.ndarray, np.ndarray]] = []
+    all_seq_lens: list[int] = []
     max_g = 0
     max_nd = 0
     dropped = 0
@@ -918,68 +990,43 @@ def _tensorize_dataset(ds: ARCDataset, *, max_seq_len: Optional[int] = None) -> 
 
         test_in = np.asarray(task.test.x, dtype=np.int64)
         test_out = np.asarray(task.test.y, dtype=np.int64)
-        if test_in.ndim != 2 or int(test_in.shape[0]) != int(test_in.shape[1]):
-            raise ValueError(f"Expected square test input grid, got shape={tuple(test_in.shape)}")
-        g = int(test_in.shape[0])
-        if test_out.ndim != 2 or int(test_out.shape[0]) != int(test_out.shape[1]) or int(test_out.shape[0]) != int(g):
-            raise ValueError(f"Expected square test output grid matching input size {g}, got shape={tuple(test_out.shape)}")
+        if test_in.ndim != 2:
+            raise ValueError(f"Expected 2D test input grid, got ndim={test_in.ndim}")
+        if test_out.ndim != 2:
+            raise ValueError(f"Expected 2D test output grid, got ndim={test_out.ndim}")
 
+        # Sequence length uses the max dimension over ALL grids in this task (demos + test).
+        # ARC-AGI has variable-sized demos; padding is to this task's max, so seq_len = prompt_seq_len(task_max_g, nd).
+        task_max_g = 0
+        for x, y in demos:
+            task_max_g = max(int(task_max_g), int(x.shape[0]), int(x.shape[1]), int(y.shape[0]), int(y.shape[1]))
+        task_max_g = max(int(task_max_g), int(test_in.shape[0]), int(test_in.shape[1]), int(test_out.shape[0]), int(test_out.shape[1]))
+        if int(task_max_g) <= 0:
+            raise ValueError(f"Task has no grid content (task_id={getattr(task,'task_id','?')})")
+        test_g = max(int(test_out.shape[0]), int(test_out.shape[1]))  # target grid size we predict
+
+        tlen = int(prompt_seq_len(grid_size=int(task_max_g), num_demos=int(nd)))
+        all_seq_lens.append(tlen)
         if max_seq_len is not None and int(max_seq_len) > 0:
-            tlen = int(prompt_seq_len(grid_size=int(g), num_demos=int(nd)))
             if int(tlen) > int(max_seq_len):
                 dropped += 1
                 continue
 
-        parsed.append((g, nd, demos, test_in, test_out))
-        max_g = max(int(max_g), int(g))
+        parsed.append((task_max_g, test_g, nd, demos, test_in, test_out))
+        max_g = max(int(max_g), int(task_max_g))
         max_nd = max(int(max_nd), int(nd))
 
-    # Enforce that the *dataset-level* fixed token budget fits, not just each individual task.
-    # Since tokenization pads all tasks to (max_g, max_nd), mixing "large-g" tasks and "large-nd"
-    # tasks can exceed max_seq_len even if no single task does.
-    if max_seq_len is not None and int(max_seq_len) > 0 and len(parsed) > 0:
-        cap = int(max_seq_len)
-        while True:
-            max_g = max(int(p[0]) for p in parsed)
-            max_nd = max(int(p[1]) for p in parsed)
-            tlen = int(prompt_seq_len(grid_size=int(max_g), num_demos=int(max_nd)))
-            if int(tlen) <= int(cap):
-                break
-
-            # Candidate: drop all tasks at the current max grid size.
-            g_vals = sorted({int(p[0]) for p in parsed})
-            nd_vals = sorted({int(p[1]) for p in parsed})
-            next_g = int(g_vals[-2]) if len(g_vals) >= 2 else 0
-            next_nd = int(nd_vals[-2]) if len(nd_vals) >= 2 else 0
-
-            cand_g = int(prompt_seq_len(grid_size=int(next_g), num_demos=int(max_nd))) if int(next_g) > 0 else 10**18
-            cand_nd = int(prompt_seq_len(grid_size=int(max_g), num_demos=int(next_nd))) if int(next_nd) > 0 else 10**18
-
-            # If neither axis can be reduced, we cannot satisfy the constraint.
-            if int(cand_g) >= 10**18 and int(cand_nd) >= 10**18:
-                raise ValueError(
-                    f"After applying max_seq_len={int(cap)}, dataset cannot be tensorized within the budget "
-                    f"(needs seq_len={int(tlen)} for grid_size={int(max_g)}, num_demos={int(max_nd)})."
-                )
-
-            drop_by_g = int(cand_g) <= int(cand_nd)
-            if int(cand_g) <= int(cap) and int(cand_nd) > int(cap):
-                drop_by_g = True
-            elif int(cand_nd) <= int(cap) and int(cand_g) > int(cap):
-                drop_by_g = False
-
-            if drop_by_g:
-                keep = [p for p in parsed if int(p[0]) != int(max_g)]
-            else:
-                keep = [p for p in parsed if int(p[1]) != int(max_nd)]
-
-            removed = int(len(parsed) - len(keep))
-            dropped += int(removed)
-            parsed = keep
-            if len(parsed) == 0:
-                raise ValueError(
-                    f"After applying max_seq_len={int(cap)}, dataset became empty (dropped {int(dropped)}/{int(total)} tasks)."
-                )
+    # Always print quantiles of all tasks (including dropped) for debugging.
+    if len(all_seq_lens) > 0:
+        seq_arr = np.array(all_seq_lens)
+        q0, q25, q50, q75, q100 = np.percentile(seq_arr, [0, 25, 50, 75, 100])
+        dsid = getattr(ds, "dataset_id", "?")
+        split_s = getattr(ds, "split", "?")
+        print(
+            f"[seq_len quantiles] dataset_id={dsid} split={split_s} n_all={len(all_seq_lens)} kept={len(parsed)} "
+            f"min={int(q0)} p25={int(q25)} p50={int(q50)} p75={int(q75)} max={int(q100)}",
+            flush=True,
+        )
 
     if len(parsed) == 0:
         if max_seq_len is not None and int(max_seq_len) > 0:
@@ -988,45 +1035,38 @@ def _tensorize_dataset(ds: ARCDataset, *, max_seq_len: Optional[int] = None) -> 
             )
         raise ValueError("Dataset became empty after parsing tasks.")
 
-    max_T = int(prompt_seq_len(grid_size=int(max_g), num_demos=int(max_nd)))
-    max_G = int(max_g * max_g)
+    def embed_grid(grid: np.ndarray, *, out_size: int) -> np.ndarray:
+        out = np.full((int(out_size), int(out_size)), 0, dtype=np.int64)
+        r, c = int(grid.shape[0]), int(grid.shape[1])
+        out[:r, :c] = np.asarray(grid, dtype=np.int64)
+        return out
 
-    src = torch.full((len(parsed), int(max_T)), int(PAD_TOKEN), dtype=torch.long)
-    tgt = torch.full((len(parsed), int(max_G)), -100, dtype=torch.long)
+    src_list: list[torch.Tensor] = []
+    tgt_list: list[torch.Tensor] = []
     grid_each = torch.empty((len(parsed),), dtype=torch.long)
     demos_each = torch.empty((len(parsed),), dtype=torch.long)
 
-    def embed_grid(grid: np.ndarray, *, g: int) -> np.ndarray:
-        # IMPORTANT: within-grid padding uses background color 0 (not PAD_TOKEN).
-        out = np.full((int(max_g), int(max_g)), 0, dtype=np.int64)
-        out[: int(g), : int(g)] = np.asarray(grid, dtype=np.int64)
-        return out
-
-    for i, (g, nd, demos, test_in, test_out) in enumerate(parsed):
-        grid_each[i] = int(g)
+    for i, (task_max_g, test_g, nd, demos, test_in, test_out) in enumerate(parsed):
+        grid_each[i] = int(test_g)
         demos_each[i] = int(nd)
+        g = int(task_max_g)
+        nd_i = int(nd)
 
-        demos_fixed: list[tuple[np.ndarray, np.ndarray]] = []
-        # Missing demos are padded with background color 0 grids (not PAD_TOKEN).
-        pad_grid = np.full((int(max_g), int(max_g)), 0, dtype=np.int64)
-        for di in range(int(max_nd)):
-            if di < int(nd):
-                x, y = demos[int(di)]
-                demos_fixed.append((embed_grid(x, g=g), embed_grid(y, g=g)))
-            else:
-                demos_fixed.append((pad_grid, pad_grid))
-
-        test_in_big = embed_grid(test_in, g=g)
+        demos_fixed = []
+        for di in range(nd_i):
+            x, y = demos[di]
+            demos_fixed.append((embed_grid(x, out_size=g), embed_grid(y, out_size=g)))
+        test_in_big = embed_grid(test_in, out_size=g)
         seq = _flatten_prompt(demos_fixed, test_in_big)
-        if int(len(seq)) != int(max_T):
-            raise ValueError(f"Internal error: fixed prompt len={len(seq)} != max_T={max_T}")
-        src[i] = torch.tensor(seq, dtype=torch.long)
+        src_list.append(torch.tensor(seq, dtype=torch.long))
 
-        # Fill only valid target cells (top-left g x g) into the max_g x max_g flattened grid.
+        tgt_flat = torch.full((g * g,), -100, dtype=torch.long)
         to = np.asarray(test_out, dtype=np.int64)
-        for r in range(int(g)):
-            for c in range(int(g)):
-                tgt[i, int(r * int(max_g) + c)] = int(to[int(r), int(c)])
+        rows, cols = int(to.shape[0]), int(to.shape[1])
+        for r in range(rows):
+            for c in range(cols):
+                tgt_flat[int(r * g + c)] = int(to[r, c])
+        tgt_list.append(tgt_flat)
 
     if max_seq_len is not None and int(max_seq_len) > 0:
         kept = int(len(parsed))
@@ -1035,8 +1075,7 @@ def _tensorize_dataset(ds: ARCDataset, *, max_seq_len: Optional[int] = None) -> 
         split_s = getattr(ds, "split", "?")
         print(
             f"[max_seq_len={cap}] filtered tasks for dataset_id={dsid} split={split_s}: "
-            f"dropped={int(dropped)}/{int(total)} kept={kept} "
-            f"final(grid_size={int(max_g)}, num_demos={int(max_nd)}, seq_len={int(max_T)})",
+            f"dropped={int(dropped)}/{int(total)} kept={kept} (padding per batch)",
             flush=True,
         )
 
@@ -1045,8 +1084,8 @@ def _tensorize_dataset(ds: ARCDataset, *, max_seq_len: Optional[int] = None) -> 
         split=str(ds.split),
         grid_size=int(max_g),
         num_demos=int(max_nd),
-        src=src,
-        tgt=tgt,
+        src_list=src_list,
+        tgt_list=tgt_list,
         grid_size_each=grid_each,
         num_demos_each=demos_each,
     )
@@ -1054,8 +1093,7 @@ def _tensorize_dataset(ds: ARCDataset, *, max_seq_len: Optional[int] = None) -> 
 
 def pad_dataset_to(ds: TensorizedDataset, *, grid_size: int, num_demos: int) -> TensorizedDataset:
     """
-    Retokenize a dataset to a larger (grid_size, num_demos) budget by embedding
-    old grids into the top-left corner and padding missing demos with PAD.
+    Retokenize each example to a larger (grid_size, num_demos) budget.
     """
     g = int(grid_size)
     nd = int(num_demos)
@@ -1068,68 +1106,56 @@ def pad_dataset_to(ds: TensorizedDataset, *, grid_size: int, num_demos: int) -> 
     if int(ds.grid_size) == int(g) and int(ds.num_demos) == int(nd):
         return ds
 
-    old_g = int(ds.grid_size)
-    old_nd = int(ds.num_demos)
-    old_grid_tokens = int(old_g * old_g)
-    new_grid_tokens = int(g * g)
-    new_T = int(prompt_seq_len(grid_size=int(g), num_demos=int(nd)))
+    dev = ds.src_list[0].device if ds.n > 0 else torch.device("cpu")
+    out_src_list = []
+    out_tgt_list = []
 
-    out_src = torch.full((ds.n, int(new_T)), int(PAD_TOKEN), dtype=torch.long, device=ds.src.device)
-    out_tgt = torch.full((ds.n, int(new_grid_tokens)), -100, dtype=torch.long, device=ds.tgt.device)
+    for i in range(ds.n):
+        tokens = ds.src_list[i]
+        old_nd_i = int(ds.num_demos_each[i].item())
+        old_g_i = int(round(ds.tgt_list[i].shape[0] ** 0.5))
+        old_grid_tokens = old_g_i * old_g_i
 
-    for i in range(int(ds.n)):
-        tokens = ds.src[i]
         off = 0
-        seq: list[int] = []
-
-        for di in range(int(nd)):
-            if di < int(old_nd):
+        seq = []
+        for di in range(nd):
+            if di < old_nd_i:
                 x_flat = tokens[off : off + old_grid_tokens]
-                off += old_grid_tokens
-                off += 1  # SEP
+                off += old_grid_tokens + 1
                 y_flat = tokens[off : off + old_grid_tokens]
-                off += old_grid_tokens
-                off += 1  # SEP
-                x_old = x_flat.reshape(old_g, old_g)
-                y_old = y_flat.reshape(old_g, old_g)
+                off += old_grid_tokens + 1
+                x_old = x_flat.reshape(old_g_i, old_g_i)
+                y_old = y_flat.reshape(old_g_i, old_g_i)
             else:
-                # Missing demos are padded with background color 0 (not PAD_TOKEN).
-                x_old = torch.zeros((old_g, old_g), dtype=torch.long, device=tokens.device)
-                y_old = torch.zeros((old_g, old_g), dtype=torch.long, device=tokens.device)
-
-            # IMPORTANT: within-grid padding uses background color 0 (not PAD_TOKEN).
+                x_old = torch.zeros((old_g_i, old_g_i), dtype=torch.long, device=tokens.device)
+                y_old = torch.zeros((old_g_i, old_g_i), dtype=torch.long, device=tokens.device)
             x_big = torch.zeros((g, g), dtype=torch.long, device=tokens.device)
             y_big = torch.zeros((g, g), dtype=torch.long, device=tokens.device)
-            x_big[:old_g, :old_g] = x_old
-            y_big[:old_g, :old_g] = y_old
-
+            x_big[:old_g_i, :old_g_i] = x_old
+            y_big[:old_g_i, :old_g_i] = y_old
             seq += x_big.reshape(-1).tolist() + [int(SEP_TOKEN)] + y_big.reshape(-1).tolist() + [int(SEP_TOKEN)]
 
-        # test_x from old prompt
         test_x_flat = tokens[off : off + old_grid_tokens]
-        test_x_old = test_x_flat.reshape(old_g, old_g)
+        test_x_old = test_x_flat.reshape(old_g_i, old_g_i)
         test_x_big = torch.zeros((g, g), dtype=torch.long, device=tokens.device)
-        test_x_big[:old_g, :old_g] = test_x_old
+        test_x_big[:old_g_i, :old_g_i] = test_x_old
         seq += test_x_big.reshape(-1).tolist() + [int(SEP_TOKEN)]
+        out_src_list.append(torch.tensor(seq, dtype=torch.long, device=dev))
 
-        if int(len(seq)) != int(new_T):
-            raise ValueError("Internal error: retokenized prompt has wrong length.")
-        out_src[i] = torch.tensor(seq, dtype=torch.long, device=out_src.device)
-
-        t_old = ds.tgt[i].reshape(old_g, old_g)
-        t_big = torch.full((g, g), -100, dtype=torch.long, device=out_tgt.device)
-        t_big[:old_g, :old_g] = t_old
-        out_tgt[i] = t_big.reshape(-1)
+        t_old = ds.tgt_list[i].reshape(old_g_i, old_g_i)
+        t_big = torch.full((g, g), -100, dtype=torch.long, device=dev)
+        t_big[:old_g_i, :old_g_i] = t_old
+        out_tgt_list.append(t_big.reshape(-1))
 
     return TensorizedDataset(
         skill_id=ds.skill_id,
         split=ds.split,
-        grid_size=int(g),
-        num_demos=int(nd),
-        src=out_src,
-        tgt=out_tgt,
-        grid_size_each=ds.grid_size_each.to(device=ds.src.device),
-        num_demos_each=ds.num_demos_each.to(device=ds.src.device),
+        grid_size=g,
+        num_demos=nd,
+        src_list=out_src_list,
+        tgt_list=out_tgt_list,
+        grid_size_each=ds.grid_size_each.to(device=dev),
+        num_demos_each=ds.num_demos_each.to(device=dev),
     )
 
 
@@ -1163,23 +1189,13 @@ def load_skill_split(
         return parts[0]
 
     max_g = max(int(p.grid_size) for p in parts)
+    max_out_g = max(int(p.output_grid_size) if int(p.output_grid_size) > 0 else int(p.grid_size) for p in parts)
     max_nd = max(int(p.num_demos) for p in parts)
-    padded = [pad_dataset_to(p, grid_size=int(max_g), num_demos=int(max_nd)) for p in parts]
-
-    src = torch.cat([p.src for p in padded], dim=0)
-    tgt = torch.cat([p.tgt for p in padded], dim=0)
-    grid_each = torch.cat([p.grid_size_each for p in padded], dim=0)
-    demos_each = torch.cat([p.num_demos_each for p in padded], dim=0)
-    return TensorizedDataset(
-        skill_id=int(skill_id),
-        split=str(split),
-        grid_size=int(max_g),
-        num_demos=int(max_nd),
-        src=src,
-        tgt=tgt,
-        grid_size_each=grid_each,
-        num_demos_each=demos_each,
-    )
+    padded = [
+        pad_dataset_to(p, grid_size=int(max_g), num_demos=int(max_nd), output_grid_size=int(max_out_g))
+        for p in parts
+    ]
+    return concat_datasets(padded, skill_id=int(skill_id), split=split, grid_size=int(max_g))
 
 
 def maybe_load_skill_split(
@@ -1193,6 +1209,40 @@ def maybe_load_skill_split(
     return None
 
 
+def _pad_batch_variable(
+    src_list: list[torch.Tensor],
+    tgt_list: list[torch.Tensor],
+    idx: torch.Tensor,
+    device: torch.device,
+    *,
+    pad_token: int,
+    tgt_ignore_index: int = -100,
+    T_max: Optional[int] = None,
+    G_max: Optional[int] = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Pad variable-length src/tgt to batch max or to T_max/G_max when provided; return (src, tgt, key_padding_mask, src_lengths)."""
+    idx_list = idx.tolist()
+    src_tensors = [src_list[i] for i in idx_list]
+    tgt_tensors = [tgt_list[i] for i in idx_list]
+    T_batch = max(int(s.shape[0]) for s in src_tensors)
+    G_batch = max(int(t.shape[0]) for t in tgt_tensors)
+    T = int(T_max) if T_max is not None else T_batch
+    G = int(G_max) if G_max is not None else G_batch
+    if T < T_batch or G < G_batch:
+        raise ValueError(f"T_max={T_max} and G_max={G_max} must be >= batch max (T_batch={T_batch}, G_batch={G_batch})")
+    bsz = len(idx_list)
+    src = torch.full((bsz, T), pad_token, dtype=torch.long, device=device)
+    tgt = torch.full((bsz, G), tgt_ignore_index, dtype=torch.long, device=device)
+    key_padding_mask = torch.ones((bsz, T), device=device, dtype=torch.bool)
+    for i, (s, t) in enumerate(zip(src_tensors, tgt_tensors)):
+        ti = int(s.shape[0])
+        gi = int(t.shape[0])
+        src[i, :ti] = s.to(device, non_blocking=True)
+        tgt[i, :gi] = t.to(device, non_blocking=True)
+        key_padding_mask[i, :ti] = False
+    return src, tgt, key_padding_mask, torch.tensor([int(s.shape[0]) for s in src_tensors], device=device, dtype=torch.long)
+
+
 def prepare_batch(
     *,
     batch_size: int,
@@ -1202,28 +1252,24 @@ def prepare_batch(
     augment: Optional[AugmentSpec] = None,
     grid_size: Optional[int] = None,
     num_demos: Optional[int] = None,
+    T_max: Optional[int] = None,
+    G_max: Optional[int] = None,
 ) -> Batch:
     """
-    Prepare a training batch with minimal CPU overhead.
-
-    - Sampling uses torch RNG (can run on GPU if train_pool is on GPU).
-    - If train_pool tensors live on CPU and are pinned, H2D copies can be async via non_blocking=True.
+    Sample a batch and pad to T_max/G_max when provided (so model sees fixed layout), else to batch max.
     """
     bsz = int(batch_size)
-    pool_device = train_pool.src.device
-    # Important: torch.Generator(device=...) is not uniformly supported across torch versions.
-    # To avoid generator/device mismatches, we only use an explicit generator on CPU.
+    pool_device = train_pool.src_list[0].device if train_pool.n > 0 else torch.device("cpu")
     if pool_device.type == "cpu":
         idx = torch.randint(
             low=0,
             high=int(train_pool.n),
             size=(bsz,),
-            device=pool_device,
+            device=torch.device("cpu"),
             generator=cpu_generator,
             dtype=torch.long,
         )
     else:
-        # Uses global RNG seeded via torch.manual_seed (covers CUDA too).
         idx = torch.randint(
             low=0,
             high=int(train_pool.n),
@@ -1231,33 +1277,45 @@ def prepare_batch(
             device=pool_device,
             dtype=torch.long,
         )
-    src = train_pool.src.index_select(0, idx)
-    tgt = train_pool.tgt.index_select(0, idx)
-    g_each = train_pool.grid_size_each.index_select(0, idx)
-    nd_each = train_pool.num_demos_each.index_select(0, idx)
-    if pool_device != device:
-        src = src.to(device, non_blocking=True)
-        tgt = tgt.to(device, non_blocking=True)
-        g_each = g_each.to(device, non_blocking=True)
-        nd_each = nd_each.to(device, non_blocking=True)
+    src, tgt, key_padding_mask, src_lengths = _pad_batch_variable(
+        train_pool.src_list,
+        train_pool.tgt_list,
+        idx,
+        device,
+        pad_token=int(PAD_TOKEN),
+        T_max=T_max,
+        G_max=G_max,
+    )
+    g_each = train_pool.grid_size_each[idx].to(device, non_blocking=True)
+    nd_each = train_pool.num_demos_each[idx].to(device, non_blocking=True)
+    g_in = int(train_pool.grid_size)
+    # Augmentation is applied per-example to content slices only (no padding passed to augment).
+    # Flip/transform therefore never see PAD; padding in the batch is left unchanged.
     if augment is not None and bool(augment.enabled):
-        # Safe for variable-size grids because within-grid padding uses background color 0 and
-        # augmentation preserves the target ignore mask (-100) via a transformed validity mask.
-        src, tgt = augment_src_tgt_batch(
-            src=src,
-            tgt=tgt,
-            grid_size=int(train_pool.grid_size),
-            num_demos=int(train_pool.num_demos),
-            generator=cpu_generator if device.type == "cpu" else None,
-            spec=augment,
-        )
-
-    # Predict logits from the test_x segment (always max_g^2 positions); mask via tgt == -100.
+        gen = cpu_generator if device.type == "cpu" else None
+        for i in range(bsz):
+            nd_i = int(nd_each[i].item())
+            g_out_i = int(g_each[i].item())
+            len_i = int(src_lengths[i].item())
+            g_out_sq = g_out_i * g_out_i
+            expected_len = prompt_seq_len(grid_size=g_in, num_demos=nd_i, output_grid_size=g_out_i)
+            if len_i != expected_len or int(tgt.shape[1]) < g_out_sq:
+                continue
+            aug_src, aug_tgt = augment_src_tgt_batch(
+                src=src[i : i + 1, :len_i],
+                tgt=tgt[i : i + 1, :g_out_sq],
+                grid_size=g_in,
+                num_demos=nd_i,
+                output_grid_size=g_out_i,
+                generator=gen,
+                spec=augment,
+            )
+            src[i, :len_i].copy_(aug_src[0])
+            tgt[i, :g_out_sq].copy_(aug_tgt[0])
     T = int(src.shape[1])
-    Gmax = int(tgt.shape[1])
-    pred_pos = torch.arange(Gmax, device=device, dtype=torch.long).unsqueeze(0).expand(int(bsz), int(Gmax))
+    G_max_batch = int(tgt.shape[1])
+    pred_pos = torch.arange(G_max_batch, device=device, dtype=torch.long).unsqueeze(0).expand(bsz, G_max_batch)
     pred_mask = tgt != -100
-    key_padding_mask = torch.zeros((int(bsz), int(T)), device=device, dtype=torch.bool)
     return Batch(
         src=src,
         tgt=tgt,
@@ -1285,9 +1343,6 @@ def maybe_move_train_pool(
 ) -> TensorizedDataset:
     """
     Move or pin training pools to avoid CPU bottlenecks.
-
-    - dataset_device="gpu": move tensors onto `device` (fastest; uses more VRAM).
-    - dataset_device="cpu": keep tensors on CPU but pin them when using CUDA (enables async H2D copies).
     """
     mode = str(dataset_device).lower()
     if mode not in {"cpu", "gpu"}:
@@ -1295,26 +1350,29 @@ def maybe_move_train_pool(
     if mode == "gpu":
         if device.type != "cuda":
             return ds
+        out_g = int(ds.output_grid_size) if int(ds.output_grid_size) > 0 else int(ds.grid_size)
         return TensorizedDataset(
             skill_id=ds.skill_id,
             split=ds.split,
             grid_size=ds.grid_size,
             num_demos=ds.num_demos,
-            src=ds.src.to(device),
-            tgt=ds.tgt.to(device),
+            src_list=[t.to(device) for t in ds.src_list],
+            tgt_list=[t.to(device) for t in ds.tgt_list],
             grid_size_each=ds.grid_size_each.to(device),
             num_demos_each=ds.num_demos_each.to(device),
+            output_grid_size=out_g,
         )
-    # cpu mode
+    out_g = int(ds.output_grid_size) if int(ds.output_grid_size) > 0 else int(ds.grid_size)
     return TensorizedDataset(
         skill_id=ds.skill_id,
         split=ds.split,
         grid_size=ds.grid_size,
         num_demos=ds.num_demos,
-        src=_pin_if_cuda(ds.src, device=device),
-        tgt=_pin_if_cuda(ds.tgt, device=device),
+        src_list=[_pin_if_cuda(t, device=device) for t in ds.src_list],
+        tgt_list=[_pin_if_cuda(t, device=device) for t in ds.tgt_list],
         grid_size_each=_pin_if_cuda(ds.grid_size_each, device=device),
         num_demos_each=_pin_if_cuda(ds.num_demos_each, device=device),
+        output_grid_size=out_g,
     )
 
 
@@ -1505,15 +1563,10 @@ def evaluate_accuracy(
     if k <= 0:
         return 0.0
 
-    # Sample once on CPU (deterministic via numpy rng), then do batched eval on device.
     idx_np = rng.choice(dataset.n, size=k, replace=False)
-    idx = torch.as_tensor(idx_np, dtype=torch.long, device=dataset.src.device)
-    src = dataset.src.index_select(0, idx)
-    tgt = dataset.tgt.index_select(0, idx)
-    grid_each = dataset.grid_size_each.index_select(0, idx)
-    if src.device != device:
-        src = src.to(device, non_blocking=True)
-        tgt = tgt.to(device, non_blocking=True)
+    idx_full = torch.as_tensor(idx_np, dtype=torch.long)
+    pool_dev = dataset.src_list[0].device if dataset.n > 0 else torch.device("cpu")
+    grid_each = dataset.grid_size_each.index_select(0, idx_full).to(device)
 
     bs = max(1, int(eval_batch_size))
     correct = 0
@@ -1522,34 +1575,57 @@ def evaluate_accuracy(
     saved_augmented = 0
     printed = 0
     for off in range(0, k, bs):
-        xb = src[off : off + bs]
-        yb = tgt[off : off + bs]  # (B, grid_tokens)
+        batch_idx = idx_full[off : off + bs]
+        xb, yb, key_padding_mask, _ = _pad_batch_variable(
+            dataset.src_list,
+            dataset.tgt_list,
+            batch_idx,
+            device,
+            pad_token=int(PAD_TOKEN),
+        )
         valid = yb != -100
+        grid_tokens_batch = int(yb.shape[1])
+        g_batch = int(round(grid_tokens_batch**0.5))
+        nd_batch = int(dataset.num_demos)
 
-        if int(vote_augs) > 0:
-            if vote_spec is None or not bool(vote_spec.enabled):
-                raise ValueError("vote_augs > 0 requires vote_spec.enabled=True")
+        if int(vote_augs) > 0 and (vote_spec is None or not bool(vote_spec.enabled)):
+            raise ValueError("vote_augs > 0 requires vote_spec.enabled=True")
+        # Only run vote_augs when batch has a single layout (same content length, inferrable g_in).
+        do_vote = (
+            int(vote_augs) > 0
+            and vote_spec is not None
+            and bool(vote_spec.enabled)
+        )
+        if do_vote:
+            content_lens = (key_padding_mask.logical_not()).sum(dim=1).cpu().tolist()
+            if len(set(content_lens)) != 1:
+                do_vote = False
+            else:
+                g_in = infer_input_grid_size(content_lens[0], nd_batch, g_batch)
+                if g_in is None:
+                    do_vote = False
+
+        if do_vote:
             bsz = int(xb.shape[0])
-            g = int(dataset.grid_size)
-            # Majority vote in the *original* space by inverting each augmentation on its prediction.
-            # Vote only on valid cells by zeroing invalid positions before hashing.
-            best_pred = torch.empty((bsz, int(grid_tokens)), dtype=torch.long, device="cpu")
+            best_pred = torch.empty((bsz, grid_tokens_batch), dtype=torch.long, device="cpu")
             best_count = [0 for _ in range(bsz)]
             counts: list[dict[bytes, int]] = [dict() for _ in range(bsz)]
+            g_in = infer_input_grid_size(content_lens[0], nd_batch, g_batch)
 
             for _ in range(int(vote_augs)):
                 xb_aug, yb_aug, params = augment_src_tgt_batch_with_params(
                     src=xb,
                     tgt=yb,
-                    grid_size=int(dataset.grid_size),
-                    num_demos=int(dataset.num_demos),
-                    generator=None,  # GPU-friendly; uses global RNG if on CUDA
+                    grid_size=g_in,
+                    num_demos=nd_batch,
+                    output_grid_size=g_batch,
+                    generator=None,
                     spec=vote_spec,
                 )
-                logits = model(xb_aug)  # (B, T, V)
-                pred_logits = logits[:, -(grid_tokens + 1) : -1, :]
-                pred = torch.argmax(pred_logits, dim=-1).reshape(bsz, g, g).unsqueeze(1)  # (B,1,g,g)
-                pred_inv = invert_grids_torch(pred, params=params).squeeze(1).reshape(bsz, int(grid_tokens))  # (B,G)
+                logits = model(xb_aug, key_padding_mask=key_padding_mask)
+                pred_logits = logits[:, -(grid_tokens_batch + 1) : -1, :]
+                pred = torch.argmax(pred_logits, dim=-1).reshape(bsz, g_batch, g_batch).unsqueeze(1)
+                pred_inv = invert_grids_torch(pred, params=params).squeeze(1).reshape(bsz, grid_tokens_batch)
                 pred_inv = torch.where(valid, pred_inv, torch.zeros_like(pred_inv))
                 pred_cpu = pred_inv.detach().to("cpu")
 
@@ -1563,9 +1639,9 @@ def evaluate_accuracy(
 
             pred_final = best_pred.to(device=device)
         else:
-            logits = model(xb)  # (B, T, V)
-            pred_logits = logits[:, -(grid_tokens + 1) : -1, :]  # (B, grid_tokens, V)
-            pred_final = torch.argmax(pred_logits, dim=-1)  # (B, grid_tokens)
+            logits = model(xb, key_padding_mask=key_padding_mask)
+            pred_logits = logits[:, -(grid_tokens_batch + 1) : -1, :]
+            pred_final = torch.argmax(pred_logits, dim=-1)
 
         # Exact match on valid cells only.
         eq = torch.where(valid, pred_final == yb, torch.ones_like(valid, dtype=torch.bool)).all(dim=1)
@@ -1586,25 +1662,33 @@ def evaluate_accuracy(
                     return a[:gg, :gg]
 
                 step_s = "na" if print_solved_step is None else f"{int(print_solved_step):07d}"
+                nd_each_b = dataset.num_demos_each[batch_idx].detach().cpu().numpy()
                 for bi in bi_solved:
                     if printed >= int(print_solved_max):
                         break
                     g_i = int(g_each_b[int(bi)])
                     if g_i <= 0:
                         continue
-
-                    # Decode prompt back into grids (max-sized), then crop to actual size.
+                    ds_idx_i = int(idx_np[int(off + bi)])
+                    g_out_i = int(round(dataset.tgt_list[ds_idx_i].shape[0] ** 0.5))
+                    nd_i = int(nd_each_b[int(bi)])
+                    content_len = int((key_padding_mask[int(bi)].logical_not()).sum().item())
+                    g_in = infer_input_grid_size(content_len, nd_i, g_out_i)
+                    if g_in is None:
+                        continue
                     _demos, test_x = _decode_prompt_src(
-                        src_tokens=xb_cpu[int(bi)], grid_size=int(dataset.grid_size), num_demos=int(dataset.num_demos)
+                        src_tokens=xb_cpu[int(bi)][:content_len],
+                        grid_size=g_in,
+                        num_demos=nd_i,
+                        output_grid_size=g_out_i,
                     )
                     test_x = crop(test_x, g_i)
-                    true_y = crop(yb_cpu[int(bi)].reshape(int(dataset.grid_size), int(dataset.grid_size)), g_i)
-                    pred_y = crop(pred_cpu[int(bi)].reshape(int(dataset.grid_size), int(dataset.grid_size)), g_i)
+                    true_y = crop(yb_cpu[int(bi)].reshape(g_batch, g_batch), g_i)
+                    pred_y = crop(pred_cpu[int(bi)].reshape(g_batch, g_batch), g_i)
 
-                    ds_idx = int(idx_np[int(off + bi)])
                     print(
                         f"\n=== solved example | tag={print_solved_tag} | s{int(dataset.skill_id)} | split={dataset.split} | "
-                        f"step={step_s} | idx={ds_idx} | grid={g_i}x{g_i} ===",
+                        f"step={step_s} | idx={ds_idx_i} | grid={g_i}x{g_i} ===",
                         flush=True,
                     )
                     print("test_x:", flush=True)
@@ -1627,15 +1711,27 @@ def evaluate_accuracy(
                 while saved_unsolved < int(save_unsolved_max):
                     bi = int(bad[saved_unsolved % len(bad)])
                     # Decode + save on CPU.
+                    ds_idx = int(idx_np[int(off + bi)])
+                    g_out_i = int(round(dataset.tgt_list[ds_idx].shape[0] ** 0.5))
+                    nd_i = int(dataset.num_demos_each[ds_idx].item())
+                    content_len = int((key_padding_mask[bi].logical_not()).sum().item())
+                    g_in = infer_input_grid_size(content_len, nd_i, g_out_i)
+                    if g_in is None:
+                        saved_unsolved += 1
+                        if saved_unsolved >= int(save_unsolved_max):
+                            break
+                        continue
                     src_i = xb[bi].detach().cpu().numpy()
                     demos, test_x = _decode_prompt_src(
-                        src_tokens=src_i, grid_size=int(dataset.grid_size), num_demos=int(dataset.num_demos)
+                        src_tokens=src_i[:content_len],
+                        grid_size=g_in,
+                        num_demos=nd_i,
+                        output_grid_size=g_out_i,
                     )
-                    g = int(dataset.grid_size)
-                    true_y = yb[bi].detach().cpu().numpy().reshape(g, g)
-                    pred_y = pred_final[bi].detach().cpu().numpy().reshape(g, g)
+                    g_i = int(grid_each[off + bi].item())
+                    true_y = yb[bi].detach().cpu().numpy().reshape(g_batch, g_batch)[:g_i, :g_i]
+                    pred_y = pred_final[bi].detach().cpu().numpy().reshape(g_batch, g_batch)[:g_i, :g_i]
 
-                    ds_idx = int(idx_np[int(off + bi)])
                     out_path = base_dir / f"slot{int(saved_unsolved):02d}.png"
                     title = (
                         f"{save_unsolved_tag} latest (unsolved) | s{int(dataset.skill_id)} | split={dataset.split} | "
@@ -1655,16 +1751,26 @@ def evaluate_accuracy(
             if len(good) > 0:
                 while saved_solved < int(save_solved_max):
                     bi = int(good[saved_solved % len(good)])
-                    # Decode + save on CPU.
+                    ds_idx = int(idx_np[int(off + bi)])
+                    g_out_i = int(round(dataset.tgt_list[ds_idx].shape[0] ** 0.5))
+                    nd_i = int(dataset.num_demos_each[ds_idx].item())
+                    content_len = int((key_padding_mask[bi].logical_not()).sum().item())
+                    g_in = infer_input_grid_size(content_len, nd_i, g_out_i)
+                    if g_in is None:
+                        saved_solved += 1
+                        if saved_solved >= int(save_solved_max):
+                            break
+                        continue
                     src_i = xb[bi].detach().cpu().numpy()
                     demos, test_x = _decode_prompt_src(
-                        src_tokens=src_i, grid_size=int(dataset.grid_size), num_demos=int(dataset.num_demos)
+                        src_tokens=src_i[:content_len],
+                        grid_size=g_in,
+                        num_demos=nd_i,
+                        output_grid_size=g_out_i,
                     )
-                    g = int(dataset.grid_size)
-                    true_y = yb[bi].detach().cpu().numpy().reshape(g, g)
-                    pred_y = pred_final[bi].detach().cpu().numpy().reshape(g, g)
-
-                    ds_idx = int(idx_np[int(off + bi)])
+                    g_i = int(grid_each[off + bi].item())
+                    true_y = yb[bi].detach().cpu().numpy().reshape(g_batch, g_batch)[:g_i, :g_i]
+                    pred_y = pred_final[bi].detach().cpu().numpy().reshape(g_batch, g_batch)[:g_i, :g_i]
                     out_path = base_dir / f"slot{int(saved_solved):02d}.png"
                     title = (
                         f"{save_solved_tag} latest (solved) | s{int(dataset.skill_id)} | split={dataset.split} | "
@@ -1691,30 +1797,59 @@ def evaluate_accuracy(
             bsz = int(xb.shape[0])
             while saved_augmented < int(save_augmented_max):
                 bi = int(saved_augmented % max(1, bsz))
-                # Apply the *train-time* augmentation distribution and run the model on the augmented prompt.
-                xb1 = xb[bi : bi + 1]
-                yb1 = yb[bi : bi + 1]
+                ds_idx = int(idx_np[int(off + bi)])
+                g_out_i = int(round(dataset.tgt_list[ds_idx].shape[0] ** 0.5))
+                nd_i = int(dataset.num_demos_each[ds_idx].item())
+                content_len = int((key_padding_mask[bi].logical_not()).sum().item())
+                g_in = infer_input_grid_size(content_len, nd_i, g_out_i)
+                if g_in is None:
+                    saved_augmented += 1
+                    if saved_augmented >= int(save_augmented_max):
+                        break
+                    continue
+                g_out_sq = g_out_i * g_out_i
+                xb1 = xb[bi : bi + 1, :content_len]
+                yb1 = yb[bi : bi + 1, :g_out_sq]
                 xb_aug, yb_aug = augment_src_tgt_batch(
                     src=xb1,
                     tgt=yb1,
-                    grid_size=int(dataset.grid_size),
-                    num_demos=int(dataset.num_demos),
-                    generator=None,  # GPU-friendly; uses global RNG if on CUDA
+                    grid_size=g_in,
+                    num_demos=nd_i,
+                    output_grid_size=g_out_i,
+                    generator=None,
                     spec=save_augmented_spec,
                 )
-                logits_aug = model(xb_aug)
-                pred_logits_aug = logits_aug[:, -(grid_tokens + 1) : -1, :]
-                pred_aug = torch.argmax(pred_logits_aug, dim=-1)  # (1, grid_tokens)
+                # Augmented output has same content length; pad to batch dims for model.
+                xb_aug_pad = torch.full(
+                    (1, int(xb.shape[1])),
+                    int(PAD_TOKEN),
+                    dtype=xb_aug.dtype,
+                    device=xb_aug.device,
+                )
+                xb_aug_pad[:, : content_len] = xb_aug
+                yb_aug_pad = torch.full(
+                    (1, int(yb.shape[1])),
+                    -100,
+                    dtype=yb_aug.dtype,
+                    device=yb_aug.device,
+                )
+                yb_aug_pad[:, :g_out_sq] = yb_aug
+                key_pad_bi = key_padding_mask[bi : bi + 1].clone()
+                logits_aug = model(xb_aug_pad, key_padding_mask=key_pad_bi)
+                pred_logits_aug = logits_aug[:, -(grid_tokens_batch + 1) : -1, :]
+                pred_aug = torch.argmax(pred_logits_aug, dim=-1)
 
-                # Decode + save on CPU.
                 src_i = xb_aug[0].detach().cpu().numpy()
                 demos, test_x = _decode_prompt_src(
-                    src_tokens=src_i, grid_size=int(dataset.grid_size), num_demos=int(dataset.num_demos)
+                    src_tokens=src_i,
+                    grid_size=g_in,
+                    num_demos=nd_i,
+                    output_grid_size=g_out_i,
                 )
-                g = int(dataset.grid_size)
-                true_y = yb_aug[0].detach().cpu().numpy().reshape(g, g)
-                pred_y = pred_aug[0].detach().cpu().numpy().reshape(g, g)
-                ds_idx = int(idx_np[int(off + bi)])
+                true_y = yb_aug[0].detach().cpu().numpy().reshape(g_out_i, g_out_i)
+                pred_y = (
+                    pred_aug[0].detach().cpu().numpy().reshape(g_batch, g_batch)[:g_out_i, :g_out_i].copy()
+                )
 
                 out_path = base_dir / f"slot{int(saved_augmented):02d}.png"
                 title = (
@@ -1737,34 +1872,31 @@ def show_one_example(
     model: nn.Module,
     dataset: TensorizedDataset,
     device: torch.device,
-    grid_size: int,
+    grid_size: Optional[int] = None,  # deprecated; use dataset grid sizes
 ) -> None:
-    grid_tokens = grid_size * grid_size
     i = 0
-    src = dataset.src[i : i + 1].to(device)
-    tgt = dataset.tgt[i].cpu().numpy().reshape(grid_size, grid_size)
+    src_i = dataset.src_list[i].unsqueeze(0).to(device)
+    g_out = int(round(dataset.tgt_list[i].shape[0] ** 0.5))
+    grid_tokens = g_out * g_out
+    tgt = dataset.tgt_list[i].cpu().numpy().reshape(g_out, g_out)
+    key_pad = torch.zeros((1, int(src_i.shape[1])), device=device, dtype=torch.bool)
 
-    logits = model(src)
+    logits = model(src_i, key_padding_mask=key_pad)
     pred_logits = logits[:, -(grid_tokens + 1) : -1, :]
-    pred = torch.argmax(pred_logits, dim=-1).cpu().numpy().reshape(grid_size, grid_size)
+    pred = torch.argmax(pred_logits, dim=-1).cpu().numpy().reshape(g_out, g_out)
 
-    # Decode the first example back to grids for printing.
-    # Layout: (x SEP y SEP) x3, then test_x SEP.
-    tokens = dataset.src[i].cpu().numpy().tolist()
-    g = grid_size * grid_size
-
-    def unflatten(block: list[int]) -> np.ndarray:
-        return np.asarray(block, dtype=np.int64).reshape(grid_size, grid_size)
-
-    demos = []
-    off = 0
-    for _ in range(int(dataset.num_demos)):
-        x = unflatten(tokens[off : off + g])
-        off += g + 1  # +SEP
-        y = unflatten(tokens[off : off + g])
-        off += g + 1  # +SEP
-        demos.append((x, y))
-    test_x = unflatten(tokens[off : off + g])
+    tokens = dataset.src_list[i].cpu().numpy()
+    nd = int(dataset.num_demos_each[i].item())
+    g_in = infer_input_grid_size(int(tokens.shape[0]), nd, g_out)
+    if g_in is None:
+        print(f"Cannot infer input grid size for seq_len={tokens.shape[0]} num_demos={nd} output_grid_size={g_out}")
+        return
+    demos, test_x = _decode_prompt_src(
+        src_tokens=tokens,
+        grid_size=g_in,
+        num_demos=nd,
+        output_grid_size=g_out,
+    )
 
     print(f"\n=== Skill {dataset.skill_id} | split={dataset.split} ===")
     print("Demo 1:")

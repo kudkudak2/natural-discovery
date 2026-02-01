@@ -42,179 +42,187 @@ DEFAULT_TRAIN_SKILLS = (11, 12, 14, 15, 16)
 DEFAULT_TRAIN_WITH_OOD_SKILLS = (11, 12, 14, 15, 16)
 
 
-def _prompt_rows_cols(*, t: int, grid_size: int, device: torch.device) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+def _prompt_rows_cols(
+    *,
+    t: int,
+    input_grid_size: int,
+    output_grid_size: int,
+    num_demos: int,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Compute per-token (row, col) coordinates for the ARC prompt sequence, plus an is_sep mask.
-
-    Prompt layout is a repetition of: [grid_tokens] + [SEP]
-    (see arc_train_utils.prompt_seq_len / _flatten_prompt).
+    Input grids are input_grid_size x input_grid_size; output grids are output_grid_size x output_grid_size.
+    Row/col are in [0, max(g_in,g_out)-1] for embedding indexing.
     """
-    g = int(grid_size)
-    if g <= 0:
-        raise ValueError(f"grid_size must be >= 1, got {g}")
-    grid_tokens = int(g * g)
-    block = int(grid_tokens + 1)
+    g_in = int(input_grid_size)
+    g_out = int(output_grid_size)
+    nd = int(num_demos)
+    if g_in <= 0 or g_out <= 0:
+        raise ValueError(f"input_grid_size and output_grid_size must be >= 1, got {g_in}, {g_out}")
+    g_max = max(g_in, g_out)
+    in_tokens = g_in * g_in
+    out_tokens = g_out * g_out
+    demo_block = in_tokens + 1 + out_tokens + 1
+    demos_total = nd * demo_block
+    test_block = in_tokens + 1
+    total = demos_total + test_block
+    if t > total:
+        raise ValueError(f"Unexpected t={t} for input_g={g_in} output_g={g_out} num_demos={nd} (expected <= {total})")
 
     pos = torch.arange(int(t), device=device)
-    within = pos % block
-    is_sep = within == int(grid_tokens)
-    cell = torch.clamp(within, max=int(grid_tokens - 1))
-    row = (cell // int(g)).to(torch.long)
-    col = (cell % int(g)).to(torch.long)
+    row = torch.zeros(int(t), device=device, dtype=torch.long)
+    col = torch.zeros(int(t), device=device, dtype=torch.long)
+    is_sep = torch.zeros(int(t), device=device, dtype=torch.bool)
+
+    # Demo region: (x SEP y SEP) * num_demos
+    in_demos = pos < int(demos_total)
+    if in_demos.any():
+        p = pos[in_demos]
+        did = (p // int(demo_block)).to(torch.long)
+        within = (p % int(demo_block)).to(torch.long)
+        in_x = within < int(in_tokens)
+        is_sep_demo = (within == int(in_tokens)) | (within == int(in_tokens + 1 + out_tokens))
+        in_y = (within > int(in_tokens)) & (within < int(in_tokens + 1 + out_tokens))
+        if in_x.any():
+            cell = within[in_x]
+            idx = p[in_x]
+            row[idx] = (cell // g_in).clamp(max=g_max - 1)
+            col[idx] = (cell % g_in).clamp(max=g_max - 1)
+        if in_y.any():
+            cell = (within[in_y] - int(in_tokens + 1)).to(torch.long)
+            idx = p[in_y]
+            row[idx] = (cell // g_out).clamp(max=g_max - 1)
+            col[idx] = (cell % g_out).clamp(max=g_max - 1)
+        is_sep[in_demos] = is_sep_demo
+
+    # Test region: test_x SEP
+    in_test = pos >= int(demos_total)
+    if in_test.any():
+        p = pos[in_test]
+        within = (p - int(demos_total)).to(torch.long)
+        in_x = within < int(in_tokens)
+        is_sep[in_test] = (within == int(in_tokens))
+        if in_x.any():
+            cell = within[in_x]
+            idx = p[in_x]
+            row[idx] = (cell // g_in).clamp(max=g_max - 1)
+            col[idx] = (cell % g_in).clamp(max=g_max - 1)
     return row, col, is_sep
 
 
 def _prompt_demo_rows_cols(
     *,
     t: int,
-    grid_size: int,
+    input_grid_size: int,
+    output_grid_size: int,
     num_demos: int,
     device: torch.device,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    Compute per-token (row, col, demo_id) coordinates for a *demo-level* 2D layout:
-
-    - Each demo is a (x, y) pair laid out horizontally: x on the left, y on the right.
-    - We reserve one "gap column" between x and y to make the offset explicit (so y starts at col=g+1).
-    - The test_x is treated as its own demo_id (= num_demos) with only the x grid.
-
-    Layout in 1D token space (see arc_train_utils._flatten_prompt):
-      (x SEP y SEP) repeated `num_demos` times, then (test_x SEP)
-
-    Returns:
-      demo_row: (T,) long in [0..g-1] for non-SEP tokens
-      demo_col: (T,) long in [0..2g] for demo tokens; [0..g-1] for test_x tokens
-      demo_id:  (T,) long in {0..num_demos} for non-SEP tokens; -1 for SEP tokens
+    Compute per-token (row, col, demo_id) for demo-level 2D layout.
+    Input grids are input_grid_size x input_grid_size; output grids are output_grid_size x output_grid_size.
+    demo_col for y tokens: offset by g_in+1 so y starts at col=g_in+1.
     """
     tt = int(t)
-    g = int(grid_size)
+    g_in = int(input_grid_size)
+    g_out = int(output_grid_size)
     nd = int(num_demos)
-    if tt < 0:
-        raise ValueError(f"t must be >= 0, got {tt}")
-    if g <= 0:
-        raise ValueError(f"grid_size must be >= 1, got {g}")
+    if g_in <= 0 or g_out <= 0:
+        raise ValueError(f"input_grid_size and output_grid_size must be >= 1, got {g_in}, {g_out}")
     if nd <= 0:
         raise ValueError(f"num_demos must be >= 1, got {nd}")
-
-    grid_tokens = int(g * g)
-    demo_block = int(2 * grid_tokens + 2)  # x + SEP + y + SEP
-    demos_total = int(nd * demo_block)
+    in_tokens = g_in * g_in
+    out_tokens = g_out * g_out
+    demo_block = in_tokens + 1 + out_tokens + 1
+    demos_total = nd * demo_block
+    test_block = in_tokens + 1
+    total = int(demos_total + test_block)
+    if tt > total:
+        raise ValueError(f"Unexpected t={tt} for input_g={g_in} output_g={g_out} num_demos={nd} (expected <= {total})")
 
     pos = torch.arange(int(tt), device=device)
-
-    # Defaults for SEP tokens / padding positions.
     demo_row = torch.zeros(int(tt), device=device, dtype=torch.long)
     demo_col = torch.zeros(int(tt), device=device, dtype=torch.long)
     demo_id = torch.full((int(tt),), -1, device=device, dtype=torch.long)
 
-    # Demo region: (x SEP y SEP) * num_demos
     in_demos = pos < int(demos_total)
-    if bool(in_demos.any()):
+    if in_demos.any():
         p = pos[in_demos]
         did = (p // int(demo_block)).to(torch.long)
         within = (p % int(demo_block)).to(torch.long)
-
-        # x tokens
-        in_x = within < int(grid_tokens)
-        # sep between x and y
-        is_sep_xy = within == int(grid_tokens)
-        # y tokens
-        in_y = (within > int(grid_tokens)) & (within < int(2 * grid_tokens + 1))
-        # sep after y
-        is_sep_y = within == int(2 * grid_tokens + 1)
-
-        # x mapping
-        if bool(in_x.any()):
+        in_x = within < int(in_tokens)
+        in_y = (within > int(in_tokens)) & (within < int(in_tokens + 1 + out_tokens))
+        if in_x.any():
             cell = within[in_x]
-            r = (cell // int(g)).to(torch.long)
-            c = (cell % int(g)).to(torch.long)
             idx = p[in_x]
-            demo_row[idx] = r
-            demo_col[idx] = c
+            demo_row[idx] = (cell // g_in).to(torch.long)
+            demo_col[idx] = (cell % g_in).to(torch.long)
             demo_id[idx] = did[in_x]
-
-        # y mapping (offset by g+1 columns to encode x|gap|y)
-        if bool(in_y.any()):
-            cell = (within[in_y] - int(grid_tokens + 1)).to(torch.long)
-            r = (cell // int(g)).to(torch.long)
-            c = (cell % int(g)).to(torch.long) + int(g + 1)
+        if in_y.any():
+            cell = (within[in_y] - int(in_tokens + 1)).to(torch.long)
             idx = p[in_y]
-            demo_row[idx] = r
-            demo_col[idx] = c
+            demo_row[idx] = (cell // g_out).to(torch.long)
+            demo_col[idx] = (cell % g_out).to(torch.long) + int(g_in + 1)
             demo_id[idx] = did[in_y]
 
-        # separators remain demo_id = -1
-        _ = is_sep_xy, is_sep_y  # documentation-only; keep explicit branches above
-
-    # Test region: test_x SEP
     in_test = pos >= int(demos_total)
-    if bool(in_test.any()):
+    if in_test.any():
         p = pos[in_test]
         within = (p - int(demos_total)).to(torch.long)
-        in_x = within < int(grid_tokens)
-        if bool(in_x.any()):
+        in_x = within < int(in_tokens)
+        if in_x.any():
             cell = within[in_x]
-            r = (cell // int(g)).to(torch.long)
-            c = (cell % int(g)).to(torch.long)
             idx = p[in_x]
-            demo_row[idx] = r
-            demo_col[idx] = c
-            demo_id[idx] = int(nd)  # test_x as its own demo bucket
-        # trailing SEP remains demo_id = -1
-
+            demo_row[idx] = (cell // g_in).to(torch.long)
+            demo_col[idx] = (cell % g_in).to(torch.long)
+            demo_id[idx] = int(nd)
     return demo_row, demo_col, demo_id
 
 
-def _prompt_token_types(*, t: int, grid_size: int, num_demos: int, device: torch.device) -> torch.Tensor:
+def _prompt_token_types(
+    *,
+    t: int,
+    input_grid_size: int,
+    output_grid_size: int,
+    num_demos: int,
+    device: torch.device,
+) -> torch.Tensor:
     """
     Return per-token role/type IDs for the ARC prompt.
-
-    Prompt layout (see arc_train_utils._flatten_prompt):
-      (x SEP y SEP) repeated `num_demos` times, then (test_x SEP)
-
-    Types (int):
-      0: demo_x
-      1: demo_y
-      2: test_x
-      3: sep
+    Types: 0 demo_x, 1 demo_y, 2 test_x, 3 sep.
     """
     tt = int(t)
-    g = int(grid_size)
+    g_in = int(input_grid_size)
+    g_out = int(output_grid_size)
     nd = int(num_demos)
-    if tt < 0:
-        raise ValueError(f"t must be >= 0, got {tt}")
-    if g <= 0:
-        raise ValueError(f"grid_size must be >= 1, got {g}")
-    if nd <= 0:
-        raise ValueError(f"num_demos must be >= 1, got {nd}")
-
-    grid_tokens = int(g * g)
-    demo_block = int(2 * grid_tokens + 2)  # x + SEP + y + SEP
-    demos_total = int(nd * demo_block)
-    test_block = int(grid_tokens + 1)  # test_x + SEP
-    if tt != int(demos_total + test_block):
-        # Keep this strict to avoid silently mislabeling roles if the prompt format changes.
-        raise ValueError(f"Unexpected t={tt} for grid_size={g}, num_demos={nd} (expected {demos_total + test_block})")
+    in_tokens = g_in * g_in
+    out_tokens = g_out * g_out
+    demo_block = in_tokens + 1 + out_tokens + 1
+    demos_total = nd * demo_block
+    test_block = in_tokens + 1
+    total = int(demos_total + test_block)
+    if tt > total:
+        raise ValueError(f"Unexpected t={tt} for input_g={g_in} output_g={g_out} num_demos={nd} (expected <= {total})")
 
     pos = torch.arange(int(tt), device=device)
-    token_type = torch.full((int(tt),), 3, device=device, dtype=torch.long)  # default: SEP
+    token_type = torch.full((int(tt),), 3, device=device, dtype=torch.long)
 
     in_demos = pos < int(demos_total)
-    if bool(in_demos.any()):
+    if in_demos.any():
         p = pos[in_demos]
         within = (p % int(demo_block)).to(torch.long)
-        in_x = within < int(grid_tokens)
-        in_y = (within > int(grid_tokens)) & (within < int(2 * grid_tokens + 1))
-        token_type[p[in_x]] = 0  # demo_x
-        token_type[p[in_y]] = 1  # demo_y
+        in_x = within < int(in_tokens)
+        in_y = (within > int(in_tokens)) & (within < int(in_tokens + 1 + out_tokens))
+        token_type[p[in_x]] = 0
+        token_type[p[in_y]] = 1
 
     in_test = pos >= int(demos_total)
-    if bool(in_test.any()):
+    if in_test.any():
         p = pos[in_test]
         within = (p - int(demos_total)).to(torch.long)
-        in_x = within < int(grid_tokens)
-        token_type[p[in_x]] = 2  # test_x
-
+        in_x = within < int(in_tokens)
+        token_type[p[in_x]] = 2
     return token_type
 
 
@@ -273,26 +281,28 @@ class RelPosBias2D(nn.Module):
 class RelPosBias2DWithinDemo(nn.Module):
     """
     Learned 2D relative position bias (per head) for a demo-level x|gap|y layout.
-
-    Bias is applied ONLY to token pairs that belong to the same demonstration (same demo_id),
-    and never to SEP tokens.
+    demo_row in [0..max(g_in,g_out)-1]; demo_col in [0..g_in-1] for x, [g_in+1..g_in+g_out] for y.
     """
 
-    def __init__(self, *, grid_size: int, num_heads: int) -> None:
+    def __init__(
+        self,
+        *,
+        input_grid_size: int,
+        output_grid_size: int,
+        num_heads: int,
+    ) -> None:
         super().__init__()
-        g = int(grid_size)
+        g_in = int(input_grid_size)
+        g_out = int(output_grid_size)
         h = int(num_heads)
-        if g <= 0:
-            raise ValueError(f"grid_size must be >= 1, got {g}")
+        if g_in <= 0 or g_out <= 0:
+            raise ValueError(f"input_grid_size and output_grid_size must be >= 1, got {g_in}, {g_out}")
         if h <= 0:
             raise ValueError(f"num_heads must be >= 1, got {h}")
-        self.grid_size = int(g)
+        self.grid_size = int(max(g_in, g_out))  # for row span
         self.num_heads = int(h)
-
-        # demo_row in [0..g-1] -> dr span: 2g-1
-        self._span_r = int(2 * g - 1)
-        # demo_col in [0..2g] (x is 0..g-1, y is g+1..2g) -> dc max magnitude: 2g
-        self._span_c = int(4 * g + 1)
+        self._span_r = int(2 * self.grid_size - 1)
+        self._span_c = int(2 * (g_in + g_out) + 1)
         self._rel_size = int(self._span_r * self._span_c)
         self.bias = nn.Embedding(int(self._rel_size), int(self.num_heads))
 
@@ -318,12 +328,11 @@ class RelPosBias2DWithinDemo(nn.Module):
         if int(demo_col.shape[0]) != t or int(demo_id.shape[0]) != t or int(is_sep.shape[0]) != t:
             raise ValueError("demo_row/demo_col/demo_id/is_sep must have the same length")
 
-        g = int(self.grid_size)
         span_r = int(self._span_r)
         span_c = int(self._span_c)
-
-        dr = (demo_row[:, None] - demo_row[None, :]).clamp(min=-(g - 1), max=(g - 1)) + (g - 1)
-        dc = (demo_col[:, None] - demo_col[None, :]).clamp(min=-(2 * g), max=(2 * g)) + (2 * g)
+        half_c = (span_c - 1) // 2
+        dr = (demo_row[:, None] - demo_row[None, :]).clamp(min=-(self.grid_size - 1), max=(self.grid_size - 1)) + (self.grid_size - 1)
+        dc = (demo_col[:, None] - demo_col[None, :]).clamp(min=-half_c, max=half_c) + half_c
         idx = (dr * span_c + dc).to(torch.long)  # (T, T)
 
         # Apply bias only within the same demo, and never involving SEP.
@@ -433,14 +442,20 @@ class EncoderRelPos2D(nn.Module):
         num_heads: int,
         ff_dim: int,
         dropout: float,
-        grid_size: int,
+        input_grid_size: int,
+        output_grid_size: int,
         demo_rel_pos_bias_2d: bool = True,
     ) -> None:
         super().__init__()
-        rel = RelPosBias2D(grid_size=int(grid_size), num_heads=int(num_heads))
+        g_max = max(int(input_grid_size), int(output_grid_size))
+        rel = RelPosBias2D(grid_size=int(g_max), num_heads=int(num_heads))
         self.rel = rel
         self.demo_rel: Optional[RelPosBias2DWithinDemo] = (
-            RelPosBias2DWithinDemo(grid_size=int(grid_size), num_heads=int(num_heads))
+            RelPosBias2DWithinDemo(
+                input_grid_size=int(input_grid_size),
+                output_grid_size=int(output_grid_size),
+                num_heads=int(num_heads),
+            )
             if bool(demo_rel_pos_bias_2d)
             else None
         )
@@ -593,6 +608,7 @@ class ARCTransformer(nn.Module):
         vocab_size: int = VOCAB_SIZE,
         grid_size: int = 5,
         num_demos: int = 3,
+        output_grid_size: Optional[int] = None,
         pos_encoding: str = "2d",
         rel_pos_bias_2d: bool = True,
         demo_rel_pos_bias_2d: bool = True,
@@ -604,35 +620,30 @@ class ARCTransformer(nn.Module):
         dropout: float = 0.0,
     ) -> None:
         super().__init__()
-        self.grid_size = int(grid_size)
-        if self.grid_size <= 0:
-            raise ValueError(f"grid_size must be >= 1, got {self.grid_size}")
+        self.grid_size = int(grid_size)  # input grid size
+        self.output_grid_size = int(output_grid_size if output_grid_size is not None else grid_size)
+        if self.grid_size <= 0 or self.output_grid_size <= 0:
+            raise ValueError(f"grid_size and output_grid_size must be >= 1, got {self.grid_size}, {self.output_grid_size}")
         self.num_demos = int(num_demos)
         if self.num_demos <= 0:
             raise ValueError(f"num_demos must be >= 1, got {self.num_demos}")
-        self.grid_tokens = self.grid_size * self.grid_size
+        self.grid_tokens = self.output_grid_size * self.output_grid_size  # number of tokens we predict
+        self._grid_size_max = max(self.grid_size, self.output_grid_size)  # for embeddings / rel_pos
 
         self.pos_encoding = str(pos_encoding).lower()
         if self.pos_encoding not in {"2d", "1d"}:
             raise ValueError(f"pos_encoding must be one of {{'2d','1d'}}, got {pos_encoding!r}")
 
         self.embed = nn.Embedding(vocab_size, embed_dim)
-        # Always include a *global* 1D positional encoding so the model can distinguish
-        # "demo1 input" vs "demo1 output" vs "test input" even when (row, col) repeats.
         self.global_pos_enc = nn.Parameter(torch.randn(1, int(max_len), embed_dim) * 0.02)
 
-        # Segment / role embeddings: explicitly tag demo-x vs demo-y vs test-x vs SEP,
-        # plus a per-demo ID embedding (0..num_demos-1, and test_x uses id=num_demos).
         self._N_TOKEN_TYPES = 4
         self.token_type_embed = nn.Embedding(int(self._N_TOKEN_TYPES), embed_dim)
         self.demo_id_embed = nn.Embedding(int(self.num_demos + 1), embed_dim)
 
-        # Optional *local* 2D positional encoding (row + col) to restore spatial inductive bias.
-        # If rel_pos_bias_2d is enabled, we skip absolute 2D embeddings (relative bias provides the spatial signal).
-        # Note: SEP tokens (between grids) will receive a 0 2D positional embedding.
         if self.pos_encoding == "2d":
-            self.row_embed = nn.Embedding(self.grid_size, embed_dim)
-            self.col_embed = nn.Embedding(self.grid_size, embed_dim)
+            self.row_embed = nn.Embedding(self._grid_size_max, embed_dim)
+            self.col_embed = nn.Embedding(self._grid_size_max, embed_dim)
 
         self.rel_pos_bias_2d = bool(rel_pos_bias_2d)
         if self.rel_pos_bias_2d:
@@ -642,7 +653,8 @@ class ARCTransformer(nn.Module):
                 num_heads=int(num_heads),
                 ff_dim=int(ff_dim),
                 dropout=float(dropout),
-                grid_size=int(self.grid_size),
+                input_grid_size=self.grid_size,
+                output_grid_size=self.output_grid_size,
                 demo_rel_pos_bias_2d=bool(demo_rel_pos_bias_2d),
             )
             self.transformer = None
@@ -673,14 +685,27 @@ class ARCTransformer(nn.Module):
                 raise ValueError(f"key_padding_mask must have shape {tuple(x.shape)}, got {tuple(key_padding_mask.shape)}")
             emb = emb.masked_fill(key_padding_mask.unsqueeze(-1), 0.0)
 
-        row, col, is_sep = _prompt_rows_cols(t=int(t), grid_size=int(self.grid_size), device=x.device)
-        demo_row, demo_col, demo_id = _prompt_demo_rows_cols(
+        row, col, is_sep = _prompt_rows_cols(
             t=int(t),
-            grid_size=int(self.grid_size),
+            input_grid_size=int(self.grid_size),
+            output_grid_size=int(self.output_grid_size),
             num_demos=int(self.num_demos),
             device=x.device,
         )
-        token_type = _prompt_token_types(t=int(t), grid_size=int(self.grid_size), num_demos=int(self.num_demos), device=x.device)
+        demo_row, demo_col, demo_id = _prompt_demo_rows_cols(
+            t=int(t),
+            input_grid_size=int(self.grid_size),
+            output_grid_size=int(self.output_grid_size),
+            num_demos=int(self.num_demos),
+            device=x.device,
+        )
+        token_type = _prompt_token_types(
+            t=int(t),
+            input_grid_size=int(self.grid_size),
+            output_grid_size=int(self.output_grid_size),
+            num_demos=int(self.num_demos),
+            device=x.device,
+        )
 
         # Add role + demo id embeddings.
         # - demo_id is -1 on SEP tokens; we clamp for indexing and then explicitly zero-out SEP contributions.
@@ -893,34 +918,36 @@ def main(
         # Assign stable synthetic "skill ids" 1..N so existing training code (which expects sid>=1) works.
         train_skills = list(range(1, int(len(ext)) + 1))
         for i, (name, tr, ev) in enumerate(ext, start=1):
-            # Tag splits with the dataset name for readable logs/plots.
+            out_g_tr = tr.effective_output_grid_size()
+            out_g_ev = ev.effective_output_grid_size()
             train_sets[i] = TensorizedDataset(
                 skill_id=int(i),
                 split=f"train[{name}]",
                 grid_size=tr.grid_size,
                 num_demos=tr.num_demos,
-                src=tr.src,
-                tgt=tr.tgt,
+                src_list=tr.src_list,
+                tgt_list=tr.tgt_list,
                 grid_size_each=tr.grid_size_each,
                 num_demos_each=tr.num_demos_each,
+                output_grid_size=out_g_tr,
             )
             eval_id_sets[i] = TensorizedDataset(
                 skill_id=int(i),
                 split=f"test[{name}]",
                 grid_size=ev.grid_size,
                 num_demos=ev.num_demos,
-                src=ev.src,
-                tgt=ev.tgt,
+                src_list=ev.src_list,
+                tgt_list=ev.tgt_list,
                 grid_size_each=ev.grid_size_each,
                 num_demos_each=ev.num_demos_each,
+                output_grid_size=out_g_ev,
             )
-        # No OOD split for external datasets.
         ood_train_pools = {}
         eval_ood_sets = {}
         if grid_size_arg == 0:
-            grid_size_arg = int(train_sets[1].grid_size)
+            grid_size_arg = max(int(ds.grid_size) for ds in list(train_sets.values()) + list(eval_id_sets.values()))
         if num_demos_arg == 0:
-            num_demos_arg = int(train_sets[1].num_demos)
+            num_demos_arg = max(int(ds.num_demos) for ds in list(train_sets.values()) + list(eval_id_sets.values()))
     else:
         # Load full splits first so we can infer *max* grid_size/num_demos across skills.
         train_full: dict[int, TensorizedDataset] = {}
@@ -941,6 +968,9 @@ def main(
 
         max_g_loaded = max(int(ds.grid_size) for ds in train_full.values())
         max_nd_loaded = max(int(ds.num_demos) for ds in train_full.values())
+        max_out_g_loaded = max(
+            int(ds.effective_output_grid_size()) for ds in list(train_full.values()) + list(ood_full.values())
+        )
         # OOD can have larger maxima too; include it.
         max_g_loaded = max(int(max_g_loaded), max(int(ds.grid_size) for ds in ood_full.values()))
         max_nd_loaded = max(int(max_nd_loaded), max(int(ds.num_demos) for ds in ood_full.values()))
@@ -954,7 +984,13 @@ def main(
         if int(num_demos_arg) < int(max_nd_loaded):
             raise ValueError(f"--num_demos={int(num_demos_arg)} is smaller than dataset max num_demos={int(max_nd_loaded)}")
         if int(max_seq_len_i) > 0:
-            target_seq_len = int(prompt_seq_len(grid_size=int(grid_size_arg), num_demos=int(num_demos_arg)))
+            target_seq_len = int(
+                prompt_seq_len(
+                    grid_size=int(grid_size_arg),
+                    num_demos=int(num_demos_arg),
+                    output_grid_size=int(max_out_g_loaded),
+                )
+            )
             if int(target_seq_len) > int(max_seq_len_i):
                 raise ValueError(
                     f"Chosen token budget seq_len={int(target_seq_len)} exceeds max_seq_len={int(max_seq_len_i)}. "
@@ -963,8 +999,18 @@ def main(
 
         # Normalize all datasets to the chosen maxima before splitting.
         for sid in train_skills:
-            train_full[sid] = pad_dataset_to(train_full[sid], grid_size=int(grid_size_arg), num_demos=int(num_demos_arg))
-            ood_full[sid] = pad_dataset_to(ood_full[sid], grid_size=int(grid_size_arg), num_demos=int(num_demos_arg))
+            train_full[sid] = pad_dataset_to(
+                train_full[sid],
+                grid_size=int(grid_size_arg),
+                num_demos=int(num_demos_arg),
+                output_grid_size=int(max_out_g_loaded),
+            )
+            ood_full[sid] = pad_dataset_to(
+                ood_full[sid],
+                grid_size=int(grid_size_arg),
+                num_demos=int(num_demos_arg),
+                output_grid_size=int(max_out_g_loaded),
+            )
 
         for sid in train_skills:
             ds_train, ds_train_test = split_dataset(train_full[sid], train_frac=train_frac_f, rng=rng)
@@ -984,13 +1030,14 @@ def main(
 
     grid_size = int(grid_size_arg)
     num_demos = int(num_demos_arg)
-    grid_tokens = int(grid_size) * int(grid_size)
-    seq_len = prompt_seq_len(grid_size=int(grid_size), num_demos=int(num_demos))
-    if int(max_seq_len_i) > 0 and int(seq_len) > int(max_seq_len_i):
-        raise ValueError(
-            f"Chosen token budget seq_len={int(seq_len)} exceeds max_seq_len={int(max_seq_len_i)}. "
-            "Reduce --grid_size/--num_demos or increase --max_seq_len (or set it to 0 to disable)."
-        )
+    ds_for_out = list(train_sets.values()) + list(eval_id_sets.values()) + list(eval_ood_sets.values())
+    output_grid_size = max(
+        (int(ds.effective_output_grid_size()) for ds in ds_for_out),
+        default=int(grid_size),
+    )
+    grid_tokens = int(output_grid_size) * int(output_grid_size)
+    # With per-batch padding, seq_len is the model's max context (each example already filtered in tensorize).
+    seq_len = int(max_seq_len_i) if int(max_seq_len_i) > 0 else 8192
 
     # Include OOD examples for selected skills in training (synthetic mode only).
     # OOD test remains disjoint and is what we report in the printed metrics.
@@ -1034,7 +1081,15 @@ def main(
     eval_probe_ood = None
     probe_ood_train: Optional[TensorizedDataset] = None
     if probe_ood_full is not None:
-        probe_ood_full = pad_dataset_to(probe_ood_full, grid_size=int(grid_size), num_demos=int(num_demos))
+        out_g_probe = probe_ood_full.effective_output_grid_size()
+        output_grid_size = max(int(output_grid_size), int(out_g_probe))
+        grid_tokens = int(output_grid_size) * int(output_grid_size)
+        probe_ood_full = pad_dataset_to(
+            probe_ood_full,
+            grid_size=int(grid_size),
+            num_demos=int(num_demos),
+            output_grid_size=int(output_grid_size),
+        )
         probe_ood_train, probe_ood_test = split_dataset(probe_ood_full, train_frac=train_frac_f, rng=rng)
         eval_probe_ood = probe_ood_test
         assert_disjoint_datasets(
@@ -1043,46 +1098,34 @@ def main(
             label=f"probe_skill_{probe_skill}: ood train vs ood heldout",
         )
 
-    # Sanity: ensure grid_size matches.
+    # Sanity: dataset maxima must not exceed chosen grid_size/num_demos (with per-batch padding they may be smaller).
     ds_to_check = list(train_sets.values()) + list(eval_id_sets.values()) + list(eval_ood_sets.values())
     if eval_probe_ood is not None:
         ds_to_check.append(eval_probe_ood)
     for ds in ds_to_check:
-        if int(ds.grid_size) != int(grid_size):
-            raise ValueError(f"Dataset grid_size={ds.grid_size} != inferred/selected grid_size={grid_size}")
-        if int(ds.num_demos) != int(num_demos):
-            raise ValueError(f"Dataset num_demos={ds.num_demos} != inferred/selected num_demos={num_demos}")
+        if int(ds.grid_size) > int(grid_size):
+            raise ValueError(f"Dataset grid_size={ds.grid_size} > chosen grid_size={grid_size}")
+        if int(ds.effective_output_grid_size()) > int(output_grid_size):
+            raise ValueError(
+                f"Dataset output_grid_size={ds.effective_output_grid_size()} > chosen output_grid_size={output_grid_size}"
+            )
+        if int(ds.num_demos) > int(num_demos):
+            raise ValueError(f"Dataset num_demos={ds.num_demos} > chosen num_demos={num_demos}")
 
-    # Build mixed training pools. Optionally delay multiple skills until specified steps.
-    train_src_all = torch.cat([train_sets[sid].src for sid in train_skills], dim=0)
-    train_tgt_all = torch.cat([train_sets[sid].tgt for sid in train_skills], dim=0)
-    train_g_each_all = torch.cat([train_sets[sid].grid_size_each for sid in train_skills], dim=0)
-    train_nd_each_all = torch.cat([train_sets[sid].num_demos_each for sid in train_skills], dim=0)
-    train_pool_all = TensorizedDataset(
+    # Build mixed training pools (variable-length; padding is per-batch).
+    train_pool_all = concat_datasets(
+        [train_sets[sid] for sid in train_skills],
         skill_id=-1,
         split="train_mix",
         grid_size=grid_size,
-        num_demos=num_demos,
-        src=train_src_all,
-        tgt=train_tgt_all,
-        grid_size_each=train_g_each_all,
-        num_demos_each=train_nd_each_all,
     )
 
     def build_pool(active_skills: list[int], *, split: str) -> TensorizedDataset:
-        train_src = torch.cat([train_sets[sid].src for sid in active_skills], dim=0)
-        train_tgt = torch.cat([train_sets[sid].tgt for sid in active_skills], dim=0)
-        train_g_each = torch.cat([train_sets[sid].grid_size_each for sid in active_skills], dim=0)
-        train_nd_each = torch.cat([train_sets[sid].num_demos_each for sid in active_skills], dim=0)
-        return TensorizedDataset(
+        return concat_datasets(
+            [train_sets[sid] for sid in active_skills],
             skill_id=-1,
             split=split,
             grid_size=grid_size,
-            num_demos=num_demos,
-            src=train_src,
-            tgt=train_tgt,
-            grid_size_each=train_g_each,
-            num_demos_each=train_nd_each,
         )
 
     # Precompute phase pools keyed by the step at which that pool becomes active.
@@ -1118,6 +1161,7 @@ def main(
         vocab_size=VOCAB_SIZE,
         grid_size=grid_size,
         num_demos=int(num_demos),
+        output_grid_size=int(output_grid_size),
         pos_encoding=str(pos_encoding),
         rel_pos_bias_2d=bool(rel_pos_bias_2d),
         demo_rel_pos_bias_2d=bool(demo_rel_pos_bias_2d),
@@ -1312,6 +1356,8 @@ def main(
             augment=aug_spec if bool(aug_spec.enabled) else None,
             grid_size=int(grid_size),
             num_demos=int(num_demos),
+            T_max=seq_len,
+            G_max=grid_tokens,
         )
         src = batch.src
         tgt = batch.tgt  # (B, grid_tokens)
@@ -1330,7 +1376,8 @@ def main(
 
         opt.zero_grad(set_to_none=True)
         logits = model(src, key_padding_mask=batch.key_padding_mask)  # (B, T, V)
-        pred_logits = logits[:, -(grid_tokens + 1) : -1, :]  # predict from test-x positions
+        grid_tokens_batch = int(tgt.shape[1])
+        pred_logits = logits[:, -(grid_tokens_batch + 1) : -1, :]  # predict from test-x positions
 
         loss = loss_fn(pred_logits.reshape(-1, VOCAB_SIZE), tgt.reshape(-1))
         loss.backward()
@@ -1554,7 +1601,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--max_seq_len",
         type=int,
-        default=500,
+        default=2000,
         help=(
             "Maximum allowed tokenized prompt length T. Any training/eval examples whose prompt would exceed this are dropped. "
             "Also enforces that the final (grid_size,num_demos) token budget fits within this limit. "
