@@ -1487,6 +1487,15 @@ def evaluate_accuracy(
     save_unsolved_max: int = 0,
     save_unsolved_step: Optional[int] = None,
     save_unsolved_tag: str = "test",
+    save_solved_dir: Optional[Path] = None,
+    save_solved_max: int = 0,
+    save_solved_step: Optional[int] = None,
+    save_solved_tag: str = "test",
+    save_augmented_dir: Optional[Path] = None,
+    save_augmented_max: int = 0,
+    save_augmented_step: Optional[int] = None,
+    save_augmented_tag: str = "test",
+    save_augmented_spec: Optional[AugmentSpec] = None,
     print_solved_max: int = 0,
     print_solved_step: Optional[int] = None,
     print_solved_tag: str = "test",
@@ -1508,7 +1517,9 @@ def evaluate_accuracy(
 
     bs = max(1, int(eval_batch_size))
     correct = 0
-    saved = 0
+    saved_unsolved = 0
+    saved_solved = 0
+    saved_augmented = 0
     printed = 0
     for off in range(0, k, bs):
         xb = src[off : off + bs]
@@ -1606,38 +1617,115 @@ def evaluate_accuracy(
 
         # Save a fixed set of "latest" example images (slot00..slotN) so evals overwrite in-place
         # instead of creating new files every time.
-        if save_unsolved_dir is not None and int(save_unsolved_max) > 0 and saved < int(save_unsolved_max):
+        if save_unsolved_dir is not None and int(save_unsolved_max) > 0 and saved_unsolved < int(save_unsolved_max):
             step_s = "na" if save_unsolved_step is None else f"{int(save_unsolved_step):07d}"
-            base_dir = Path(save_unsolved_dir) / f"{save_unsolved_tag}" / f"s{int(dataset.skill_id)}" / f"{dataset.split}"
-            # Prefer unsolved examples, but if there aren't enough, fill remaining slots with solved ones.
+            base_dir = (
+                Path(save_unsolved_dir) / f"{save_unsolved_tag}" / f"s{int(dataset.skill_id)}" / f"{dataset.split}"
+            )
             bad = (~eq).nonzero(as_tuple=False).reshape(-1).tolist()
+            if len(bad) > 0:
+                while saved_unsolved < int(save_unsolved_max):
+                    bi = int(bad[saved_unsolved % len(bad)])
+                    # Decode + save on CPU.
+                    src_i = xb[bi].detach().cpu().numpy()
+                    demos, test_x = _decode_prompt_src(
+                        src_tokens=src_i, grid_size=int(dataset.grid_size), num_demos=int(dataset.num_demos)
+                    )
+                    g = int(dataset.grid_size)
+                    true_y = yb[bi].detach().cpu().numpy().reshape(g, g)
+                    pred_y = pred_final[bi].detach().cpu().numpy().reshape(g, g)
+
+                    ds_idx = int(idx_np[int(off + bi)])
+                    out_path = base_dir / f"slot{int(saved_unsolved):02d}.png"
+                    title = (
+                        f"{save_unsolved_tag} latest (unsolved) | s{int(dataset.skill_id)} | split={dataset.split} | "
+                        f"step={step_s} | idx={ds_idx} | slot={int(saved_unsolved):02d}"
+                    )
+                    save_arc_prompt_prediction_png(
+                        demos=demos, test_x=test_x, pred_y=pred_y, true_y=true_y, out_path=out_path, title=title
+                    )
+                    saved_unsolved += 1
+                    if saved_unsolved >= int(save_unsolved_max):
+                        break
+
+        if save_solved_dir is not None and int(save_solved_max) > 0 and saved_solved < int(save_solved_max):
+            step_s = "na" if save_solved_step is None else f"{int(save_solved_step):07d}"
+            base_dir = Path(save_solved_dir) / f"{save_solved_tag}" / f"s{int(dataset.skill_id)}" / f"{dataset.split}"
             good = (eq).nonzero(as_tuple=False).reshape(-1).tolist()
-            pick = bad + good
-            if len(pick) == 0:
-                continue
-            # If the batch doesn't have enough candidates, repeat deterministically to fill slots.
-            while saved < int(save_unsolved_max):
-                bi = int(pick[saved % len(pick)])
+            if len(good) > 0:
+                while saved_solved < int(save_solved_max):
+                    bi = int(good[saved_solved % len(good)])
+                    # Decode + save on CPU.
+                    src_i = xb[bi].detach().cpu().numpy()
+                    demos, test_x = _decode_prompt_src(
+                        src_tokens=src_i, grid_size=int(dataset.grid_size), num_demos=int(dataset.num_demos)
+                    )
+                    g = int(dataset.grid_size)
+                    true_y = yb[bi].detach().cpu().numpy().reshape(g, g)
+                    pred_y = pred_final[bi].detach().cpu().numpy().reshape(g, g)
+
+                    ds_idx = int(idx_np[int(off + bi)])
+                    out_path = base_dir / f"slot{int(saved_solved):02d}.png"
+                    title = (
+                        f"{save_solved_tag} latest (solved) | s{int(dataset.skill_id)} | split={dataset.split} | "
+                        f"step={step_s} | idx={ds_idx} | slot={int(saved_solved):02d}"
+                    )
+                    save_arc_prompt_prediction_png(
+                        demos=demos, test_x=test_x, pred_y=pred_y, true_y=true_y, out_path=out_path, title=title
+                    )
+                    saved_solved += 1
+                    if saved_solved >= int(save_solved_max):
+                        break
+
+        if (
+            save_augmented_dir is not None
+            and int(save_augmented_max) > 0
+            and saved_augmented < int(save_augmented_max)
+            and save_augmented_spec is not None
+            and bool(save_augmented_spec.enabled)
+        ):
+            step_s = "na" if save_augmented_step is None else f"{int(save_augmented_step):07d}"
+            base_dir = (
+                Path(save_augmented_dir) / f"{save_augmented_tag}" / f"s{int(dataset.skill_id)}" / f"{dataset.split}"
+            )
+            bsz = int(xb.shape[0])
+            while saved_augmented < int(save_augmented_max):
+                bi = int(saved_augmented % max(1, bsz))
+                # Apply the *train-time* augmentation distribution and run the model on the augmented prompt.
+                xb1 = xb[bi : bi + 1]
+                yb1 = yb[bi : bi + 1]
+                xb_aug, yb_aug = augment_src_tgt_batch(
+                    src=xb1,
+                    tgt=yb1,
+                    grid_size=int(dataset.grid_size),
+                    num_demos=int(dataset.num_demos),
+                    generator=None,  # GPU-friendly; uses global RNG if on CUDA
+                    spec=save_augmented_spec,
+                )
+                logits_aug = model(xb_aug)
+                pred_logits_aug = logits_aug[:, -(grid_tokens + 1) : -1, :]
+                pred_aug = torch.argmax(pred_logits_aug, dim=-1)  # (1, grid_tokens)
+
                 # Decode + save on CPU.
-                src_i = xb[bi].detach().cpu().numpy()
+                src_i = xb_aug[0].detach().cpu().numpy()
                 demos, test_x = _decode_prompt_src(
                     src_tokens=src_i, grid_size=int(dataset.grid_size), num_demos=int(dataset.num_demos)
                 )
                 g = int(dataset.grid_size)
-                true_y = yb[bi].detach().cpu().numpy().reshape(g, g)
-                pred_y = pred_final[bi].detach().cpu().numpy().reshape(g, g)
-
+                true_y = yb_aug[0].detach().cpu().numpy().reshape(g, g)
+                pred_y = pred_aug[0].detach().cpu().numpy().reshape(g, g)
                 ds_idx = int(idx_np[int(off + bi)])
-                out_path = base_dir / f"slot{int(saved):02d}.png"
+
+                out_path = base_dir / f"slot{int(saved_augmented):02d}.png"
                 title = (
-                    f"{save_unsolved_tag} latest | s{int(dataset.skill_id)} | split={dataset.split} | "
-                    f"step={step_s} | idx={ds_idx} | slot={int(saved):02d}"
+                    f"{save_augmented_tag} latest (augmented) | s{int(dataset.skill_id)} | split={dataset.split} | "
+                    f"step={step_s} | idx={ds_idx} | slot={int(saved_augmented):02d}"
                 )
                 save_arc_prompt_prediction_png(
                     demos=demos, test_x=test_x, pred_y=pred_y, true_y=true_y, out_path=out_path, title=title
                 )
-                saved += 1
-                if saved >= int(save_unsolved_max):
+                saved_augmented += 1
+                if saved_augmented >= int(save_augmented_max):
                     break
 
     return float(correct) / float(k)

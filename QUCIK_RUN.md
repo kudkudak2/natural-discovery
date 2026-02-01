@@ -144,6 +144,8 @@ CUDA_VISIBLE_DEVICES=0 python arc_train_transformer.py \
   - Set `--max_seq_len 0` to disable, but be careful (OOM risk).
 - **`--print_solved_n`** (default **0**): prints up to N solved ID test examples at each eval (stdout).
 - **`--plot_unsolved_n`**: saves “latest unsolved” PNGs during eval under `plots/unsolved_examples/`.
+- **`--plot_solved_n`**: saves “latest solved” PNGs during eval under `plots/solved_examples/`.
+- **`--plot_augmented_n`**: saves “latest augmented” PNGs during eval under `plots/augmented_examples/` (uses the same distribution as train-time `--aug_*`).
 
 ---
 

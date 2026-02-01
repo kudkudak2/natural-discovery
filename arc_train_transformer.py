@@ -756,6 +756,8 @@ def main(
     eval_tasks: int = 128,
     eval_batch_size: int = 256,
     plot_unsolved_n: int = 3,
+    plot_solved_n: int = 0,
+    plot_augmented_n: int = 0,
     print_solved_n: int = 0,
     progress: bool = False,
     out_dir: Path = Path("arc_train_runs"),
@@ -794,6 +796,12 @@ def main(
     plot_unsolved_n_i = int(plot_unsolved_n)
     if plot_unsolved_n_i < 0:
         raise ValueError(f"plot_unsolved_n must be >= 0, got {plot_unsolved_n_i}")
+    plot_solved_n_i = int(plot_solved_n)
+    if plot_solved_n_i < 0:
+        raise ValueError(f"plot_solved_n must be >= 0, got {plot_solved_n_i}")
+    plot_augmented_n_i = int(plot_augmented_n)
+    if plot_augmented_n_i < 0:
+        raise ValueError(f"plot_augmented_n must be >= 0, got {plot_augmented_n_i}")
 
     if device.type == "cuda":
         # More throughput on Ampere+; safe for this kind of toy transformer.
@@ -1343,6 +1351,12 @@ def main(
             unsolved_dir = (out_dir / "plots" / "unsolved_examples") if int(plot_unsolved_n_i) > 0 else None
             if unsolved_dir is not None:
                 unsolved_dir.mkdir(parents=True, exist_ok=True)
+            solved_dir = (out_dir / "plots" / "solved_examples") if int(plot_solved_n_i) > 0 else None
+            if solved_dir is not None:
+                solved_dir.mkdir(parents=True, exist_ok=True)
+            augmented_dir = (out_dir / "plots" / "augmented_examples") if int(plot_augmented_n_i) > 0 else None
+            if augmented_dir is not None:
+                augmented_dir.mkdir(parents=True, exist_ok=True)
 
             first_sid = int(eval_ids[0]) if (len(eval_ids) > 0) else -1
             for sid in eval_ids:
@@ -1371,6 +1385,15 @@ def main(
                     save_unsolved_max=int(plot_unsolved_n_i),
                     save_unsolved_step=int(step),
                     save_unsolved_tag="id",
+                    save_solved_dir=solved_dir,
+                    save_solved_max=int(plot_solved_n_i),
+                    save_solved_step=int(step),
+                    save_solved_tag="id",
+                    save_augmented_dir=augmented_dir,
+                    save_augmented_max=int(plot_augmented_n_i),
+                    save_augmented_step=int(step),
+                    save_augmented_tag="id",
+                    save_augmented_spec=aug_spec if bool(aug_spec.enabled) else None,
                     print_solved_max=int(print_solved_n_i) if int(sid) == int(first_sid) else 0,
                     print_solved_step=int(step),
                     print_solved_tag="id",
@@ -1390,6 +1413,15 @@ def main(
                         save_unsolved_max=int(plot_unsolved_n_i),
                         save_unsolved_step=int(step),
                         save_unsolved_tag="ood",
+                        save_solved_dir=solved_dir,
+                        save_solved_max=int(plot_solved_n_i),
+                        save_solved_step=int(step),
+                        save_solved_tag="ood",
+                        save_augmented_dir=augmented_dir,
+                        save_augmented_max=int(plot_augmented_n_i),
+                        save_augmented_step=int(step),
+                        save_augmented_tag="ood",
+                        save_augmented_spec=aug_spec if bool(aug_spec.enabled) else None,
                     )
 
             # Optional strict OOD probe (held-out OOD test).
@@ -1786,6 +1818,21 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="Per-skill number of unsolved test examples to render as PNG during eval (0 disables).",
     )
     p.add_argument(
+        "--plot_solved_n",
+        type=int,
+        default=0,
+        help="Per-skill number of solved test examples to render as PNG during eval (0 disables).",
+    )
+    p.add_argument(
+        "--plot_augmented_n",
+        type=int,
+        default=0,
+        help=(
+            "Per-skill number of eval examples to render as PNG after applying the *train-time* augmentation pipeline "
+            "(0 disables). Saved under plots/augmented_examples/."
+        ),
+    )
+    p.add_argument(
         "--print_solved_n",
         type=int,
         default=0,
@@ -1949,6 +1996,8 @@ def cli_main(argv: Optional[list[str]] = None) -> None:
         eval_tasks=int(args.eval_tasks),
         eval_batch_size=int(args.eval_batch_size),
         plot_unsolved_n=int(args.plot_unsolved_n),
+        plot_solved_n=int(args.plot_solved_n),
+        plot_augmented_n=int(args.plot_augmented_n),
         print_solved_n=int(args.print_solved_n),
         progress=bool(args.progress),
         out_dir=Path(args.out_dir),

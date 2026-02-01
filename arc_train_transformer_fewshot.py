@@ -1430,6 +1430,12 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--dataset_device", type=str, default="gpu", choices=["cpu", "gpu"])
     p.add_argument("--progress", action="store_true")
+    p.add_argument(
+        "--run_tests",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Run unit tests (pytest) before training starts (default). Disable with --no-run_tests.",
+    )
     p.add_argument("--out_dir", type=Path, default=Path("arc_train_runs_fewshot"), help="Where to write plots/metrics")
     p.add_argument("--no_plots", action="store_true", help="Disable saving learning-curve PNGs (CSV still written)")
     return p
@@ -1494,6 +1500,7 @@ def cli_main(argv: Optional[list[str]] = None) -> None:
         device=str(args.device),
         dataset_device=str(args.dataset_device),
         progress_bar=bool(args.progress),
+        run_tests=bool(args.run_tests),
         out_dir=Path(args.out_dir),
         no_plots=bool(args.no_plots),
     )
