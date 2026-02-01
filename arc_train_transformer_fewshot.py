@@ -22,6 +22,7 @@ from arc_train_utils import (
     plot_learning_curves,
     progress,
     prompt_seq_len,
+    run_unit_tests,
     save_arc_prompt_prediction_png,
     write_learning_curves_csv,
 )
@@ -705,10 +706,14 @@ def main(
     progress_bar: bool = False,
     out_dir: Path = Path("arc_train_runs_fewshot"),
     no_plots: bool = False,
+    run_tests: bool = True,
 ) -> None:
     torch.manual_seed(int(seed))
     rng = np.random.default_rng(int(seed))
     device_t = torch.device(str(device))
+
+    if bool(run_tests):
+        run_unit_tests(test_paths=[Path(__file__).resolve().with_name("test_arc_aug.py")])
 
     skills = [14, 15, 16] if train_skills is None else [int(s) for s in train_skills]
     for sid in skills:

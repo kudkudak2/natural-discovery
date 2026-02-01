@@ -30,6 +30,7 @@ from arc_train_utils import (
     prepare_batch,
     progress as progress_iter,
     prompt_seq_len,
+    run_unit_tests,
     show_one_example,
     split_dataset,
     write_learning_curves_csv,
@@ -767,9 +768,13 @@ def main(
     aug_translate_max: int = -1,
     aug_keep_background: bool = True,
     eval_vote_augs: int = 0,
+    run_tests: bool = True,
 ) -> None:
     torch.manual_seed(int(seed))
     rng = np.random.default_rng(int(seed))
+
+    if bool(run_tests):
+        run_unit_tests(test_paths=[Path(__file__).resolve().with_name("test_arc_aug.py")])
 
     grid_size_arg = int(grid_size)
     num_demos_arg = int(num_demos)
@@ -1838,6 +1843,12 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         default=0,
         help="If >0, perform test-time voting over this many random augmentations (slow).",
     )
+    p.add_argument(
+        "--run_tests",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Run unit tests (pytest) before training starts (default). Disable with --no-run_tests.",
+    )
     return p
 
 
@@ -1950,6 +1961,7 @@ def cli_main(argv: Optional[list[str]] = None) -> None:
         aug_translate_max=int(args.aug_translate_max),
         aug_keep_background=bool(args.aug_keep_background),
         eval_vote_augs=int(args.eval_vote_augs),
+        run_tests=bool(args.run_tests),
     )
 
 

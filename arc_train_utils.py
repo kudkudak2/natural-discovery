@@ -18,6 +18,24 @@ from arc_aug import AugmentSpec, augment_src_tgt_batch, augment_src_tgt_batch_wi
 import hashlib
 
 
+# --- Unit test runner (used by training scripts) ---
+def run_unit_tests(*, test_paths: list[Path]) -> None:
+    """
+    Run pytest on the given paths. Raises on failure.
+    """
+    paths = [Path(p).expanduser().resolve() for p in test_paths]
+    missing = [p for p in paths if not p.exists()]
+    if missing:
+        raise ValueError(f"Missing test files: {[str(p) for p in missing]}")
+    if importlib.util.find_spec("pytest") is None:
+        raise RuntimeError("pytest is not installed. Install it (e.g. `pip install pytest`) or run with --no-run_tests.")
+    import pytest  # type: ignore
+
+    code = int(pytest.main(["-q", *[str(p) for p in paths]]))
+    if code != 0:
+        raise RuntimeError(f"Unit tests failed with exit code {code}.")
+
+
 # --- Token vocabulary ---
 # ARC colors are 0..9. We reserve two special tokens:
 # - SEP_TOKEN: separator between grids in the prompt
