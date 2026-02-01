@@ -771,12 +771,13 @@ def main(
     weight_decay: float = 0.01, 
     seed: int = 0,
     device: str = "cuda", # if torch.cuda.is_available() else "cpu",
+    precision: str = "16",
     embed_dim: int = 128,
     num_heads: int = 4,
     num_layers: int = 4,
     ff_dim: int = 256,
     dropout: float = 0.0,
-    eval_every: int = 500,
+    eval_every: int = 10000,
     save_every: int = 500,
     eval_tasks: int = 128,
     eval_batch_size: int = 256,
@@ -813,6 +814,11 @@ def main(
     if max_seq_len_i < 0:
         raise ValueError(f"max_seq_len must be >= 0 (0=disable), got {max_seq_len_i}")
     device = torch.device(device)
+    if precision not in ("16", "32"):
+        raise ValueError(f"--precision must be '16' or '32', got {precision!r}")
+    use_amp = device.type == "cuda" and precision == "16"
+    if use_amp:
+        print("Training precision: FP16 (AMP)")
     out_dir = Path(out_dir).expanduser().resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / "plots").mkdir(parents=True, exist_ok=True)
@@ -1279,12 +1285,14 @@ def main(
             return min_lr_f
         return min_lr_f + 0.5 * (base_lr - min_lr_f) * (1.0 + math.cos(math.pi * t))
     loss_fn = nn.CrossEntropyLoss(ignore_index=-100)
+    scaler = torch.amp.GradScaler("cuda") if use_amp else None
 
     def save_latest_checkpoint(*, step: int) -> None:
         ckpt = {
             "step": int(step),
             "model": model.state_dict(),
             "optimizer": opt.state_dict(),
+            "scaler": scaler.state_dict() if scaler is not None else None,
             "seed": int(seed),
             "grid_size": int(grid_size),
             "num_demos": int(num_demos),
@@ -1375,13 +1383,22 @@ def main(
                 pg["lr"] = float(lr_step)
 
         opt.zero_grad(set_to_none=True)
-        logits = model(src, key_padding_mask=batch.key_padding_mask)  # (B, T, V)
-        grid_tokens_batch = int(tgt.shape[1])
-        pred_logits = logits[:, -(grid_tokens_batch + 1) : -1, :]  # predict from test-x positions
-
-        loss = loss_fn(pred_logits.reshape(-1, VOCAB_SIZE), tgt.reshape(-1))
-        loss.backward()
-        opt.step()
+        if use_amp and scaler is not None:
+            with torch.amp.autocast(device_type="cuda", dtype=torch.float16):
+                logits = model(src, key_padding_mask=batch.key_padding_mask)  # (B, T, V)
+                grid_tokens_batch = int(tgt.shape[1])
+                pred_logits = logits[:, -(grid_tokens_batch + 1) : -1, :]  # predict from test-x positions
+                loss = loss_fn(pred_logits.reshape(-1, VOCAB_SIZE), tgt.reshape(-1))
+            scaler.scale(loss).backward()
+            scaler.step(opt)
+            scaler.update()
+        else:
+            logits = model(src, key_padding_mask=batch.key_padding_mask)  # (B, T, V)
+            grid_tokens_batch = int(tgt.shape[1])
+            pred_logits = logits[:, -(grid_tokens_batch + 1) : -1, :]  # predict from test-x positions
+            loss = loss_fn(pred_logits.reshape(-1, VOCAB_SIZE), tgt.reshape(-1))
+            loss.backward()
+            opt.step()
 
         if (int(save_every) > 0) and ((step % int(save_every) == 0) or (step == int(steps) - 1)):
             save_latest_checkpoint(step=int(step))
@@ -1818,6 +1835,13 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--weight_decay", type=float, default=0.01, help="AdamW weight decay (L2).")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
+    p.add_argument(
+        "--precision",
+        type=str,
+        default="16",
+        choices=("16", "32"),
+        help="Training precision: 16 (FP16 AMP) or 32 (FP32). AMP only when device is cuda.",
+    )
     p.add_argument("--embed_dim", type=int, default=128)
     p.add_argument("--num_heads", type=int, default=4)
     p.add_argument("--num_layers", type=int, default=6)
@@ -2038,6 +2062,7 @@ def cli_main(argv: Optional[list[str]] = None) -> None:
         weight_decay=float(args.weight_decay),
         seed=int(args.seed),
         device=str(args.device),
+        precision=str(args.precision),
         embed_dim=int(args.embed_dim),
         num_heads=int(args.num_heads),
         num_layers=int(args.num_layers),
