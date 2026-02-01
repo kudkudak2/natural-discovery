@@ -1,12 +1,18 @@
-### Quick run: synthetic ARC data generation + transformer training
+### Quick run: generate data + train Transformer (+ external ARC datasets)
 
-This folder contains a **small synthetic ARC-style benchmark** and a minimal **Transformer trainer**.
-The goal is to study **skill learning + OOD generalization**: train on in-distribution (“easy”) instances and evaluate on harder **OOD** instances that follow the *same underlying rule*.
+This folder contains:
+- **Synthetic ARC-style dataset generation** (`arc_dataset_generator.py`)
+- **Transformer trainer** (`arc_train_transformer.py`) for skill learning + OOD generalization
+- Optional **external dataset loading** (ARC-AGI / ConceptARC-style layouts)
+
+The training script is built around a fixed prompt layout and self-attention, so memory scales roughly like \(T^2\).
+To prevent OOMs from rare very-long sequences, the trainer supports `--max_seq_len` (default **500**), which drops examples that would exceed the cap and prints drop statistics.
+
 ---
 
 ### 0) Where to run commands from
 
-All commands below assume you are in this directory:
+All commands below assume:
 
 ```bash
 cd my_research/natural_discovery
@@ -14,82 +20,139 @@ cd my_research/natural_discovery
 
 ---
 
-### 1) Generate data on disk (JSON + a few PNG previews)
+### 1) Data formats (synthetic vs external)
 
-The generator writes a folder that looks like:
+`arc_train_transformer.py` supports two dataset styles:
 
-- `<out_dir>/skill_<id>/train.json`
-- `<out_dir>/skill_<id>/ood.json`
-- `<out_dir>/skill_<id>/png/{train,ood}/*.png` (small visual samples)
+#### Synthetic (skill-based) datasets
 
-For the 6×6, 400-tasks-per-skill dataset referenced by the training commands below:
+Folder layout:
+- `<data_dir>/skill_<id>/train.json`
+- `<data_dir>/skill_<id>/ood.json`
+- optional `<data_dir>/skill_<id>/png/{train,ood}/*.png`
 
-```bash
-python arc_dataset_generator.py \
-  --out_dir 6x6_400 \
-  --grid_size 6 \
-  --n_tasks 400 \
-  --skills 11 12 14 15 16 \
-  --png_per_skill 4 \
-  --seed 0
-```
+#### External ARC datasets (ARC-AGI / ConceptARC-like)
+
+Folder layout auto-detection:
+- **ARC-AGI style**: `<data_dir>/{training,evaluation}/*.json`
+- **Generic external**: `<data_dir>/<any_subdir>/*.json` (all jsons under immediate subdirs are loaded, then split deterministically into train/evaluation)
 
 Notes:
-- **`train.json` vs `ood.json`**: both contain the same task format (3 demos + 1 test); `ood` is generated with harder settings.
-- **PNG rendering** requires `matplotlib`. If you don’t have it, install it (e.g. `pip install matplotlib`), or reduce friction by generating fewer PNGs via `--png_per_skill 0`.
-- The generator also creates `*.meta.json` sidecars and (by default) a `6x6_400.zip` archive alongside the folder.
+- You can keep `--grid_size=0 --num_demos=0` to infer from the external dataset (recommended).
+- When `--max_seq_len>0`, the loader may effectively cap usable grid sizes; tasks that don’t fit are skipped and reported.
 
 ---
 
-### 2) Train the Transformer (AdamW + high weight decay)
+### 2) Quick run (newest): 7puzzle harder-OOD experiment
 
-`arc_train_transformer.py` trains a small Transformer encoder to predict the test output grid tokens given the prompt.
+This is the newest “quick run” sequence.
 
-Important details:
-- The script loads `<data_dir>/skill_<id>/{train,ood}.json`.
-- It then does an internal deterministic split using `--test_frac` to produce held-out evaluation sets (so printed metrics are on held-out portions).
-- Optimizer is **AdamW** with **`--weight_decay` defaulting to `0.1`**.
+#### 2.1 Generate the dataset
 
-#### Baseline run
+What it does:
+- Writes `7puzzle_harderood/skill_<id>/{train,ood}.json` for the selected skills.
+- Uses **per-skill `--n_tasks`** to allocate more tasks to key skills and fewer to others.
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 python arc_train_transformer.py \
-  --out_dir=2025_12_26_6x6_400_baseline_wd \
-  --data_dir=6x6_400 \
-  --grid_size=6 \
-  --steps=100000
+python arc_dataset_generator.py --out_dir=7puzzle_harderood --skills 14 15 16 24 25 26 27 29 --n_tasks 300 300 60 300 300 60 30 300 --n_jobs=15
 ```
 
-#### “Wait” run (delay introducing skills until specific steps)
+#### 2.2 Train baseline (all skills)
+
+What it does:
+- Trains one model on a **mixed pool** containing all listed skills.
+- Uses a fixed **token budget** implied by `--grid_size`/`--num_demos` and enforces `--max_seq_len` (default 500).
+- Prints dataset filtering stats like:
+  - `[max_seq_len=500] filtered tasks ... dropped=... kept=... final(... seq_len=...)`
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 python arc_train_transformer.py \
-  --out_dir=2025_12_25_6x6_400_wait_wd \
-  --data_dir=6x6_400 \
-  --grid_size=6 \
-  --steps=100000 \
-  --delay_train_skills 16 \
-  --delay_train_until_steps 60000
+CUDA_VISIBLE_DEVICES=0 python arc_train_transformer.py   --out_dir=2026_01_31_7puzzle_harderood_baseline   --data_dir=7puzzle_harderood   --grid_size=6   --steps=300000   --weight_decay=0.2  --lr_decay none --num_layers=10 --ff_dim=100 --train_skills 14 15 16 24 25 26 27 29
 ```
 
-You can delay multiple skills with different cutoff steps:
+#### 2.3 “Pretrain” run (subset of skills)
+
+What it does:
+- Trains on a **subset** (e.g., to learn core patterns first), then you can compare learning curves / performance.
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 python arc_train_transformer.py \
-  --out_dir=2025_12_25_6x6_400_wait_multi_wd \
-  --data_dir=6x6_400 \
-  --grid_size=6 \
-  --steps=100000 \
-  --delay_train_skills 13 14 \
-  --delay_train_until_steps 1000 5000
+CUDA_VISIBLE_DEVICES=0 python arc_train_transformer.py   --out_dir=2026_01_31_7puzzle_harderood_pretrain   --data_dir=7puzzle_harderood   --grid_size=6   --steps=300000   --weight_decay=0.2  --lr_decay none --num_layers=10 --ff_dim=100 --train_skills 14 15 24 25 29
+```
+
+#### 2.4 Compare runs
+
+```bash
+python task_comparison_plot.py --out task_comparison_2026_01_33.png 2026_01_31_7puzzle_harderood_baseline 2026_01_31_7puzzle_harderood_pretrain
 ```
 
 ---
 
-### Outputs
+### 3) Training on ARC-AGI1 / ARC-AGI2 / ConceptARC
 
-Training writes to `--out_dir`, including:
-- `plots/learning_curves_latest.png` (unless `--no_plots` is set)
-- printed accuracy metrics for ID / OOD splits and the strict OOD probe skill
+You don’t need `arc_dataset_generator.py` for these; just point `--data_dir` at the dataset root.
 
+#### 3.1 ARC-AGI1
 
+Assumes:
+- `<ARC_AGI1_ROOT>/training/*.json`
+- `<ARC_AGI1_ROOT>/evaluation/*.json`
+
+Example:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python arc_train_transformer.py \
+  --out_dir=2026_02_01_arc_agi1 \
+  --data_dir <ARC_AGI1_ROOT> \
+  --grid_size 0 \
+  --num_demos 0 \
+  --max_seq_len 500 \
+  --steps 100000
+```
+
+#### 3.2 ARC-AGI2
+
+Same layout; just swap the root:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python arc_train_transformer.py \
+  --out_dir=2026_02_01_arc_agi2 \
+  --data_dir <ARC_AGI2_ROOT> \
+  --grid_size 0 \
+  --num_demos 0 \
+  --max_seq_len 500 \
+  --steps 100000
+```
+
+#### 3.3 ConceptARC (or other “external” sets)
+
+If your dataset is not exactly `training/` + `evaluation/`, but has jsons under subfolders, the loader will treat it as a “generic external” dataset and split deterministically:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python arc_train_transformer.py \
+  --out_dir=2026_02_01_conceptarc \
+  --data_dir <CONCEPTARC_ROOT> \
+  --grid_size 0 \
+  --num_demos 0 \
+  --max_seq_len 500 \
+  --steps 100000
+```
+
+---
+
+### 4) Useful knobs (recommended)
+
+- **`--max_seq_len`** (default **500**): drops any examples whose prompt would exceed this token length (prevents attention OOM).
+  - Set `--max_seq_len 0` to disable, but be careful (OOM risk).
+- **`--print_solved_n`** (default **0**): prints up to N solved ID test examples at each eval (stdout).
+- **`--plot_unsolved_n`**: saves “latest unsolved” PNGs during eval under `plots/unsolved_examples/`.
+
+---
+
+### Outputs (what you should see)
+
+Training writes to `--out_dir`:
+- `checkpoints/latest.pt` and (optionally) `checkpoints/best_val.pt`
+- `plots/learning_curves_latest.png` (unless `--no_plots`)
+- Console logs including:
+  - per-split accuracies (ID / OOD / probe)
+  - `max_seq_len` filtering statistics (dropped vs kept)
+  - optional solved-example prints (if `--print_solved_n > 0`)

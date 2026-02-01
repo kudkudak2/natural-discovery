@@ -51,6 +51,7 @@ def _task_from_seed(
     *,
     skill_id: int,
     grid_size: int,
+    num_demos: int,
     dataset_id: str,
     split: str,
     ood: bool,
@@ -69,7 +70,7 @@ def _task_from_seed(
         sub_seed = int(base_rng.integers(0, 2**32 - 1, dtype=np.uint32))
         rng = np.random.default_rng(seed=int(sub_seed))
         puzzle = build_puzzle(int(skill_id), size=int(grid_size), rng=rng, shrink_perturb=shrink_perturb)
-        demos, test_pair, rule_color = puzzle.generate_prompt(num_demos=3, ood_test=bool(ood))
+        demos, test_pair, rule_color = puzzle.generate_prompt(num_demos=int(num_demos), ood_test=bool(ood))
         if _has_any_zero_outputs(demos, test_pair):
             rejected += 1
             continue
@@ -98,12 +99,13 @@ def _task_from_seed(
 
 
 def _task_from_seed_packed(
-    args: tuple[int, int, str, str, bool, int, int, Optional[ShrinkPerturbSpec]]
+    args: tuple[int, int, int, str, str, bool, int, int, Optional[ShrinkPerturbSpec]]
 ) -> tuple[ARCTask, int]:
-    skill_id, grid_size, dataset_id, split, ood, task_index, task_seed, shrink_perturb = args
+    skill_id, grid_size, num_demos, dataset_id, split, ood, task_index, task_seed, shrink_perturb = args
     return _task_from_seed(
         skill_id=skill_id,
         grid_size=grid_size,
+        num_demos=num_demos,
         dataset_id=dataset_id,
         split=split,
         ood=ood,
@@ -134,6 +136,7 @@ def generate_dataset(
     skill_id: int,
     n_tasks: int,
     grid_size: int,
+    num_demos: int,
     split: str,
     ood: bool,
     seed: int,
@@ -142,6 +145,9 @@ def generate_dataset(
     show_progress: bool = True,
 ) -> ARCDataset:
     rng = np.random.default_rng(seed=seed)
+    nd = int(num_demos)
+    if nd <= 0:
+        raise ValueError(f"num_demos must be >= 1, got {nd}")
 
     dataset_id = _stable_id("arc_synth", f"skill={skill_id}", f"split={split}", f"ood={ood}", f"seed={seed}")
     tasks: list[ARCTask] = []
@@ -161,6 +167,7 @@ def generate_dataset(
             task, rejected = _task_from_seed(
                 skill_id=int(skill_id),
                 grid_size=int(grid_size),
+                num_demos=int(nd),
                 dataset_id=str(dataset_id),
                 split=str(split),
                 ood=bool(ood),
@@ -179,6 +186,7 @@ def generate_dataset(
             (
                 int(skill_id),
                 int(grid_size),
+                int(nd),
                 str(dataset_id),
                 str(split),
                 bool(ood),
@@ -209,7 +217,7 @@ def generate_dataset(
         tasks=tasks,
         extra={
             "generator": "my_research.natural_discovery.arc_dataset_generator",
-            "note": "Each task contains 3 demos (x,y) and one test (x) with ground-truth y included in JSON.",
+            "note": f"Each task contains {int(nd)} demos (x,y) and one test (x) with ground-truth y included in JSON.",
             "rejected_due_to_zero_y": int(rejected_due_to_zero_y),
             "reject_rate_due_to_zero_y_pct": float(reject_rate_pct),
         },
@@ -317,6 +325,7 @@ def main() -> None:
         ),
     )
     p.add_argument("--grid_size", type=int, default=6, help="Grid size (NxN)")
+    p.add_argument("--num_demos", type=int, default=3, help="Number of demonstrations per task")
     p.add_argument("--skills", type=int, nargs="*", default=range(11, 24), help="Skills to generate (e.g. 1 2 3)")
     p.add_argument("--seed", type=int, default=0, help="Base RNG seed")
     p.add_argument("--png_per_skill", type=int, default=8, help="How many tasks to render as PNG per skill per split")
@@ -342,6 +351,7 @@ def main() -> None:
     out_dir = Path(args.out_dir)
     skills = _iter_skills(args.skills)
     grid_size = int(args.grid_size)
+    num_demos = int(args.num_demos)
     show_progress = not bool(args.no_progress)
 
     shrink_perturb: Optional[ShrinkPerturbSpec] = None
@@ -359,6 +369,7 @@ def main() -> None:
                 skill_id=skill_id,
                 n_tasks=int(n_tasks),
                 grid_size=grid_size,
+                num_demos=int(num_demos),
                 split=split,
                 ood=ood,
                 seed=int(args.seed) + 10_000 * skill_id + (1 if ood else 0),
@@ -385,6 +396,7 @@ def main() -> None:
                 "split": split,
                 "ood": ood,
                 "grid_size": grid_size,
+                "num_demos": int(num_demos),
                 "dataset_json": str(json_path),
                 "png_dir": str(out_dir / f"skill_{skill_id}" / "png" / split),
                 "n_tasks": len(ds.tasks),

@@ -7,6 +7,13 @@ import numpy as np
 import torch
 
 
+# Keep this module standalone (no import from arc_train_utils to avoid cycles).
+N_COLORS = 10
+SEP_TOKEN = N_COLORS  # 10
+PAD_TOKEN = N_COLORS + 1  # 11
+VOCAB_SIZE = N_COLORS + 2  # 12
+
+
 @dataclass(frozen=True)
 class AugmentSpec:
     """
@@ -58,33 +65,36 @@ def apply_geom_np(grid: np.ndarray, *, code: int) -> np.ndarray:
 
 
 def _identity_color_map_np() -> np.ndarray:
-    return np.arange(6, dtype=np.int64)
+    return np.arange(int(VOCAB_SIZE), dtype=np.int64)
 
 
 def sample_color_map_np(*, rng: np.random.Generator, keep_background: bool) -> np.ndarray:
     """
-    Returns a lookup table `m` of shape (6,) mapping tokens 0..5 -> 0..5.
-    Token 5 is reserved for SEP and is always mapped to 5.
+    Returns a lookup table `m` of shape (VOCAB_SIZE,) mapping tokens -> tokens.
+
+    - Colors 0..9 are permuted (optionally keeping background=0 fixed).
+    - SEP_TOKEN and PAD_TOKEN are always mapped to themselves.
     """
     kb = bool(keep_background)
     m = _identity_color_map_np()
     if kb:
-        perm = rng.permutation(np.arange(1, 5, dtype=np.int64))
-        m[1:5] = perm
+        perm = rng.permutation(np.arange(1, int(N_COLORS), dtype=np.int64))
+        m[1:int(N_COLORS)] = perm
     else:
-        perm = rng.permutation(np.arange(0, 5, dtype=np.int64))
-        m[0:5] = perm
-    m[5] = 5
+        perm = rng.permutation(np.arange(0, int(N_COLORS), dtype=np.int64))
+        m[0:int(N_COLORS)] = perm
+    m[int(SEP_TOKEN)] = int(SEP_TOKEN)
+    m[int(PAD_TOKEN)] = int(PAD_TOKEN)
     return m
 
 
 def apply_color_map_np(tokens: np.ndarray, *, color_map: np.ndarray) -> np.ndarray:
     m = np.asarray(color_map, dtype=np.int64).reshape(-1)
-    if int(m.shape[0]) != 6:
-        raise ValueError(f"Expected color_map shape (6,), got {m.shape}")
+    if int(m.shape[0]) != int(VOCAB_SIZE):
+        raise ValueError(f"Expected color_map shape ({int(VOCAB_SIZE)},), got {m.shape}")
     t = np.asarray(tokens, dtype=np.int64)
-    if np.any((t < 0) | (t > 5)):
-        raise ValueError("apply_color_map_np expects tokens in [0..5]")
+    if np.any((t < 0) | (t > int(PAD_TOKEN))):
+        raise ValueError(f"apply_color_map_np expects tokens in [0..{int(PAD_TOKEN)}]")
     return m[t]
 
 
@@ -207,24 +217,25 @@ def _sample_color_maps_torch(
     keep_background: bool,
 ) -> torch.Tensor:
     """
-    Returns (B, 6) lookup tables mapping tokens 0..5 -> 0..5.
+    Returns (B, VOCAB_SIZE) lookup tables mapping tokens -> tokens.
     """
     b = int(batch_size)
     if b <= 0:
         raise ValueError(f"batch_size must be >= 1, got {b}")
     kb = bool(keep_background)
-    maps = torch.empty((b, 6), device=device, dtype=torch.long)
-    maps[:, 5] = 5
+    maps = torch.empty((b, int(VOCAB_SIZE)), device=device, dtype=torch.long)
+    maps[:, int(SEP_TOKEN)] = int(SEP_TOKEN)
+    maps[:, int(PAD_TOKEN)] = int(PAD_TOKEN)
     if kb:
         maps[:, 0] = 0
-        # Permute [1..4] per-sample by sorting random scores.
-        scores = torch.rand((b, 4), generator=generator, device=device)
-        order = torch.argsort(scores, dim=1)  # (B,4) in [0..3]
-        maps[:, 1:5] = (order + 1).to(torch.long)
+        # Permute [1..9] per-sample by sorting random scores.
+        scores = torch.rand((b, int(N_COLORS - 1)), generator=generator, device=device)
+        order = torch.argsort(scores, dim=1)  # (B,9) in [0..8]
+        maps[:, 1:int(N_COLORS)] = (order + 1).to(torch.long)
     else:
-        scores = torch.rand((b, 5), generator=generator, device=device)
-        order = torch.argsort(scores, dim=1)  # (B,5) in [0..4]
-        maps[:, 0:5] = order.to(torch.long)
+        scores = torch.rand((b, int(N_COLORS)), generator=generator, device=device)
+        order = torch.argsort(scores, dim=1)  # (B,10) in [0..9]
+        maps[:, 0:int(N_COLORS)] = order.to(torch.long)
     return maps
 
 
@@ -232,11 +243,11 @@ def _apply_color_maps_torch(tokens: torch.Tensor, *, maps: torch.Tensor) -> torc
     """
     Apply per-sample token remapping.
 
-    tokens: (B, ...) long with values in [0..5]
-    maps: (B, 6) long
+    tokens: (B, ...) long with values in [0..PAD_TOKEN]
+    maps: (B, VOCAB_SIZE) long
     """
-    if maps.ndim != 2 or int(maps.shape[1]) != 6:
-        raise ValueError(f"Expected maps shape (B,6), got {tuple(maps.shape)}")
+    if maps.ndim != 2 or int(maps.shape[1]) != int(VOCAB_SIZE):
+        raise ValueError(f"Expected maps shape (B,{int(VOCAB_SIZE)}), got {tuple(maps.shape)}")
     if tokens.ndim < 1:
         raise ValueError("tokens must have at least 1 dimension")
     b = int(tokens.shape[0])
@@ -246,8 +257,8 @@ def _apply_color_maps_torch(tokens: torch.Tensor, *, maps: torch.Tensor) -> torc
         tokens = tokens.to(torch.long)
     # Avoid a device sync in the training hot-path: only validate token range on CPU.
     if tokens.device.type == "cpu":
-        if int(tokens.min().item()) < 0 or int(tokens.max().item()) > 5:
-            raise ValueError("_apply_color_maps_torch expects tokens in [0..5]")
+        if int(tokens.min().item()) < 0 or int(tokens.max().item()) > int(PAD_TOKEN):
+            raise ValueError(f"_apply_color_maps_torch expects tokens in [0..{int(PAD_TOKEN)}]")
     # Advanced indexing: maps[b, token] for each element.
     idx0 = torch.arange(b, device=tokens.device).view(b, *([1] * (tokens.ndim - 1)))
     return maps[idx0, tokens]
@@ -269,8 +280,8 @@ def augment_src_tgt_batch(
       (x SEP y SEP) repeated `num_demos` times, then (test_x SEP)
 
     Args:
-      src: (B, T) long tokens in [0..5]
-      tgt: (B, grid_tokens) long tokens in [0..4]
+      src: (B, T) long tokens in [0..PAD_TOKEN]
+      tgt: (B, grid_tokens) long tokens in [0..9]
     """
     if not bool(spec.enabled):
         return src, tgt
@@ -310,7 +321,7 @@ def augment_src_tgt_batch(
     # color: per-sample map, or identity map when not applied
     p_col = float(spec.color_prob)
     if p_col <= 0.0:
-        color_maps = torch.arange(6, device=device, dtype=torch.long).unsqueeze(0).repeat(b, 1)
+        color_maps = torch.arange(int(VOCAB_SIZE), device=device, dtype=torch.long).unsqueeze(0).repeat(b, 1)
     else:
         apply_col = torch.rand((b,), device=device, generator=generator) < float(p_col)
         rand_maps = _sample_color_maps_torch(
@@ -319,7 +330,7 @@ def augment_src_tgt_batch(
             device=device,
             keep_background=bool(spec.keep_background),
         )
-        ident = torch.arange(6, device=device, dtype=torch.long).unsqueeze(0).repeat(b, 1)
+        ident = torch.arange(int(VOCAB_SIZE), device=device, dtype=torch.long).unsqueeze(0).repeat(b, 1)
         color_maps = torch.where(apply_col.unsqueeze(1), rand_maps, ident)
 
     # --- parse src into 7 grids (3*(x,y) + test_x), apply geom, then stitch back ---
@@ -362,7 +373,7 @@ def augment_src_tgt_batch(
         off += 1  # SEP
     out_src[:, off : off + grid_tokens] = grids_stacked[:, gi].reshape(b, grid_tokens)
     out_tgt = tgt_grid.reshape(b, grid_tokens)
-    # Note: SEPs are untouched, but if the original src had bad values outside [0..5],
+    # Note: SEPs/PADs are untouched, but if the original src had bad values outside [0..PAD_TOKEN],
     # earlier checks would have caught it.
     return out_src, out_tgt
 

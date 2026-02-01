@@ -130,7 +130,8 @@ def load_variant_pools(
         ds = _parse_dataset_json(path)
         grid_size = int(ds.grid_size)
         grid_tokens = grid_size * grid_size
-        seq_len = prompt_seq_len(grid_size=grid_size, num_demos=3)
+        expected_num_demos: Optional[int] = None
+        seq_len: Optional[int] = None
 
         # First, collect rows per key in numpy/torch.
         per_key_rows: dict[VariantKey, list[tuple[torch.Tensor, torch.Tensor]]] = {}
@@ -141,10 +142,22 @@ def load_variant_pools(
             demos: list[tuple[np.ndarray, np.ndarray]] = []
             for demo in task.demos:
                 demos.append((_grid_to_np(demo.x), _grid_to_np(demo.y)))
+            nd = int(len(demos))
+            if nd <= 0:
+                raise ValueError(f"Task has no demos (skill={sid} split={split})")
+            if expected_num_demos is None:
+                expected_num_demos = int(nd)
+                seq_len = prompt_seq_len(grid_size=grid_size, num_demos=int(expected_num_demos))
+            elif int(expected_num_demos) != int(nd):
+                raise ValueError(
+                    f"Inconsistent num_demos within skill={sid} split={split}: expected {int(expected_num_demos)} got {int(nd)}"
+                )
             test_in = _grid_to_np(task.test.x)
             test_out = _grid_to_np(task.test.y).reshape(-1)
 
             seq = _flatten_prompt(demos=demos, test_in=test_in)
+            if seq_len is None:
+                raise ValueError("Internal error: seq_len not initialized")
             if len(seq) != int(seq_len):
                 raise ValueError(f"Unexpected seq_len={len(seq)} (expected {seq_len}) for skill={sid} split={split}")
             if int(test_out.shape[0]) != int(grid_tokens):
@@ -626,7 +639,7 @@ def _exact_match_acc(
                 demos, test_x = decode_prompt_src(
                     src_tokens=xb[bi].detach().cpu().numpy(),
                     grid_size=g,
-                    num_demos=3,
+                    num_demos=int((int(xb.shape[1]) - (g * g + 1)) // (2 * g * g + 2)),
                 )
                 pred_y = pred[bi].detach().cpu().numpy().reshape(g, g)
                 true_y = yb[bi].detach().cpu().numpy().reshape(g, g)
@@ -734,7 +747,12 @@ def main(
         if int(p.grid_size) != int(grid_size):
             raise ValueError(f"Pool {k.to_str()} grid_size={p.grid_size} != --grid_size={grid_size}")
 
-    seq_len = prompt_seq_len(grid_size=int(grid_size), num_demos=3)
+    # Infer num_demos from any pool's prompt length (dataset is required to be consistent).
+    any_pool = next(iter(train_pools.values()))
+    g2 = int(grid_size) * int(grid_size)
+    denom = int(2 * g2 + 2)
+    nd = int((int(any_pool.src.shape[1]) - (g2 + 1)) // denom)
+    seq_len = prompt_seq_len(grid_size=int(grid_size), num_demos=int(nd))
     trunk_heads = int(num_heads) if num_heads_trunk is None else int(num_heads_trunk)
     expert_heads = int(num_heads) if num_heads_expert is None else int(num_heads_expert)
     trunk_layers_i = int(trunk_layers)

@@ -21,6 +21,8 @@ from arc_train_utils import (
     count_params,
     evaluate_accuracy,
     load_skill_split,
+    pad_dataset_to,
+    maybe_load_external_arc_splits,
     maybe_load_skill_split,
     maybe_move_train_pool,
     plot_learning_curves,
@@ -654,7 +656,7 @@ class ARCTransformer(nn.Module):
             self.transformer_rel = None
         self.fc_out = nn.Linear(embed_dim, vocab_size)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, *, key_padding_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         # x: (B, T)
         _b, t = x.shape
         if t > int(self.global_pos_enc.shape[1]):
@@ -664,6 +666,10 @@ class ARCTransformer(nn.Module):
             )
 
         emb = self.embed(x) + self.global_pos_enc[:, :t, :]
+        if key_padding_mask is not None:
+            if key_padding_mask.shape != x.shape:
+                raise ValueError(f"key_padding_mask must have shape {tuple(x.shape)}, got {tuple(key_padding_mask.shape)}")
+            emb = emb.masked_fill(key_padding_mask.unsqueeze(-1), 0.0)
 
         row, col, is_sep = _prompt_rows_cols(t=int(t), grid_size=int(self.grid_size), device=x.device)
         demo_row, demo_col, demo_id = _prompt_demo_rows_cols(
@@ -699,14 +705,18 @@ class ARCTransformer(nn.Module):
             )
         else:
             assert self.transformer is not None
-            h = self.transformer(emb)
+            if key_padding_mask is not None:
+                h = self.transformer(emb, src_key_padding_mask=key_padding_mask)
+            else:
+                h = self.transformer(emb)
         return self.fc_out(h)  # (B, T, vocab)
 
 
 def main(
-    data_dir: Path = Path("tmp"),
-    grid_size: int = 5,
-    num_demos: int = 3,
+    data_dir: Path | list[Path] = Path("tmp"),
+    grid_size: int = 0,
+    num_demos: int = 0,
+    max_seq_len: int = 500,
     pos_encoding: str = "2d",
     rel_pos_bias_2d: bool = True,
     demo_rel_pos_bias_2d: bool = True,
@@ -743,6 +753,7 @@ def main(
     eval_tasks: int = 128,
     eval_batch_size: int = 256,
     plot_unsolved_n: int = 3,
+    print_solved_n: int = 0,
     progress: bool = False,
     out_dir: Path = Path("arc_train_runs"),
     no_plots: bool = False,
@@ -755,12 +766,15 @@ def main(
     torch.manual_seed(int(seed))
     rng = np.random.default_rng(int(seed))
 
-    grid_size = int(grid_size)
-    grid_tokens = grid_size * grid_size
-    num_demos = int(num_demos)
-    if num_demos <= 0:
-        raise ValueError(f"num_demos must be >= 1, got {num_demos}")
-    seq_len = prompt_seq_len(grid_size=grid_size, num_demos=int(num_demos))
+    grid_size_arg = int(grid_size)
+    num_demos_arg = int(num_demos)
+    max_seq_len_i = int(max_seq_len)
+    if grid_size_arg < 0:
+        raise ValueError(f"grid_size must be >= 0 (0=infer), got {grid_size_arg}")
+    if num_demos_arg < 0:
+        raise ValueError(f"num_demos must be >= 0 (0=infer), got {num_demos_arg}")
+    if max_seq_len_i < 0:
+        raise ValueError(f"max_seq_len must be >= 0 (0=disable), got {max_seq_len_i}")
     device = torch.device(device)
     out_dir = Path(out_dir).expanduser().resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -835,6 +849,9 @@ def main(
     if cap_skill is not None and cap_n is None:
         raise ValueError("--cap_train_n must be provided when --cap_train_skill is set.")
 
+    # Normalize to a list of dataset roots.
+    data_dirs: list[Path] = [Path(p).expanduser().resolve() for p in (data_dir if isinstance(data_dir, list) else [data_dir])]
+
     # Load datasets from disk (no on-the-fly generation) and do a deterministic train/test split.
     #
     # Important: reported accuracies are computed on the held-out "test" portions to avoid leakage.
@@ -843,48 +860,163 @@ def main(
     ood_train_pools: dict[int, TensorizedDataset] = {}
     eval_ood_sets: dict[int, TensorizedDataset] = {}
 
-    for sid in train_skills:
-        ds_train_full = load_skill_split(data_dir=data_dir, skill_id=sid, split="train")
-        ds_train, ds_train_test = split_dataset(ds_train_full, train_frac=train_frac_f, rng=rng)
-        train_sets[sid] = ds_train
-        eval_id_sets[sid] = ds_train_test
-        assert_disjoint_datasets(a=ds_train, b=ds_train_test, label=f"skill_{sid}: id train vs id heldout")
+    ext = maybe_load_external_arc_splits(
+        data_dirs=data_dirs,
+        grid_size=int(grid_size_arg),
+        num_demos=int(num_demos_arg),
+        rng=rng,
+        train_frac_for_unsplit=float(train_frac_f),
+        max_seq_len=int(max_seq_len_i) if int(max_seq_len_i) > 0 else None,
+    )
+    external_mode = ext is not None
 
-        ds_ood_full = load_skill_split(data_dir=data_dir, skill_id=sid, split="ood")
-        ds_ood_train, ds_ood_test = split_dataset(ds_ood_full, train_frac=train_frac_f, rng=rng)
-        ood_train_pools[sid] = ds_ood_train
-        eval_ood_sets[sid] = ds_ood_test
-        assert_disjoint_datasets(a=ds_ood_train, b=ds_ood_test, label=f"skill_{sid}: ood train vs ood heldout")
-
-    # Include OOD examples for selected skills in training (from their OOD-train pool).
-    # OOD test remains disjoint and is what we report in the printed metrics.
-    if train_with_ood_skills is None:
-        train_with_ood_skills = list(DEFAULT_TRAIN_WITH_OOD_SKILLS)
-    train_with_ood = {int(s) for s in train_with_ood_skills} & set(train_skills)
-    # Never include probe skill OOD in training (strict OOD probe).
-    train_with_ood.discard(probe_skill)
-    for sid in sorted(train_with_ood):
-        ood_pool = ood_train_pools[sid]
-        ood_train = ood_pool
-        if float(ood_train_frac) < 1.0:
-            ood_train, _ood_unused = split_dataset(ood_pool, train_frac=float(ood_train_frac), rng=rng)
-        if ood_train.n > 0:
-            train_sets[sid] = concat_datasets(
-                [train_sets[sid], ood_train],
-                skill_id=sid,
-                split=f"train+ood{sid}",
-                grid_size=grid_size,
+    if external_mode:
+        assert ext is not None
+        # Assign stable synthetic "skill ids" 1..N so existing training code (which expects sid>=1) works.
+        train_skills = list(range(1, int(len(ext)) + 1))
+        for i, (name, tr, ev) in enumerate(ext, start=1):
+            # Tag splits with the dataset name for readable logs/plots.
+            train_sets[i] = TensorizedDataset(
+                skill_id=int(i),
+                split=f"train[{name}]",
+                grid_size=tr.grid_size,
+                num_demos=tr.num_demos,
+                src=tr.src,
+                tgt=tr.tgt,
+                grid_size_each=tr.grid_size_each,
+                num_demos_each=tr.num_demos_each,
             )
+            eval_id_sets[i] = TensorizedDataset(
+                skill_id=int(i),
+                split=f"test[{name}]",
+                grid_size=ev.grid_size,
+                num_demos=ev.num_demos,
+                src=ev.src,
+                tgt=ev.tgt,
+                grid_size_each=ev.grid_size_each,
+                num_demos_each=ev.num_demos_each,
+            )
+        # No OOD split for external datasets.
+        ood_train_pools = {}
+        eval_ood_sets = {}
+        if grid_size_arg == 0:
+            grid_size_arg = int(train_sets[1].grid_size)
+        if num_demos_arg == 0:
+            num_demos_arg = int(train_sets[1].num_demos)
+    else:
+        # Load full splits first so we can infer *max* grid_size/num_demos across skills.
+        train_full: dict[int, TensorizedDataset] = {}
+        ood_full: dict[int, TensorizedDataset] = {}
+        for sid in train_skills:
+            train_full[sid] = load_skill_split(
+                data_dir=data_dirs,
+                skill_id=sid,
+                split="train",
+                max_seq_len=int(max_seq_len_i) if int(max_seq_len_i) > 0 else None,
+            )
+            ood_full[sid] = load_skill_split(
+                data_dir=data_dirs,
+                skill_id=sid,
+                split="ood",
+                max_seq_len=int(max_seq_len_i) if int(max_seq_len_i) > 0 else None,
+            )
+
+        max_g_loaded = max(int(ds.grid_size) for ds in train_full.values())
+        max_nd_loaded = max(int(ds.num_demos) for ds in train_full.values())
+        # OOD can have larger maxima too; include it.
+        max_g_loaded = max(int(max_g_loaded), max(int(ds.grid_size) for ds in ood_full.values()))
+        max_nd_loaded = max(int(max_nd_loaded), max(int(ds.num_demos) for ds in ood_full.values()))
+
+        if grid_size_arg == 0:
+            grid_size_arg = int(max_g_loaded)
+        if num_demos_arg == 0:
+            num_demos_arg = int(max_nd_loaded)
+        if int(grid_size_arg) < int(max_g_loaded):
+            raise ValueError(f"--grid_size={int(grid_size_arg)} is smaller than dataset max grid_size={int(max_g_loaded)}")
+        if int(num_demos_arg) < int(max_nd_loaded):
+            raise ValueError(f"--num_demos={int(num_demos_arg)} is smaller than dataset max num_demos={int(max_nd_loaded)}")
+        if int(max_seq_len_i) > 0:
+            target_seq_len = int(prompt_seq_len(grid_size=int(grid_size_arg), num_demos=int(num_demos_arg)))
+            if int(target_seq_len) > int(max_seq_len_i):
+                raise ValueError(
+                    f"Chosen token budget seq_len={int(target_seq_len)} exceeds max_seq_len={int(max_seq_len_i)}. "
+                    "Reduce --grid_size/--num_demos or increase --max_seq_len (or set it to 0 to disable)."
+                )
+
+        # Normalize all datasets to the chosen maxima before splitting.
+        for sid in train_skills:
+            train_full[sid] = pad_dataset_to(train_full[sid], grid_size=int(grid_size_arg), num_demos=int(num_demos_arg))
+            ood_full[sid] = pad_dataset_to(ood_full[sid], grid_size=int(grid_size_arg), num_demos=int(num_demos_arg))
+
+        for sid in train_skills:
+            ds_train, ds_train_test = split_dataset(train_full[sid], train_frac=train_frac_f, rng=rng)
+            train_sets[sid] = ds_train
+            eval_id_sets[sid] = ds_train_test
+            assert_disjoint_datasets(a=ds_train, b=ds_train_test, label=f"skill_{sid}: id train vs id heldout")
+
+            ds_ood_train, ds_ood_test = split_dataset(ood_full[sid], train_frac=train_frac_f, rng=rng)
+            ood_train_pools[sid] = ds_ood_train
+            eval_ood_sets[sid] = ds_ood_test
+            assert_disjoint_datasets(a=ds_ood_train, b=ds_ood_test, label=f"skill_{sid}: ood train vs ood heldout")
+
+    if grid_size_arg <= 0:
+        raise ValueError("Could not infer grid_size (no training datasets loaded).")
+    if num_demos_arg <= 0:
+        raise ValueError("Could not infer num_demos (no training datasets loaded).")
+
+    grid_size = int(grid_size_arg)
+    num_demos = int(num_demos_arg)
+    grid_tokens = int(grid_size) * int(grid_size)
+    seq_len = prompt_seq_len(grid_size=int(grid_size), num_demos=int(num_demos))
+    if int(max_seq_len_i) > 0 and int(seq_len) > int(max_seq_len_i):
+        raise ValueError(
+            f"Chosen token budget seq_len={int(seq_len)} exceeds max_seq_len={int(max_seq_len_i)}. "
+            "Reduce --grid_size/--num_demos or increase --max_seq_len (or set it to 0 to disable)."
+        )
+
+    # Include OOD examples for selected skills in training (synthetic mode only).
+    # OOD test remains disjoint and is what we report in the printed metrics.
+    if not external_mode:
+        if train_with_ood_skills is None:
+            train_with_ood_skills = list(DEFAULT_TRAIN_WITH_OOD_SKILLS)
+        train_with_ood = {int(s) for s in train_with_ood_skills} & set(train_skills)
+        # Never include probe skill OOD in training (strict OOD probe).
+        train_with_ood.discard(probe_skill)
+        for sid in sorted(train_with_ood):
+            ood_pool = ood_train_pools[sid]
+            ood_train = ood_pool
+            if float(ood_train_frac) < 1.0:
+                ood_train, _ood_unused = split_dataset(ood_pool, train_frac=float(ood_train_frac), rng=rng)
+            if ood_train.n > 0:
+                train_sets[sid] = concat_datasets(
+                    [train_sets[sid], ood_train],
+                    skill_id=sid,
+                    split=f"train+ood{sid}",
+                    grid_size=grid_size,
+                )
+    else:
+        train_with_ood = set()
 
     # Optional artificial cap for any skill: reduce training data to force learning only when possible.
     if cap_skill is not None and cap_skill in train_sets:
         train_sets[cap_skill] = cap_dataset(train_sets[cap_skill], cap=int(cap_n), rng=rng)
 
     # Always report the strict OOD probe (held-out OOD test), even if probe_skill is not in train_skills.
-    probe_ood_full = maybe_load_skill_split(data_dir=data_dir, skill_id=probe_skill, split="ood")
+    # (Synthetic mode only.)
+    probe_ood_full = (
+        None
+        if external_mode
+        else maybe_load_skill_split(
+            data_dir=data_dirs,
+            skill_id=probe_skill,
+            split="ood",
+            max_seq_len=int(max_seq_len_i) if int(max_seq_len_i) > 0 else None,
+        )
+    )
     eval_probe_ood = None
     probe_ood_train: Optional[TensorizedDataset] = None
     if probe_ood_full is not None:
+        probe_ood_full = pad_dataset_to(probe_ood_full, grid_size=int(grid_size), num_demos=int(num_demos))
         probe_ood_train, probe_ood_test = split_dataset(probe_ood_full, train_frac=train_frac_f, rng=rng)
         eval_probe_ood = probe_ood_test
         assert_disjoint_datasets(
@@ -898,20 +1030,42 @@ def main(
     if eval_probe_ood is not None:
         ds_to_check.append(eval_probe_ood)
     for ds in ds_to_check:
-        if ds.grid_size != grid_size:
-            raise ValueError(f"Dataset grid_size={ds.grid_size} != --grid_size={grid_size}")
+        if int(ds.grid_size) != int(grid_size):
+            raise ValueError(f"Dataset grid_size={ds.grid_size} != inferred/selected grid_size={grid_size}")
+        if int(ds.num_demos) != int(num_demos):
+            raise ValueError(f"Dataset num_demos={ds.num_demos} != inferred/selected num_demos={num_demos}")
 
     # Build mixed training pools. Optionally delay multiple skills until specified steps.
     train_src_all = torch.cat([train_sets[sid].src for sid in train_skills], dim=0)
     train_tgt_all = torch.cat([train_sets[sid].tgt for sid in train_skills], dim=0)
+    train_g_each_all = torch.cat([train_sets[sid].grid_size_each for sid in train_skills], dim=0)
+    train_nd_each_all = torch.cat([train_sets[sid].num_demos_each for sid in train_skills], dim=0)
     train_pool_all = TensorizedDataset(
-        skill_id=-1, split="train_mix", grid_size=grid_size, src=train_src_all, tgt=train_tgt_all
+        skill_id=-1,
+        split="train_mix",
+        grid_size=grid_size,
+        num_demos=num_demos,
+        src=train_src_all,
+        tgt=train_tgt_all,
+        grid_size_each=train_g_each_all,
+        num_demos_each=train_nd_each_all,
     )
 
     def build_pool(active_skills: list[int], *, split: str) -> TensorizedDataset:
         train_src = torch.cat([train_sets[sid].src for sid in active_skills], dim=0)
         train_tgt = torch.cat([train_sets[sid].tgt for sid in active_skills], dim=0)
-        return TensorizedDataset(skill_id=-1, split=split, grid_size=grid_size, src=train_src, tgt=train_tgt)
+        train_g_each = torch.cat([train_sets[sid].grid_size_each for sid in active_skills], dim=0)
+        train_nd_each = torch.cat([train_sets[sid].num_demos_each for sid in active_skills], dim=0)
+        return TensorizedDataset(
+            skill_id=-1,
+            split=split,
+            grid_size=grid_size,
+            num_demos=num_demos,
+            src=train_src,
+            tgt=train_tgt,
+            grid_size_each=train_g_each,
+            num_demos_each=train_nd_each,
+        )
 
     # Precompute phase pools keyed by the step at which that pool becomes active.
     phase_starts = [0]
@@ -1047,7 +1201,7 @@ def main(
         )
     else:
         scheduler = None
-    loss_fn = nn.CrossEntropyLoss()
+    loss_fn = nn.CrossEntropyLoss(ignore_index=-100)
 
     def save_latest_checkpoint(*, step: int) -> None:
         ckpt = {
@@ -1056,6 +1210,7 @@ def main(
             "optimizer": opt.state_dict(),
             "seed": int(seed),
             "grid_size": int(grid_size),
+            "num_demos": int(num_demos),
             "seq_len": int(seq_len),
             "train_skills": [int(s) for s in train_skills],
             "delay_until_by_skill": {int(k): int(v) for k, v in delay_until_by_skill.items()},
@@ -1070,6 +1225,7 @@ def main(
             "optimizer": opt.state_dict(),
             "seed": int(seed),
             "grid_size": int(grid_size),
+            "num_demos": int(num_demos),
             "seq_len": int(seq_len),
             "train_skills": [int(s) for s in train_skills],
             "delay_until_by_skill": {int(k): int(v) for k, v in delay_until_by_skill.items()},
@@ -1114,7 +1270,7 @@ def main(
         tgt = batch.tgt  # (B, grid_tokens)
 
         opt.zero_grad(set_to_none=True)
-        logits = model(src)  # (B, T, V)
+        logits = model(src, key_padding_mask=batch.key_padding_mask)  # (B, T, V)
         pred_logits = logits[:, -(grid_tokens + 1) : -1, :]  # predict from test-x positions
 
         loss = loss_fn(pred_logits.reshape(-1, VOCAB_SIZE), tgt.reshape(-1))
@@ -1134,6 +1290,7 @@ def main(
         if do_eval:
             model.eval()
             eval_ids = sorted(eval_id_sets.keys())
+            print_solved_n_i = int(print_solved_n)
             acc_train = {}
             acc_id = {}
             acc_ood = {}
@@ -1142,6 +1299,7 @@ def main(
             if unsolved_dir is not None:
                 unsolved_dir.mkdir(parents=True, exist_ok=True)
 
+            first_sid = int(eval_ids[0]) if (len(eval_ids) > 0) else -1
             for sid in eval_ids:
                 acc_train[sid] = evaluate_accuracy(
                     model=model,
@@ -1164,20 +1322,24 @@ def main(
                     save_unsolved_max=int(plot_unsolved_n_i),
                     save_unsolved_step=int(step),
                     save_unsolved_tag="id",
+                    print_solved_max=int(print_solved_n_i) if int(sid) == int(first_sid) else 0,
+                    print_solved_step=int(step),
+                    print_solved_tag="id",
                 )
-                acc_ood[sid] = evaluate_accuracy(
-                    model=model,
-                    rng=rng,
-                    n_tasks=int(eval_tasks),
-                    device=device,
-                    grid_tokens=grid_tokens,
-                    dataset=eval_ood_sets[sid],
-                    eval_batch_size=int(eval_batch_size),
-                    save_unsolved_dir=unsolved_dir,
-                    save_unsolved_max=int(plot_unsolved_n_i),
-                    save_unsolved_step=int(step),
-                    save_unsolved_tag="ood",
-                )
+                if sid in eval_ood_sets:
+                    acc_ood[sid] = evaluate_accuracy(
+                        model=model,
+                        rng=rng,
+                        n_tasks=int(eval_tasks),
+                        device=device,
+                        grid_tokens=grid_tokens,
+                        dataset=eval_ood_sets[sid],
+                        eval_batch_size=int(eval_batch_size),
+                        save_unsolved_dir=unsolved_dir,
+                        save_unsolved_max=int(plot_unsolved_n_i),
+                        save_unsolved_step=int(step),
+                        save_unsolved_tag="ood",
+                    )
 
             # Optional strict OOD probe (held-out OOD test).
             acc_probe_ood = float("nan")
@@ -1205,15 +1367,21 @@ def main(
                 )
 
             def fmt(acc: dict[int, float], skills: list[int]) -> str:
-                return " ".join(f"s{sid}={acc[sid]:.3f}" for sid in skills)
+                return " ".join(f"s{sid}={acc.get(sid, float('nan')):.3f}" for sid in skills)
 
             print(f"step={step:5d} loss={loss.item():.4f}")
             print(f"  trn: {fmt(acc_train, eval_ids)}")
-            print(f"  id : {fmt(acc_id, eval_ids)}")
-            ood_line = f"  ood: {fmt(acc_ood, eval_ids)}"
-            if eval_probe_ood is not None:
-                ood_line += f"  (probe: s{probe_skill} train-ood={acc_probe_train:.3f} fully-heldout-ood={acc_probe_ood:.3f})"
-            print(ood_line)
+            if external_mode:
+                print(f"  tst: {fmt(acc_id, eval_ids)}")
+            else:
+                print(f"  id : {fmt(acc_id, eval_ids)}")
+            if len(eval_ood_sets) > 0:
+                ood_line = f"  ood: {fmt(acc_ood, eval_ids)}"
+                if eval_probe_ood is not None:
+                    ood_line += (
+                        f"  (probe: s{probe_skill} train-ood={acc_probe_train:.3f} fully-heldout-ood={acc_probe_ood:.3f})"
+                    )
+                print(ood_line)
             if (scheduler is not None) or use_gradual_unfreeze:
                 base_lr = float(opt.param_groups[0]["lr"])
                 if use_gradual_unfreeze:
@@ -1231,7 +1399,7 @@ def main(
                 curves.ensure_skill(sid)
                 curves.acc_train[sid].append(float(acc_train[sid]))
                 curves.acc_id[sid].append(float(acc_id[sid]))
-                curves.acc_ood[sid].append(float(acc_ood[sid]))
+                curves.acc_ood[sid].append(float(acc_ood.get(sid, float("nan"))))
 
             # Save metrics CSV next to the plot output (even if --no_plots).
             metrics_csv = out_dir / "plots" / "learning_curves_latest.csv"
@@ -1263,10 +1431,9 @@ def main(
 
     # Qualitative examples
     model.eval()
-    if 2 in eval_id_sets:
-        show_one_example(model=model, dataset=eval_id_sets[2], device=device, grid_size=grid_size)
-    if 3 in eval_id_sets:
-        show_one_example(model=model, dataset=eval_id_sets[3], device=device, grid_size=grid_size)
+    if len(eval_id_sets) > 0:
+        sid0 = sorted(eval_id_sets.keys())[0]
+        show_one_example(model=model, dataset=eval_id_sets[sid0], device=device, grid_size=grid_size)
     if eval_probe_ood is not None:
         show_one_example(model=model, dataset=eval_probe_ood, device=device, grid_size=grid_size)
 
@@ -1276,10 +1443,37 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--data_dir",
         type=Path,
-        default=Path("tmp"),
-        help="Directory produced by arc_dataset_generator.py (contains skill_<id>/{train,ood}.json).",
+        nargs="*",
+        default=[Path("tmp")],
+        help=(
+            "One or more dataset roots. "
+            "Synthetic format: contains skill_<id>/{train,ood}.json. "
+            "ARC-AGI format: contains {training,evaluation}/*.json (ARC task JSONs). "
+            "If subfolders exist but are not named training/evaluation, all jsons are loaded and split into train/evaluation."
+        ),
     )
-    p.add_argument("--grid_size", type=int, default=5)
+    p.add_argument(
+        "--grid_size",
+        type=int,
+        default=0,
+        help="Grid size. Use 0 to infer from the loaded dataset/puzzles.",
+    )
+    p.add_argument(
+        "--num_demos",
+        type=int,
+        default=0,
+        help="Number of demonstrations. Use 0 to infer from the loaded dataset/puzzles.",
+    )
+    p.add_argument(
+        "--max_seq_len",
+        type=int,
+        default=500,
+        help=(
+            "Maximum allowed tokenized prompt length T. Any training/eval examples whose prompt would exceed this are dropped. "
+            "Also enforces that the final (grid_size,num_demos) token budget fits within this limit. "
+            "Use 0 to disable."
+        ),
+    )
     p.add_argument(
         "--pretrained",
         type=Path,
@@ -1530,6 +1724,12 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         default=3,
         help="Per-skill number of unsolved test examples to render as PNG during eval (0 disables).",
     )
+    p.add_argument(
+        "--print_solved_n",
+        type=int,
+        default=0,
+        help="Number of solved ID test examples to print (stdout) at each eval (0 disables). Printed for the first eval skill only.",
+    )
     p.add_argument("--progress", action="store_true", help="Show tqdm progress if installed")
     p.add_argument("--out_dir", type=Path, default=Path("arc_train_runs"), help="Where to write plots/metrics")
     p.add_argument("--no_plots", action="store_true", help="Disable saving learning-curve PNGs")
@@ -1625,9 +1825,10 @@ def cli_main(argv: Optional[list[str]] = None) -> None:
         args.delay_train_skills = delay_skills
         args.delay_train_until_steps = delay_steps
     main(
-        data_dir=Path(args.data_dir),
+        data_dir=list(args.data_dir),
         grid_size=int(args.grid_size),
-        num_demos=3,
+        num_demos=int(args.num_demos),
+        max_seq_len=int(args.max_seq_len),
         pos_encoding=str(args.pos_encoding),
         rel_pos_bias_2d=bool(args.rel_pos_bias_2d),
         demo_rel_pos_bias_2d=bool(args.demo_rel_pos_bias_2d),
@@ -1662,6 +1863,7 @@ def cli_main(argv: Optional[list[str]] = None) -> None:
         eval_tasks=int(args.eval_tasks),
         eval_batch_size=int(args.eval_batch_size),
         plot_unsolved_n=int(args.plot_unsolved_n),
+        print_solved_n=int(args.print_solved_n),
         progress=bool(args.progress),
         out_dir=Path(args.out_dir),
         no_plots=bool(args.no_plots),

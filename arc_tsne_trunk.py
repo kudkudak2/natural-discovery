@@ -113,7 +113,8 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         choices=["train", "val", "test"],
         help='Which deterministic subset to embed after loading the JSON. "test" is an alias for "val".',
     )
-    p.add_argument("--grid_size", type=int, default=6)
+    p.add_argument("--grid_size", type=int, default=0, help="Grid size. Use 0 to infer from the loaded dataset/pools.")
+    p.add_argument("--num_demos", type=int, default=0, help="Number of demos. Use 0 to infer from the loaded dataset/pools.")
     p.add_argument("--pos_encoding", type=str, default="2d", choices=["2d", "1d"])
     p.add_argument("--train_skills", type=int, nargs="*", default=None)
 
@@ -189,6 +190,7 @@ def main(
     split: str,
     subset: str,
     grid_size: int,
+    num_demos: int,
     pos_encoding: str,
     train_skills: Optional[list[int]],
     embed_dim: int,
@@ -249,7 +251,19 @@ def main(
     else:
         raise ValueError(f"Unexpected --subset: {subset!r}")
 
-    seq_len = prompt_seq_len(grid_size=int(grid_size), num_demos=3)
+    # Infer grid_size / num_demos if not explicitly provided.
+    any_pool = next(iter(pools.values()))
+    if int(grid_size) == 0:
+        grid_size = int(any_pool.grid_size)
+    for kk, pool in pools.items():
+        if int(pool.grid_size) != int(grid_size):
+            raise ValueError(f"Pool {kk.to_str()} grid_size={pool.grid_size} != grid_size={grid_size}")
+
+    if int(num_demos) == 0:
+        g2 = int(grid_size) * int(grid_size)
+        denom = int(2 * g2 + 2)
+        num_demos = int((int(any_pool.src.shape[1]) - (g2 + 1)) // denom)
+    seq_len = prompt_seq_len(grid_size=int(grid_size), num_demos=int(num_demos))
     trunk_heads = int(num_heads) if num_heads_trunk is None else int(num_heads_trunk)
     expert_heads = int(num_heads) if num_heads_expert is None else int(num_heads_expert)
     model = TrunkPlusExperts(
@@ -557,6 +571,7 @@ def cli_main(argv: Optional[list[str]] = None) -> None:
         split=str(pick("split", args.split, "--split")),
         subset=str(pick("subset", args.subset, "--subset")),
         grid_size=int(pick("grid_size", args.grid_size, "--grid_size")),
+        num_demos=int(pick("num_demos", args.num_demos, "--num_demos")),
         pos_encoding=str(pick("pos_encoding", args.pos_encoding, "--pos_encoding")),
         train_skills=(
             [int(s) for s in args.train_skills]
