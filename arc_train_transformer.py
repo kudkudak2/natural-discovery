@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import math
 from pathlib import Path
 from typing import Optional
 
@@ -740,7 +741,8 @@ def main(
     lr: float = 5e-4,
     lr_decay: str = "cosine",
     min_lr: float = 0.0,
-    weight_decay: float = 0.01, # 0.1 seems too high actually
+    warmup_steps: int = 2000,
+    weight_decay: float = 0.01, 
     seed: int = 0,
     device: str = "cuda", # if torch.cuda.is_available() else "cpu",
     embed_dim: int = 128,
@@ -761,7 +763,10 @@ def main(
     aug: bool = True,
     aug_geom_prob: float = 1.0,
     aug_color_prob: float = 1.0,
+    aug_translate_prob: float = 1.0,
+    aug_translate_max: int = -1,
     aug_keep_background: bool = True,
+    eval_vote_augs: int = 0,
 ) -> None:
     torch.manual_seed(int(seed))
     rng = np.random.default_rng(int(seed))
@@ -1192,15 +1197,30 @@ def main(
         raise ValueError(f"--lr_decay must be one of {{'cosine','none'}}, got {lr_decay!r}")
     if float(min_lr) < 0.0:
         raise ValueError(f"--min_lr must be >= 0, got {min_lr}")
-    if lr_decay == "cosine":
-        # Decay from --lr to --min_lr over the full training horizon.
-        scheduler = optim.lr_scheduler.CosineAnnealingLR(
-            opt,
-            T_max=int(steps),
-            eta_min=float(min_lr),
-        )
-    else:
-        scheduler = None
+    warmup_steps_i = int(warmup_steps)
+    if warmup_steps_i < 0:
+        raise ValueError(f"--warmup_steps must be >= 0, got {warmup_steps_i}")
+    base_lr = float(lr)
+    min_lr_f = float(min_lr)
+    total_steps_i = int(steps)
+
+    def lr_at_step(step_i: int) -> float:
+        """
+        LR schedule:
+        - linear warmup for the first `warmup_steps` steps (default on)
+        - then either constant LR (--lr_decay=none) or cosine decay to --min_lr
+        """
+        s = int(step_i) + 1  # 1-indexed
+        if warmup_steps_i > 0 and s <= warmup_steps_i:
+            return base_lr * (float(s) / float(warmup_steps_i))
+        if lr_decay == "none":
+            return base_lr
+        # cosine
+        denom = max(1, int(total_steps_i - warmup_steps_i))
+        t = float(max(0, s - warmup_steps_i)) / float(denom)
+        if t >= 1.0:
+            return min_lr_f
+        return min_lr_f + 0.5 * (base_lr - min_lr_f) * (1.0 + math.cos(math.pi * t))
     loss_fn = nn.CrossEntropyLoss(ignore_index=-100)
 
     def save_latest_checkpoint(*, step: int) -> None:
@@ -1249,7 +1269,21 @@ def main(
         enabled=bool(aug),
         geom_prob=float(aug_geom_prob),
         color_prob=float(aug_color_prob),
+        translate_prob=float(aug_translate_prob),
+        translate_max=int(aug_translate_max),
         keep_background=bool(aug_keep_background),
+    )
+    vote_spec = (
+        AugmentSpec(
+            enabled=True,
+            geom_prob=1.0,
+            color_prob=1.0,
+            translate_prob=1.0,
+            translate_max=int(aug_translate_max),
+            keep_background=bool(aug_keep_background),
+        )
+        if int(eval_vote_augs) > 0
+        else None
     )
     steps_iter = progress_iter(range(int(steps)), total=int(steps), desc="train", enabled=bool(progress))
     phase_idx = 0
@@ -1269,19 +1303,25 @@ def main(
         src = batch.src
         tgt = batch.tgt  # (B, grid_tokens)
 
+        # Update learning rates (warmup + optional decay). Applied to all param groups.
+        lr_step = float(lr_at_step(int(step)))
+        if use_gradual_unfreeze:
+            mult = float(NEW_LAYER_LR_MULT) if int(step) < int(gradual_unfreeze_steps) else 1.0
+            opt.param_groups[int(old_decay_idx)]["lr"] = float(lr_step)
+            opt.param_groups[int(old_no_decay_idx)]["lr"] = float(lr_step)
+            opt.param_groups[int(new_decay_idx)]["lr"] = float(lr_step) * float(mult)
+            opt.param_groups[int(new_no_decay_idx)]["lr"] = float(lr_step) * float(mult)
+        else:
+            for pg in opt.param_groups:
+                pg["lr"] = float(lr_step)
+
         opt.zero_grad(set_to_none=True)
         logits = model(src, key_padding_mask=batch.key_padding_mask)  # (B, T, V)
         pred_logits = logits[:, -(grid_tokens + 1) : -1, :]  # predict from test-x positions
 
         loss = loss_fn(pred_logits.reshape(-1, VOCAB_SIZE), tgt.reshape(-1))
         loss.backward()
-        if use_gradual_unfreeze:
-            mult = float(NEW_LAYER_LR_MULT) if int(step) < int(gradual_unfreeze_steps) else 1.0
-            opt.param_groups[int(new_decay_idx)]["lr"] = float(opt.param_groups[int(old_decay_idx)]["lr"]) * float(mult)
-            opt.param_groups[int(new_no_decay_idx)]["lr"] = float(opt.param_groups[int(old_no_decay_idx)]["lr"]) * float(mult)
         opt.step()
-        if scheduler is not None:
-            scheduler.step()
 
         if (int(save_every) > 0) and ((step % int(save_every) == 0) or (step == int(steps) - 1)):
             save_latest_checkpoint(step=int(step))
@@ -1309,6 +1349,8 @@ def main(
                     grid_tokens=grid_tokens,
                     dataset=train_sets[sid],
                     eval_batch_size=int(eval_batch_size),
+                    vote_augs=int(eval_vote_augs),
+                    vote_spec=vote_spec,
                 )
                 acc_id[sid] = evaluate_accuracy(
                     model=model,
@@ -1318,6 +1360,8 @@ def main(
                     grid_tokens=grid_tokens,
                     dataset=eval_id_sets[sid],
                     eval_batch_size=int(eval_batch_size),
+                    vote_augs=int(eval_vote_augs),
+                    vote_spec=vote_spec,
                     save_unsolved_dir=unsolved_dir,
                     save_unsolved_max=int(plot_unsolved_n_i),
                     save_unsolved_step=int(step),
@@ -1335,6 +1379,8 @@ def main(
                         grid_tokens=grid_tokens,
                         dataset=eval_ood_sets[sid],
                         eval_batch_size=int(eval_batch_size),
+                        vote_augs=int(eval_vote_augs),
+                        vote_spec=vote_spec,
                         save_unsolved_dir=unsolved_dir,
                         save_unsolved_max=int(plot_unsolved_n_i),
                         save_unsolved_step=int(step),
@@ -1352,6 +1398,8 @@ def main(
                     grid_tokens=grid_tokens,
                     dataset=eval_probe_ood,
                     eval_batch_size=int(eval_batch_size),
+                    vote_augs=int(eval_vote_augs),
+                    vote_spec=vote_spec,
                 )
 
             acc_probe_train = float("nan")
@@ -1364,6 +1412,8 @@ def main(
                     grid_tokens=grid_tokens,
                     dataset=probe_ood_train,
                     eval_batch_size=int(eval_batch_size),
+                    vote_augs=int(eval_vote_augs),
+                    vote_spec=vote_spec,
                 )
 
             def fmt(acc: dict[int, float], skills: list[int]) -> str:
@@ -1382,7 +1432,7 @@ def main(
                         f"  (probe: s{probe_skill} train-ood={acc_probe_train:.3f} fully-heldout-ood={acc_probe_ood:.3f})"
                     )
                 print(ood_line)
-            if (scheduler is not None) or use_gradual_unfreeze:
+            if (lr_decay != "none") or (warmup_steps_i > 0) or use_gradual_unfreeze:
                 base_lr = float(opt.param_groups[0]["lr"])
                 if use_gradual_unfreeze:
                     new_lr = float(opt.param_groups[2]["lr"])
@@ -1670,6 +1720,12 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         default=0.0,
         help="Minimum LR for cosine decay (eta_min). Ignored when --lr_decay=none.",
     )
+    p.add_argument(
+        "--warmup_steps",
+        type=int,
+        default=2000,
+        help="Number of initial steps for linear LR warmup (default on). Set 0 to disable.",
+    )
     p.add_argument("--weight_decay", type=float, default=0.01, help="AdamW weight decay (L2).")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
@@ -1759,10 +1815,28 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="Probability of applying a random global color permutation per sample in a training batch.",
     )
     p.add_argument(
+        "--aug_translate_prob",
+        type=float,
+        default=1.0,
+        help="Probability of applying a random translation per sample in a training batch.",
+    )
+    p.add_argument(
+        "--aug_translate_max",
+        type=int,
+        default=-1,
+        help="Max absolute translation (cells). -1=auto (max in-bounds based on non-zero bbox).",
+    )
+    p.add_argument(
         "--aug_keep_background",
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Keep background color 0 fixed during color permutation (default). Disable with --no-aug_keep_background.",
+    )
+    p.add_argument(
+        "--eval_vote_augs",
+        type=int,
+        default=0,
+        help="If >0, perform test-time voting over this many random augmentations (slow).",
     )
     return p
 
@@ -1850,6 +1924,7 @@ def cli_main(argv: Optional[list[str]] = None) -> None:
         lr=float(args.lr),
         lr_decay=str(args.lr_decay),
         min_lr=float(args.min_lr),
+        warmup_steps=int(args.warmup_steps),
         weight_decay=float(args.weight_decay),
         seed=int(args.seed),
         device=str(args.device),
@@ -1871,7 +1946,10 @@ def cli_main(argv: Optional[list[str]] = None) -> None:
         aug=bool(args.aug),
         aug_geom_prob=float(args.aug_geom_prob),
         aug_color_prob=float(args.aug_color_prob),
+        aug_translate_prob=float(args.aug_translate_prob),
+        aug_translate_max=int(args.aug_translate_max),
         aug_keep_background=bool(args.aug_keep_background),
+        eval_vote_augs=int(args.eval_vote_augs),
     )
 
 

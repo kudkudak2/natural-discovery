@@ -13,7 +13,7 @@ import torch.nn as nn
 
 from arc_dataset_models import ARCDataset
 from arc_dataset_models import ARCExamplePair, ARCTask, ARCTestCase
-from arc_aug import AugmentSpec, augment_src_tgt_batch
+from arc_aug import AugmentSpec, augment_src_tgt_batch, augment_src_tgt_batch_with_params, invert_grids_torch
 
 import hashlib
 
@@ -330,6 +330,9 @@ def _pad_to_square(grid: list[list[int]], *, size: int) -> list[list[int]]:
         raise ValueError(f"size must be >= 1, got {g}")
     if h > g or w > g:
         raise ValueError(f"Grid {h}x{w} does not fit into requested square size={g}")
+    # IMPORTANT: within-grid padding uses background color 0 (not PAD_TOKEN).
+    # This is required for geometry/translation augmentations to preserve semantics
+    # when mixing variable-sized grids inside a fixed max canvas.
     out = [[0 for _ in range(g)] for _ in range(g)]
     for r in range(h):
         row = grid[r]
@@ -976,7 +979,8 @@ def _tensorize_dataset(ds: ARCDataset, *, max_seq_len: Optional[int] = None) -> 
     demos_each = torch.empty((len(parsed),), dtype=torch.long)
 
     def embed_grid(grid: np.ndarray, *, g: int) -> np.ndarray:
-        out = np.full((int(max_g), int(max_g)), int(PAD_TOKEN), dtype=np.int64)
+        # IMPORTANT: within-grid padding uses background color 0 (not PAD_TOKEN).
+        out = np.full((int(max_g), int(max_g)), 0, dtype=np.int64)
         out[: int(g), : int(g)] = np.asarray(grid, dtype=np.int64)
         return out
 
@@ -985,7 +989,8 @@ def _tensorize_dataset(ds: ARCDataset, *, max_seq_len: Optional[int] = None) -> 
         demos_each[i] = int(nd)
 
         demos_fixed: list[tuple[np.ndarray, np.ndarray]] = []
-        pad_grid = np.full((int(max_g), int(max_g)), int(PAD_TOKEN), dtype=np.int64)
+        # Missing demos are padded with background color 0 grids (not PAD_TOKEN).
+        pad_grid = np.full((int(max_g), int(max_g)), 0, dtype=np.int64)
         for di in range(int(max_nd)):
             if di < int(nd):
                 x, y = demos[int(di)]
@@ -1070,11 +1075,13 @@ def pad_dataset_to(ds: TensorizedDataset, *, grid_size: int, num_demos: int) -> 
                 x_old = x_flat.reshape(old_g, old_g)
                 y_old = y_flat.reshape(old_g, old_g)
             else:
-                x_old = torch.full((old_g, old_g), int(PAD_TOKEN), dtype=torch.long, device=tokens.device)
-                y_old = torch.full((old_g, old_g), int(PAD_TOKEN), dtype=torch.long, device=tokens.device)
+                # Missing demos are padded with background color 0 (not PAD_TOKEN).
+                x_old = torch.zeros((old_g, old_g), dtype=torch.long, device=tokens.device)
+                y_old = torch.zeros((old_g, old_g), dtype=torch.long, device=tokens.device)
 
-            x_big = torch.full((g, g), int(PAD_TOKEN), dtype=torch.long, device=tokens.device)
-            y_big = torch.full((g, g), int(PAD_TOKEN), dtype=torch.long, device=tokens.device)
+            # IMPORTANT: within-grid padding uses background color 0 (not PAD_TOKEN).
+            x_big = torch.zeros((g, g), dtype=torch.long, device=tokens.device)
+            y_big = torch.zeros((g, g), dtype=torch.long, device=tokens.device)
             x_big[:old_g, :old_g] = x_old
             y_big[:old_g, :old_g] = y_old
 
@@ -1083,7 +1090,7 @@ def pad_dataset_to(ds: TensorizedDataset, *, grid_size: int, num_demos: int) -> 
         # test_x from old prompt
         test_x_flat = tokens[off : off + old_grid_tokens]
         test_x_old = test_x_flat.reshape(old_g, old_g)
-        test_x_big = torch.full((g, g), int(PAD_TOKEN), dtype=torch.long, device=tokens.device)
+        test_x_big = torch.zeros((g, g), dtype=torch.long, device=tokens.device)
         test_x_big[:old_g, :old_g] = test_x_old
         seq += test_x_big.reshape(-1).tolist() + [int(SEP_TOKEN)]
 
@@ -1215,19 +1222,17 @@ def prepare_batch(
         tgt = tgt.to(device, non_blocking=True)
         g_each = g_each.to(device, non_blocking=True)
         nd_each = nd_each.to(device, non_blocking=True)
-    # NOTE: When puzzles have different grid sizes, our tokenization embeds smaller grids into the top-left
-    # of the max grid and uses PAD_TOKEN for the rest. Geometry augmentation on the max grid would move
-    # real content into padded regions, changing semantics; so we disable augmentation in that case.
     if augment is not None and bool(augment.enabled):
-        if bool((g_each == int(train_pool.grid_size)).all().item()) and bool((nd_each == int(train_pool.num_demos)).all().item()):
-            src, tgt = augment_src_tgt_batch(
-                src=src,
-                tgt=tgt,
-                grid_size=int(train_pool.grid_size),
-                num_demos=int(train_pool.num_demos),
-                generator=cpu_generator if device.type == "cpu" else None,
-                spec=augment,
-            )
+        # Safe for variable-size grids because within-grid padding uses background color 0 and
+        # augmentation preserves the target ignore mask (-100) via a transformed validity mask.
+        src, tgt = augment_src_tgt_batch(
+            src=src,
+            tgt=tgt,
+            grid_size=int(train_pool.grid_size),
+            num_demos=int(train_pool.num_demos),
+            generator=cpu_generator if device.type == "cpu" else None,
+            spec=augment,
+        )
 
     # Predict logits from the test_x segment (always max_g^2 positions); mask via tgt == -100.
     T = int(src.shape[1])
@@ -1458,6 +1463,8 @@ def evaluate_accuracy(
     grid_tokens: int,
     dataset: TensorizedDataset,
     eval_batch_size: int,
+    vote_augs: int = 0,
+    vote_spec: Optional[AugmentSpec] = None,
     save_unsolved_dir: Optional[Path] = None,
     save_unsolved_max: int = 0,
     save_unsolved_step: Optional[int] = None,
@@ -1488,12 +1495,51 @@ def evaluate_accuracy(
     for off in range(0, k, bs):
         xb = src[off : off + bs]
         yb = tgt[off : off + bs]  # (B, grid_tokens)
-        logits = model(xb)  # (B, T, V)
-        pred_logits = logits[:, -(grid_tokens + 1) : -1, :]  # (B, grid_tokens, V)
-        pred = torch.argmax(pred_logits, dim=-1)  # (B, grid_tokens)
         valid = yb != -100
+
+        if int(vote_augs) > 0:
+            if vote_spec is None or not bool(vote_spec.enabled):
+                raise ValueError("vote_augs > 0 requires vote_spec.enabled=True")
+            bsz = int(xb.shape[0])
+            g = int(dataset.grid_size)
+            # Majority vote in the *original* space by inverting each augmentation on its prediction.
+            # Vote only on valid cells by zeroing invalid positions before hashing.
+            best_pred = torch.empty((bsz, int(grid_tokens)), dtype=torch.long, device="cpu")
+            best_count = [0 for _ in range(bsz)]
+            counts: list[dict[bytes, int]] = [dict() for _ in range(bsz)]
+
+            for _ in range(int(vote_augs)):
+                xb_aug, yb_aug, params = augment_src_tgt_batch_with_params(
+                    src=xb,
+                    tgt=yb,
+                    grid_size=int(dataset.grid_size),
+                    num_demos=int(dataset.num_demos),
+                    generator=None,  # GPU-friendly; uses global RNG if on CUDA
+                    spec=vote_spec,
+                )
+                logits = model(xb_aug)  # (B, T, V)
+                pred_logits = logits[:, -(grid_tokens + 1) : -1, :]
+                pred = torch.argmax(pred_logits, dim=-1).reshape(bsz, g, g).unsqueeze(1)  # (B,1,g,g)
+                pred_inv = invert_grids_torch(pred, params=params).squeeze(1).reshape(bsz, int(grid_tokens))  # (B,G)
+                pred_inv = torch.where(valid, pred_inv, torch.zeros_like(pred_inv))
+                pred_cpu = pred_inv.detach().to("cpu")
+
+                for bi in range(bsz):
+                    key = pred_cpu[bi].numpy().tobytes()
+                    c = counts[bi].get(key, 0) + 1
+                    counts[bi][key] = c
+                    if c > best_count[bi]:
+                        best_count[bi] = c
+                        best_pred[bi] = pred_cpu[bi]
+
+            pred_final = best_pred.to(device=device)
+        else:
+            logits = model(xb)  # (B, T, V)
+            pred_logits = logits[:, -(grid_tokens + 1) : -1, :]  # (B, grid_tokens, V)
+            pred_final = torch.argmax(pred_logits, dim=-1)  # (B, grid_tokens)
+
         # Exact match on valid cells only.
-        eq = torch.where(valid, pred == yb, torch.ones_like(valid, dtype=torch.bool)).all(dim=1)
+        eq = torch.where(valid, pred_final == yb, torch.ones_like(valid, dtype=torch.bool)).all(dim=1)
         correct += int(eq.sum().item())
 
         # Print a few solved examples (small grids only).
@@ -1504,7 +1550,7 @@ def evaluate_accuracy(
                 g_each_b = grid_each[off : off + bs].detach().cpu().numpy()
                 xb_cpu = xb.detach().cpu().numpy()
                 yb_cpu = yb.detach().cpu().numpy()
-                pred_cpu = pred.detach().cpu().numpy()
+                pred_cpu = pred_final.detach().cpu().numpy()
 
                 def crop(a: np.ndarray, g: int) -> np.ndarray:
                     gg = int(g)
@@ -1561,7 +1607,7 @@ def evaluate_accuracy(
                 )
                 g = int(dataset.grid_size)
                 true_y = yb[bi].detach().cpu().numpy().reshape(g, g)
-                pred_y = pred[bi].detach().cpu().numpy().reshape(g, g)
+                pred_y = pred_final[bi].detach().cpu().numpy().reshape(g, g)
 
                 ds_idx = int(idx_np[int(off + bi)])
                 out_path = base_dir / f"slot{int(saved):02d}.png"
