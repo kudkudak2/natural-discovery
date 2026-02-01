@@ -743,7 +743,7 @@ def main(
     data_dir: Path | list[Path] = Path("tmp"),
     grid_size: int = 0,
     num_demos: int = 0,
-    max_seq_len: int = 500,
+    max_seq_len: int = 1000,
     pos_encoding: str = "2d",
     rel_pos_bias_2d: bool = True,
     demo_rel_pos_bias_2d: bool = True,
@@ -1856,7 +1856,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         default=500,
         help="How often to update checkpoints/latest.pt (in steps). Set 0 to disable.",
     )
-    p.add_argument("--eval_tasks", type=int, default=128)
+    p.add_argument("--eval_tasks", type=int, default=64)
     p.add_argument(
         "--eval_batch_size",
         type=int,
@@ -1890,7 +1890,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         default=0,
         help="Number of solved ID test examples to print (stdout) at each eval (0 disables). Printed for the first eval skill only.",
     )
-    p.add_argument("--progress", action="store_true", help="Show tqdm progress if installed")
+    p.add_argument("--progress", action="store_true", default=True, help="Show tqdm progress if installed")
     p.add_argument("--out_dir", type=Path, default=Path("arc_train_runs"), help="Where to write plots/metrics")
     p.add_argument("--no_plots", action="store_true", help="Disable saving learning-curve PNGs")
     p.add_argument(
