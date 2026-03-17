@@ -1099,7 +1099,7 @@ def _tensorize_dataset(ds: ARCDataset, *, max_seq_len: Optional[int] = None) -> 
     )
 
 
-def pad_dataset_to(ds: TensorizedDataset, *, grid_size: int, num_demos: int) -> TensorizedDataset:
+def pad_dataset_to(ds: TensorizedDataset, *, grid_size: int, num_demos: int, output_grid_size: int) -> TensorizedDataset:
     """
     Retokenize each example to a larger (grid_size, num_demos) budget.
     """
@@ -1164,6 +1164,7 @@ def pad_dataset_to(ds: TensorizedDataset, *, grid_size: int, num_demos: int) -> 
         tgt_list=out_tgt_list,
         grid_size_each=ds.grid_size_each.to(device=dev),
         num_demos_each=ds.num_demos_each.to(device=dev),
+        output_grid_size=int(output_grid_size),
     )
 
 

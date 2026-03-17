@@ -11,6 +11,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 
+from models.arc_transformer import ARCTransformer
+
 from arc_aug import AugmentSpec
 from arc_train_utils import (
     LearningCurves,
@@ -40,461 +42,6 @@ from checkpointing import load_pretrained_weights
 
 DEFAULT_TRAIN_SKILLS = (11, 12, 14, 15, 16)
 DEFAULT_TRAIN_WITH_OOD_SKILLS = (11, 12, 14, 15, 16)
-
-
-def _prompt_rows_cols(
-    *,
-    t: int,
-    input_grid_size: int,
-    output_grid_size: int,
-    num_demos: int,
-    device: torch.device,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """
-    Compute per-token (row, col) coordinates for the ARC prompt sequence, plus an is_sep mask.
-    Input grids are input_grid_size x input_grid_size; output grids are output_grid_size x output_grid_size.
-    Row/col are in [0, max(g_in,g_out)-1] for embedding indexing.
-    """
-    g_in = int(input_grid_size)
-    g_out = int(output_grid_size)
-    nd = int(num_demos)
-    if g_in <= 0 or g_out <= 0:
-        raise ValueError(f"input_grid_size and output_grid_size must be >= 1, got {g_in}, {g_out}")
-    g_max = max(g_in, g_out)
-    in_tokens = g_in * g_in
-    out_tokens = g_out * g_out
-    demo_block = in_tokens + 1 + out_tokens + 1
-    demos_total = nd * demo_block
-    test_block = in_tokens + 1
-    total = demos_total + test_block
-    if t > total:
-        raise ValueError(f"Unexpected t={t} for input_g={g_in} output_g={g_out} num_demos={nd} (expected <= {total})")
-
-    pos = torch.arange(int(t), device=device)
-    row = torch.zeros(int(t), device=device, dtype=torch.long)
-    col = torch.zeros(int(t), device=device, dtype=torch.long)
-    is_sep = torch.zeros(int(t), device=device, dtype=torch.bool)
-
-    # Demo region: (x SEP y SEP) * num_demos
-    in_demos = pos < int(demos_total)
-    if in_demos.any():
-        p = pos[in_demos]
-        did = (p // int(demo_block)).to(torch.long)
-        within = (p % int(demo_block)).to(torch.long)
-        in_x = within < int(in_tokens)
-        is_sep_demo = (within == int(in_tokens)) | (within == int(in_tokens + 1 + out_tokens))
-        in_y = (within > int(in_tokens)) & (within < int(in_tokens + 1 + out_tokens))
-        if in_x.any():
-            cell = within[in_x]
-            idx = p[in_x]
-            row[idx] = (cell // g_in).clamp(max=g_max - 1)
-            col[idx] = (cell % g_in).clamp(max=g_max - 1)
-        if in_y.any():
-            cell = (within[in_y] - int(in_tokens + 1)).to(torch.long)
-            idx = p[in_y]
-            row[idx] = (cell // g_out).clamp(max=g_max - 1)
-            col[idx] = (cell % g_out).clamp(max=g_max - 1)
-        is_sep[in_demos] = is_sep_demo
-
-    # Test region: test_x SEP
-    in_test = pos >= int(demos_total)
-    if in_test.any():
-        p = pos[in_test]
-        within = (p - int(demos_total)).to(torch.long)
-        in_x = within < int(in_tokens)
-        is_sep[in_test] = (within == int(in_tokens))
-        if in_x.any():
-            cell = within[in_x]
-            idx = p[in_x]
-            row[idx] = (cell // g_in).clamp(max=g_max - 1)
-            col[idx] = (cell % g_in).clamp(max=g_max - 1)
-    return row, col, is_sep
-
-
-def _prompt_demo_rows_cols(
-    *,
-    t: int,
-    input_grid_size: int,
-    output_grid_size: int,
-    num_demos: int,
-    device: torch.device,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """
-    Compute per-token (row, col, demo_id) for demo-level 2D layout.
-    Input grids are input_grid_size x input_grid_size; output grids are output_grid_size x output_grid_size.
-    demo_col for y tokens: offset by g_in+1 so y starts at col=g_in+1.
-    """
-    tt = int(t)
-    g_in = int(input_grid_size)
-    g_out = int(output_grid_size)
-    nd = int(num_demos)
-    if g_in <= 0 or g_out <= 0:
-        raise ValueError(f"input_grid_size and output_grid_size must be >= 1, got {g_in}, {g_out}")
-    if nd <= 0:
-        raise ValueError(f"num_demos must be >= 1, got {nd}")
-    in_tokens = g_in * g_in
-    out_tokens = g_out * g_out
-    demo_block = in_tokens + 1 + out_tokens + 1
-    demos_total = nd * demo_block
-    test_block = in_tokens + 1
-    total = int(demos_total + test_block)
-    if tt > total:
-        raise ValueError(f"Unexpected t={tt} for input_g={g_in} output_g={g_out} num_demos={nd} (expected <= {total})")
-
-    pos = torch.arange(int(tt), device=device)
-    demo_row = torch.zeros(int(tt), device=device, dtype=torch.long)
-    demo_col = torch.zeros(int(tt), device=device, dtype=torch.long)
-    demo_id = torch.full((int(tt),), -1, device=device, dtype=torch.long)
-
-    in_demos = pos < int(demos_total)
-    if in_demos.any():
-        p = pos[in_demos]
-        did = (p // int(demo_block)).to(torch.long)
-        within = (p % int(demo_block)).to(torch.long)
-        in_x = within < int(in_tokens)
-        in_y = (within > int(in_tokens)) & (within < int(in_tokens + 1 + out_tokens))
-        if in_x.any():
-            cell = within[in_x]
-            idx = p[in_x]
-            demo_row[idx] = (cell // g_in).to(torch.long)
-            demo_col[idx] = (cell % g_in).to(torch.long)
-            demo_id[idx] = did[in_x]
-        if in_y.any():
-            cell = (within[in_y] - int(in_tokens + 1)).to(torch.long)
-            idx = p[in_y]
-            demo_row[idx] = (cell // g_out).to(torch.long)
-            demo_col[idx] = (cell % g_out).to(torch.long) + int(g_in + 1)
-            demo_id[idx] = did[in_y]
-
-    in_test = pos >= int(demos_total)
-    if in_test.any():
-        p = pos[in_test]
-        within = (p - int(demos_total)).to(torch.long)
-        in_x = within < int(in_tokens)
-        if in_x.any():
-            cell = within[in_x]
-            idx = p[in_x]
-            demo_row[idx] = (cell // g_in).to(torch.long)
-            demo_col[idx] = (cell % g_in).to(torch.long)
-            demo_id[idx] = int(nd)
-    return demo_row, demo_col, demo_id
-
-
-def _prompt_token_types(
-    *,
-    t: int,
-    input_grid_size: int,
-    output_grid_size: int,
-    num_demos: int,
-    device: torch.device,
-) -> torch.Tensor:
-    """
-    Return per-token role/type IDs for the ARC prompt.
-    Types: 0 demo_x, 1 demo_y, 2 test_x, 3 sep.
-    """
-    tt = int(t)
-    g_in = int(input_grid_size)
-    g_out = int(output_grid_size)
-    nd = int(num_demos)
-    in_tokens = g_in * g_in
-    out_tokens = g_out * g_out
-    demo_block = in_tokens + 1 + out_tokens + 1
-    demos_total = nd * demo_block
-    test_block = in_tokens + 1
-    total = int(demos_total + test_block)
-    if tt > total:
-        raise ValueError(f"Unexpected t={tt} for input_g={g_in} output_g={g_out} num_demos={nd} (expected <= {total})")
-
-    pos = torch.arange(int(tt), device=device)
-    token_type = torch.full((int(tt),), 3, device=device, dtype=torch.long)
-
-    in_demos = pos < int(demos_total)
-    if in_demos.any():
-        p = pos[in_demos]
-        within = (p % int(demo_block)).to(torch.long)
-        in_x = within < int(in_tokens)
-        in_y = (within > int(in_tokens)) & (within < int(in_tokens + 1 + out_tokens))
-        token_type[p[in_x]] = 0
-        token_type[p[in_y]] = 1
-
-    in_test = pos >= int(demos_total)
-    if in_test.any():
-        p = pos[in_test]
-        within = (p - int(demos_total)).to(torch.long)
-        in_x = within < int(in_tokens)
-        token_type[p[in_x]] = 2
-    return token_type
-
-
-class RelPosBias2D(nn.Module):
-    """
-    Learned 2D relative position bias (per head), added to self-attention logits.
-
-    SEP tokens get 0 bias to avoid polluting attention through separators.
-    """
-
-    def __init__(self, *, grid_size: int, num_heads: int) -> None:
-        super().__init__()
-        g = int(grid_size)
-        h = int(num_heads)
-        if g <= 0:
-            raise ValueError(f"grid_size must be >= 1, got {g}")
-        if h <= 0:
-            raise ValueError(f"num_heads must be >= 1, got {h}")
-        self.grid_size = int(g)
-        self.num_heads = int(h)
-        self._span = int(2 * g - 1)
-        self._rel_size = int(self._span * self._span)
-        # (rel_size -> num_heads)
-        self.bias = nn.Embedding(int(self._rel_size), int(self.num_heads))
-
-    def forward(self, *, row: torch.Tensor, col: torch.Tensor, is_sep: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-          row/col: (T,) long
-          is_sep: (T,) bool
-        Returns:
-          bias: (H, T, T) float32
-        """
-        if row.ndim != 1 or col.ndim != 1 or is_sep.ndim != 1:
-            raise ValueError("row/col/is_sep must be 1D tensors")
-        if int(row.shape[0]) != int(col.shape[0]) or int(row.shape[0]) != int(is_sep.shape[0]):
-            raise ValueError("row/col/is_sep must have the same length")
-
-        t = int(row.shape[0])
-        g = int(self.grid_size)
-        span = int(self._span)
-
-        # dr,dc in [-(g-1)..(g-1)] -> [0..2g-2]
-        dr = (row[:, None] - row[None, :]).clamp(min=-(g - 1), max=(g - 1)) + (g - 1)
-        dc = (col[:, None] - col[None, :]).clamp(min=-(g - 1), max=(g - 1)) + (g - 1)
-        idx = (dr * span + dc).to(torch.long)  # (T, T)
-
-        # Zero any pair involving SEP tokens.
-        valid = (~is_sep).to(torch.bool)
-        valid_pair = (valid[:, None] & valid[None, :]).to(torch.float32)  # (T, T)
-
-        b = self.bias(idx.reshape(-1)).reshape(t, t, int(self.num_heads)).permute(2, 0, 1).contiguous()
-        return b * valid_pair.unsqueeze(0)
-
-
-class RelPosBias2DWithinDemo(nn.Module):
-    """
-    Learned 2D relative position bias (per head) for a demo-level x|gap|y layout.
-    demo_row in [0..max(g_in,g_out)-1]; demo_col in [0..g_in-1] for x, [g_in+1..g_in+g_out] for y.
-    """
-
-    def __init__(
-        self,
-        *,
-        input_grid_size: int,
-        output_grid_size: int,
-        num_heads: int,
-    ) -> None:
-        super().__init__()
-        g_in = int(input_grid_size)
-        g_out = int(output_grid_size)
-        h = int(num_heads)
-        if g_in <= 0 or g_out <= 0:
-            raise ValueError(f"input_grid_size and output_grid_size must be >= 1, got {g_in}, {g_out}")
-        if h <= 0:
-            raise ValueError(f"num_heads must be >= 1, got {h}")
-        self.grid_size = int(max(g_in, g_out))  # for row span
-        self.num_heads = int(h)
-        self._span_r = int(2 * self.grid_size - 1)
-        self._span_c = int(2 * (g_in + g_out) + 1)
-        self._rel_size = int(self._span_r * self._span_c)
-        self.bias = nn.Embedding(int(self._rel_size), int(self.num_heads))
-
-    def forward(
-        self,
-        *,
-        demo_row: torch.Tensor,
-        demo_col: torch.Tensor,
-        demo_id: torch.Tensor,
-        is_sep: torch.Tensor,
-    ) -> torch.Tensor:
-        """
-        Args:
-          demo_row/demo_col: (T,) long
-          demo_id: (T,) long (>=0 for non-SEP tokens, -1 for SEP tokens)
-          is_sep: (T,) bool
-        Returns:
-          bias: (H, T, T) float32
-        """
-        if demo_row.ndim != 1 or demo_col.ndim != 1 or demo_id.ndim != 1 or is_sep.ndim != 1:
-            raise ValueError("demo_row/demo_col/demo_id/is_sep must be 1D tensors")
-        t = int(demo_row.shape[0])
-        if int(demo_col.shape[0]) != t or int(demo_id.shape[0]) != t or int(is_sep.shape[0]) != t:
-            raise ValueError("demo_row/demo_col/demo_id/is_sep must have the same length")
-
-        span_r = int(self._span_r)
-        span_c = int(self._span_c)
-        half_c = (span_c - 1) // 2
-        dr = (demo_row[:, None] - demo_row[None, :]).clamp(min=-(self.grid_size - 1), max=(self.grid_size - 1)) + (self.grid_size - 1)
-        dc = (demo_col[:, None] - demo_col[None, :]).clamp(min=-half_c, max=half_c) + half_c
-        idx = (dr * span_c + dc).to(torch.long)  # (T, T)
-
-        # Apply bias only within the same demo, and never involving SEP.
-        valid = (~is_sep).to(torch.bool)
-        same_demo = (demo_id[:, None] == demo_id[None, :]) & (demo_id[:, None] >= 0) & (demo_id[None, :] >= 0)
-        valid_pair = (valid[:, None] & valid[None, :] & same_demo).to(torch.float32)  # (T, T)
-
-        b = self.bias(idx.reshape(-1)).reshape(t, t, int(self.num_heads)).permute(2, 0, 1).contiguous()
-        return b * valid_pair.unsqueeze(0)
-
-
-class EncoderLayerRelPos2D(nn.Module):
-    """A minimal Transformer encoder layer with learned 2D relative position bias."""
-
-    def __init__(
-        self,
-        *,
-        embed_dim: int,
-        num_heads: int,
-        ff_dim: int,
-        dropout: float,
-        rel_pos: RelPosBias2D,
-        rel_pos_demo: Optional[RelPosBias2DWithinDemo] = None,
-    ) -> None:
-        super().__init__()
-        d = int(embed_dim)
-        h = int(num_heads)
-        if d <= 0:
-            raise ValueError(f"embed_dim must be >= 1, got {d}")
-        if h <= 0:
-            raise ValueError(f"num_heads must be >= 1, got {h}")
-        if d % h != 0:
-            raise ValueError(f"embed_dim must be divisible by num_heads, got {d} % {h} != 0")
-        self.embed_dim = int(d)
-        self.num_heads = int(h)
-        self.head_dim = int(d // h)
-        self.scale = float(self.head_dim) ** -0.5
-        self.rel_pos = rel_pos
-        self.rel_pos_demo = rel_pos_demo
-
-        self.ln1 = nn.LayerNorm(int(d))
-        self.ln2 = nn.LayerNorm(int(d))
-        self.qkv = nn.Linear(int(d), int(3 * d), bias=True)
-        self.proj = nn.Linear(int(d), int(d), bias=True)
-        self.drop = nn.Dropout(float(dropout))
-
-        self.ff1 = nn.Linear(int(d), int(ff_dim))
-        self.ff2 = nn.Linear(int(ff_dim), int(d))
-        self.act = nn.GELU()
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        *,
-        row: torch.Tensor,
-        col: torch.Tensor,
-        demo_row: Optional[torch.Tensor],
-        demo_col: Optional[torch.Tensor],
-        demo_id: Optional[torch.Tensor],
-        is_sep: torch.Tensor,
-    ) -> torch.Tensor:
-        # x: (B, T, D)
-        b, t, d = x.shape
-        if int(d) != int(self.embed_dim):
-            raise ValueError(f"Unexpected embed dim: got {int(d)} expected {int(self.embed_dim)}")
-
-        # Pre-norm attention
-        h1 = self.ln1(x)
-        qkv = self.qkv(h1)  # (B, T, 3D)
-        q, k, v = qkv.chunk(3, dim=-1)
-        q = q.reshape(int(b), int(t), int(self.num_heads), int(self.head_dim)).permute(0, 2, 1, 3)
-        k = k.reshape(int(b), int(t), int(self.num_heads), int(self.head_dim)).permute(0, 2, 1, 3)
-        v = v.reshape(int(b), int(t), int(self.num_heads), int(self.head_dim)).permute(0, 2, 1, 3)
-
-        logits = torch.matmul(q, k.transpose(-2, -1)) * float(self.scale)  # (B, H, T, T)
-        bias = self.rel_pos(row=row, col=col, is_sep=is_sep).to(dtype=logits.dtype)  # (H, T, T)
-        if self.rel_pos_demo is not None:
-            if demo_row is None or demo_col is None or demo_id is None:
-                raise ValueError("demo_row/demo_col/demo_id must be provided when rel_pos_demo is enabled")
-            demo_bias = self.rel_pos_demo(demo_row=demo_row, demo_col=demo_col, demo_id=demo_id, is_sep=is_sep).to(
-                dtype=logits.dtype
-            )
-            bias = bias + demo_bias
-        attn = F.softmax(logits + bias.unsqueeze(0), dim=-1)
-        attn = self.drop(attn)
-        out = torch.matmul(attn, v)  # (B, H, T, Hd)
-        out = out.permute(0, 2, 1, 3).reshape(int(b), int(t), int(self.embed_dim))
-        out = self.proj(out)
-        out = self.drop(out)
-        x = x + out
-
-        # Pre-norm FFN
-        h2 = self.ln2(x)
-        ff = self.ff2(self.drop(self.act(self.ff1(h2))))
-        ff = self.drop(ff)
-        return x + ff
-
-
-class EncoderRelPos2D(nn.Module):
-    """Stack of EncoderLayerRelPos2D layers sharing the same RelPosBias2D table."""
-
-    def __init__(
-        self,
-        *,
-        num_layers: int,
-        embed_dim: int,
-        num_heads: int,
-        ff_dim: int,
-        dropout: float,
-        input_grid_size: int,
-        output_grid_size: int,
-        demo_rel_pos_bias_2d: bool = True,
-    ) -> None:
-        super().__init__()
-        g_max = max(int(input_grid_size), int(output_grid_size))
-        rel = RelPosBias2D(grid_size=int(g_max), num_heads=int(num_heads))
-        self.rel = rel
-        self.demo_rel: Optional[RelPosBias2DWithinDemo] = (
-            RelPosBias2DWithinDemo(
-                input_grid_size=int(input_grid_size),
-                output_grid_size=int(output_grid_size),
-                num_heads=int(num_heads),
-            )
-            if bool(demo_rel_pos_bias_2d)
-            else None
-        )
-        self.layers = nn.ModuleList(
-            [
-                EncoderLayerRelPos2D(
-                    embed_dim=int(embed_dim),
-                    num_heads=int(num_heads),
-                    ff_dim=int(ff_dim),
-                    dropout=float(dropout),
-                    rel_pos=rel,
-                    rel_pos_demo=self.demo_rel,
-                )
-                for _ in range(int(num_layers))
-            ]
-        )
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        *,
-        row: torch.Tensor,
-        col: torch.Tensor,
-        demo_row: Optional[torch.Tensor],
-        demo_col: Optional[torch.Tensor],
-        demo_id: Optional[torch.Tensor],
-        is_sep: torch.Tensor,
-    ) -> torch.Tensor:
-        for layer in self.layers:
-            x = layer(
-                x,
-                row=row,
-                col=col,
-                demo_row=demo_row,
-                demo_col=demo_col,
-                demo_id=demo_id,
-                is_sep=is_sep,
-            )
-        return x
 
 
 def _unique_ints(xs: list[int]) -> list[int]:
@@ -601,142 +148,6 @@ def _curriculum_delay_from_3phases(
         step_by_skill[int(sid)] = int(until)
     delay_steps_aligned = [int(step_by_skill[int(sid)]) for sid in delay_skills]
     return train_skills, delay_skills, delay_steps_aligned
-class ARCTransformer(nn.Module):
-    def __init__(
-        self,
-        *,
-        vocab_size: int = VOCAB_SIZE,
-        grid_size: int = 5,
-        num_demos: int = 3,
-        output_grid_size: Optional[int] = None,
-        pos_encoding: str = "2d",
-        rel_pos_bias_2d: bool = True,
-        demo_rel_pos_bias_2d: bool = True,
-        embed_dim: int = 128,
-        num_heads: int = 4,
-        num_layers: int = 4,
-        ff_dim: int = 256,
-        max_len: int = 256,
-        dropout: float = 0.0,
-    ) -> None:
-        super().__init__()
-        self.grid_size = int(grid_size)  # input grid size
-        self.output_grid_size = int(output_grid_size if output_grid_size is not None else grid_size)
-        if self.grid_size <= 0 or self.output_grid_size <= 0:
-            raise ValueError(f"grid_size and output_grid_size must be >= 1, got {self.grid_size}, {self.output_grid_size}")
-        self.num_demos = int(num_demos)
-        if self.num_demos <= 0:
-            raise ValueError(f"num_demos must be >= 1, got {self.num_demos}")
-        self.grid_tokens = self.output_grid_size * self.output_grid_size  # number of tokens we predict
-        self._grid_size_max = max(self.grid_size, self.output_grid_size)  # for embeddings / rel_pos
-
-        self.pos_encoding = str(pos_encoding).lower()
-        if self.pos_encoding not in {"2d", "1d"}:
-            raise ValueError(f"pos_encoding must be one of {{'2d','1d'}}, got {pos_encoding!r}")
-
-        self.embed = nn.Embedding(vocab_size, embed_dim)
-        self.global_pos_enc = nn.Parameter(torch.randn(1, int(max_len), embed_dim) * 0.02)
-
-        self._N_TOKEN_TYPES = 4
-        self.token_type_embed = nn.Embedding(int(self._N_TOKEN_TYPES), embed_dim)
-        self.demo_id_embed = nn.Embedding(int(self.num_demos + 1), embed_dim)
-
-        if self.pos_encoding == "2d":
-            self.row_embed = nn.Embedding(self._grid_size_max, embed_dim)
-            self.col_embed = nn.Embedding(self._grid_size_max, embed_dim)
-
-        self.rel_pos_bias_2d = bool(rel_pos_bias_2d)
-        if self.rel_pos_bias_2d:
-            self.transformer_rel = EncoderRelPos2D(
-                num_layers=int(num_layers),
-                embed_dim=int(embed_dim),
-                num_heads=int(num_heads),
-                ff_dim=int(ff_dim),
-                dropout=float(dropout),
-                input_grid_size=self.grid_size,
-                output_grid_size=self.output_grid_size,
-                demo_rel_pos_bias_2d=bool(demo_rel_pos_bias_2d),
-            )
-            self.transformer = None
-        else:
-            layer = nn.TransformerEncoderLayer(
-                d_model=embed_dim,
-                nhead=num_heads,
-                dim_feedforward=ff_dim,
-                batch_first=True,
-                dropout=dropout,
-            )
-            self.transformer = nn.TransformerEncoder(layer, num_layers=num_layers)
-            self.transformer_rel = None
-        self.fc_out = nn.Linear(embed_dim, vocab_size)
-
-    def forward(self, x: torch.Tensor, *, key_padding_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
-        # x: (B, T)
-        _b, t = x.shape
-        if t > int(self.global_pos_enc.shape[1]):
-            raise ValueError(
-                f"Sequence too long: t={t} > max_len={int(self.global_pos_enc.shape[1])}. "
-                "Increase max_len."
-            )
-
-        emb = self.embed(x) + self.global_pos_enc[:, :t, :]
-        if key_padding_mask is not None:
-            if key_padding_mask.shape != x.shape:
-                raise ValueError(f"key_padding_mask must have shape {tuple(x.shape)}, got {tuple(key_padding_mask.shape)}")
-            emb = emb.masked_fill(key_padding_mask.unsqueeze(-1), 0.0)
-
-        row, col, is_sep = _prompt_rows_cols(
-            t=int(t),
-            input_grid_size=int(self.grid_size),
-            output_grid_size=int(self.output_grid_size),
-            num_demos=int(self.num_demos),
-            device=x.device,
-        )
-        demo_row, demo_col, demo_id = _prompt_demo_rows_cols(
-            t=int(t),
-            input_grid_size=int(self.grid_size),
-            output_grid_size=int(self.output_grid_size),
-            num_demos=int(self.num_demos),
-            device=x.device,
-        )
-        token_type = _prompt_token_types(
-            t=int(t),
-            input_grid_size=int(self.grid_size),
-            output_grid_size=int(self.output_grid_size),
-            num_demos=int(self.num_demos),
-            device=x.device,
-        )
-
-        # Add role + demo id embeddings.
-        # - demo_id is -1 on SEP tokens; we clamp for indexing and then explicitly zero-out SEP contributions.
-        role_emb = self.token_type_embed(token_type).unsqueeze(0)  # (1, T, D)
-        did = demo_id.clamp(min=0, max=int(self.num_demos)).to(torch.long)
-        did_emb = self.demo_id_embed(did).masked_fill(is_sep.unsqueeze(-1), 0.0).unsqueeze(0)  # (1, T, D)
-        emb = emb + role_emb + did_emb
-
-        if self.pos_encoding == "2d" and (not bool(self.rel_pos_bias_2d)):
-            pos_emb_2d = self.row_embed(row) + self.col_embed(col)  # (T, D)
-            pos_emb_2d = pos_emb_2d.masked_fill(is_sep.unsqueeze(-1), 0.0)
-            emb = emb + pos_emb_2d.unsqueeze(0)  # (B, T, D)
-
-        if self.rel_pos_bias_2d:
-            assert self.transformer_rel is not None
-            h = self.transformer_rel(
-                emb,
-                row=row,
-                col=col,
-                demo_row=demo_row,
-                demo_col=demo_col,
-                demo_id=demo_id,
-                is_sep=is_sep,
-            )
-        else:
-            assert self.transformer is not None
-            if key_padding_mask is not None:
-                h = self.transformer(emb, src_key_padding_mask=key_padding_mask)
-            else:
-                h = self.transformer(emb)
-        return self.fc_out(h)  # (B, T, vocab)
 
 
 def main(
@@ -797,6 +208,10 @@ def main(
     aug_keep_background: bool = True,
     eval_vote_augs: int = 0,
     run_tests: bool = True,
+    model_type: str = "standard",
+    recurrence_steps: int = 12,   # <--- Add this (for TRM)
+    hrm_h_cycles: int = 3,        # <--- Add this (for HRM)
+    hrm_l_steps: int = 4,         # <--- Add this (for HRM)
 ) -> None:
     torch.manual_seed(int(seed))
     rng = np.random.default_rng(int(seed))
@@ -1177,6 +592,10 @@ def main(
         ff_dim=int(ff_dim),
         max_len=seq_len,
         dropout=float(dropout),
+        model_type=model_type,
+        recurrence_steps=recurrence_steps,  # <--- Add this (for TRM)
+        hrm_h_cycles=hrm_h_cycles,  # <--- Add this (for HRM)
+        hrm_l_steps=hrm_l_steps,  # <--- Add this (for HRM)
     ).to(device)
 
     # Optional: identify params that were NOT loaded from the pretrained checkpoint (new/random-init).
@@ -1972,8 +1391,32 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         default=True,
         help="Run unit tests (pytest) before training starts (default). Disable with --no-run_tests.",
     )
+    p.add_argument(
+        "--model_type",
+        type=str,
+        default="standard",
+        choices=("standard", "trm", "hrm"),
+        help="Type of reasoning model to train, including normal, tiny recursive reasoning model, and hierarchical reasoning model",
+    )
+    p.add_argument(
+        "--recurrence_steps",
+        type=int,
+        default=12,
+        help="recurrence_steps for trm",
+    )
+    p.add_argument(
+        "--hrm_h_cycles",
+        type=int,
+        default=3,
+        help="hrm_h_cycles for hrm",
+    )
+    p.add_argument(
+        "--hrm_l_steps",
+        type=int,
+        default=4,
+        help="hrm_l_steps for hrm",
+    )
     return p
-
 
 def cli_main(argv: Optional[list[str]] = None) -> None:
     args = _build_arg_parser().parse_args(argv)
@@ -2088,6 +1531,10 @@ def cli_main(argv: Optional[list[str]] = None) -> None:
         aug_keep_background=bool(args.aug_keep_background),
         eval_vote_augs=int(args.eval_vote_augs),
         run_tests=bool(args.run_tests),
+        model_type=str(args.model_type),
+        recurrence_steps=int(args.recurrence_steps),   # <--- Add this (for TRM)
+        hrm_h_cycles=int(args.hrm_h_cycles),        # <--- Add this (for HRM)
+        hrm_l_steps=int(args.hrm_l_steps),         # <--- Add this (for HRM)
     )
 
 
